@@ -1,0 +1,281 @@
+.stepContainer {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.card {
+  border: 1px solid #e3e7ef;
+  border-radius: 8px;
+  background: white;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+}
+
+.cardHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 1rem 1.25rem;
+  background: #f8f9fb;
+  border-bottom: 1px solid #e3e7ef;
+  border-radius: 8px 8px 0 0;
+}
+
+.cardBody {
+  padding: 1.5rem 1.25rem;
+}
+
+.title {
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: #070b2f;
+  margin: 0;
+}
+
+.subtitle {
+  font-size: 0.9rem;
+  color: #626b7d;
+  margin: 0.5rem 0 0 0;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.4rem 0.8rem;
+  background: #eaf8f1;
+  color: #2fa66a;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.badge.success {
+  background: #eaf8f1;
+  color: #2fa66a;
+}
+
+.badge.danger {
+  background: #fff0f0;
+  color: #ef4444;
+}
+
+.badge.warning {
+  background: #fff5df;
+  color: #f59e0b;
+}
+
+.badge.primary {
+  background: #fff0ed;
+  color: #ff5640;
+}
+
+.alert {
+  padding: 1rem;
+  border-radius: 8px;
+  border: 1px solid;
+  margin-top: 1rem;
+}
+
+.alert.danger {
+  background: #fff0f0;
+  border-color: #fed7aa;
+  color: #9a3412;
+}
+
+.alert.success {
+  background: #eaf8f1;
+  border-color: #bbf7d0;
+  color: #166534;
+}
+
+.button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem;
+  background: #ff5640;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s ease;
+  font-size: 0.9rem;
+}
+
+.button:hover:not(:disabled) {
+  background: #d63d2b;
+}
+
+.button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.button.secondary {
+  background: white;
+  color: #070b2f;
+  border: 1px solid #e3e7ef;
+}
+
+.button.secondary:hover:not(:disabled) {
+  background: #f8f9fb;
+  border-color: #ff5640;
+}
+
+.statCard {
+  text-align: center;
+  padding: 1.5rem 1rem;
+  background: #f8f9fb;
+  border-radius: 8px;
+  border: 1px solid #e3e7ef;
+}
+
+.statValue {
+  font-size: 2rem;
+  font-weight: 700;
+  color: #ff5640;
+  margin: 0;
+}
+
+.statLabel {
+  font-size: 0.85rem;
+  color: #626b7d;
+  margin-top: 0.5rem;
+}
+
+.dragOverlay {
+  border: 2px dashed #ff5640;
+  background: rgba(255, 86, 64, 0.05);
+  border-radius: 8px;
+  padding: 2rem;
+  text-align: center;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.dragOverlay.dragOver {
+  background: rgba(255, 86, 64, 0.1);
+  border-color: #d63d2b;
+}
+
+.fileInput {
+  display: none;
+}
+
+.fileName {
+  font-size: 0.9rem;
+  color: #626b7d;
+  margin-top: 0.5rem;
+}
+
+.emptyState {
+  text-align: center;
+  padding: 2rem;
+  color: #626b7d;
+}
+
+.emptyStateIcon {
+  font-size: 2.5rem;
+  margin-bottom: 1rem;
+  opacity: 0.5;
+}
+
+.table {
+  font-size: 0.9rem;
+  margin-bottom: 0;
+}
+
+.table thead {
+  background: #f8f9fb;
+  border-bottom: 2px solid #e3e7ef;
+}
+
+.table thead th {
+  color: #070b2f;
+  font-weight: 600;
+  border: none;
+  padding: 1rem 0.75rem;
+}
+
+.table tbody td {
+  padding: 0.75rem;
+  border-bottom: 1px solid #e3e7ef;
+  color: #4b5d78;
+}
+
+.table tbody tr:hover {
+  background: #f8f9fb;
+}
+
+.listGroup {
+  border: 1px solid #e3e7ef;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.listGroupItem {
+  padding: 1rem 0.75rem;
+  border-bottom: 1px solid #e3e7ef;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.listGroupItem:last-child {
+  border-bottom: none;
+}
+
+.label {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #070b2f;
+  margin-bottom: 0.5rem;
+  display: block;
+}
+
+.input {
+  width: 100%;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid #e3e7ef;
+  border-radius: 6px;
+  font-size: 0.9rem;
+  font-family: inherit;
+  color: #070b2f;
+}
+
+.input:focus {
+  outline: none;
+  border-color: #ff5640;
+  box-shadow: 0 0 0 3px rgba(255, 86, 64, 0.1);
+}
+
+.checkbox {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+.checkboxInput {
+  cursor: pointer;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 1.5rem;
+  margin-bottom: 1.5rem;
+}
+
+@media (min-width: 576px) {
+  .row {
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  }
+}
+
+.col {
+  flex: 1;
+}
