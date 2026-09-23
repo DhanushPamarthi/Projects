@@ -22,6 +22,7 @@ import {
 } from "react-bootstrap";
 import styles from "./LoginPage.module.css";
 import { registerUser } from "../api/client.js";
+import { toast } from "react-toastify";
 
 const FEATURES = [
   {
@@ -116,14 +117,14 @@ function ProductPanel() {
       </div>
       <img
         className={styles.workflowImage}
-        src="/ChatGPT%20Image%20Sep%2015,%202026,%2004_55_46%20PM%20%282%29.png"
+        src="/loginflow.png"
         alt="TestIQ workflow from requirements to validation"
       />
     </div>
   );
 }
 
-export function RegisterPage({ onLogin, onBack }) {
+export function RegisterPage({ onBack }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -132,6 +133,11 @@ export function RegisterPage({ onLogin, onBack }) {
   const [agreeTerms, setAgreeTerms] = useState(false);
   const [error, setError] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
+
+  function completeRegistration() {
+    toast.success("Registration successful. Please sign in.");
+    setTimeout(onBack, 250);
+  }
 
   function handleSubmit(e) {
     e.preventDefault();
@@ -154,12 +160,12 @@ export function RegisterPage({ onLogin, onBack }) {
 
     setIsLoading(true);
     registerUser(email, password)
-      .then((user) => { localStorage.setItem("testiq_current_user", JSON.stringify(user)); onLogin(user); })
+      .then(() => { localStorage.removeItem("testiq_auth_token"); localStorage.removeItem("testiq_current_user"); completeRegistration(); })
       .catch(() => {
         const users = JSON.parse(localStorage.getItem("testiq_users") || "{}");
         if (users[email]) { setError("An account with this email already exists"); setIsLoading(false); return; }
         const user = { email, password };
-        users[email] = user; localStorage.setItem("testiq_users", JSON.stringify(users)); localStorage.setItem("testiq_current_user", JSON.stringify(user)); onLogin(user); setIsLoading(false);
+        users[email] = user; localStorage.setItem("testiq_users", JSON.stringify(users)); localStorage.removeItem("testiq_current_user"); localStorage.removeItem("testiq_local_session"); completeRegistration(); setIsLoading(false);
       });
     return;
 

@@ -5,7 +5,7 @@
   position: relative;
   overflow: hidden;
   background: #f8fafc
-    url("/ChatGPT%20Image%20Sep%2015,%202026,%2004_55_45%20PM%20%281%29.png")
+    url("/loginbg.png")
     center / cover fixed;
   color: var(--brand-navy);
 }
@@ -421,10 +421,19 @@
   border-radius: 10px;
   padding-top: 0.7rem;
   padding-bottom: 0.7rem;
-  background: var(--brand-orange);
-  border: none;
+  background: var(--brand-orange) !important;
+  border: 1px solid var(--brand-orange) !important;
+  color: white !important;
   font-weight: 700;
   min-height: 2.65rem;
+}
+
+.submitBtn:hover,
+.submitBtn:focus,
+.submitBtn:active {
+  background: #e94f3b !important;
+  border-color: #e94f3b !important;
+  color: white !important;
 }
 
 .submitBtn :global(svg) {

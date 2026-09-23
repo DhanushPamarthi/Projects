@@ -1,8 +1,14 @@
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap');
 @import 'bootstrap/dist/css/bootstrap.min.css';
+@import 'react-toastify/dist/ReactToastify.css';
 
-:root { --ink: #18283a; --muted: #718096; --line: #e7ebf0; --soft: #f6f8fb; --orange: #ff654f; --orange-dark: #e95540; --green: #22a06b; --sidebar: #132438; }
+:root { --ink: #18283a; --muted: #718096; --line: #e7ebf0; --soft: #f6f8fb; --orange: #ff654f; --orange-dark: #e95540; --brand-navy: #192b37; --brand-orange: #ff5640; --green: #22a06b; --sidebar: #132438; }
 * { box-sizing: border-box; }
+.Toastify__toast-container { width: min(360px, calc(100vw - 32px)); }
+.Toastify__toast { min-height: 58px; border: 1px solid #bfe8d2; border-radius: 10px; color: #237850; background: #f8fffb; box-shadow: 0 14px 35px #1324381c; font-family: 'DM Sans', sans-serif; font-size: 12px; }
+.Toastify__toast--success { border-left: 4px solid var(--green); }
+.Toastify__progress-bar--success { background: var(--green); }
+.Toastify__close-button { color: #6d8b7b; opacity: .8; }
 body { margin: 0; color: var(--ink); background: #f7f9fc; font-family: 'DM Sans', sans-serif; -webkit-font-smoothing: antialiased; }
 button, input, select { font: inherit; }
 button { cursor: pointer; }
