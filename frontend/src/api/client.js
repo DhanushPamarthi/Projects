@@ -2,7 +2,7 @@ const defaultBaseUrl = import.meta.env.DEV ? "/api" : "http://127.0.0.1:8000";
 
 export function getBaseUrl() {
   const storedUrl = localStorage.getItem("testiq_base_url");
-  if (import.meta.env.DEV && (!storedUrl || storedUrl === "http://127.0.0.1:8000" || storedUrl === "http://localhost:8000")) {
+  if (import.meta.env.DEV && (!storedUrl || storedUrl === "/api" || storedUrl === "http://127.0.0.1:8000" || storedUrl === "http://localhost:8000")) {
     return "/api";
   }
   if (storedUrl === "http://127.0.0.1:8001") {
@@ -23,7 +23,12 @@ async function request(path, options = {}) {
   if (token) headers.Authorization = `Bearer ${token}`;
   const response = await fetch(url, { ...options, headers });
   const text = await response.text();
-  const data = text ? JSON.parse(text) : null;
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = { detail: text || `${response.status} ${response.statusText}` };
+  }
   if (!response.ok) {
     const detail = data?.detail;
     const message = typeof detail === "string"
@@ -92,11 +97,11 @@ export async function getRevision(revisionId) {
   return request(`/api/v1/revisions/${encodeURIComponent(revisionId)}`);
 }
 
-export async function createManifest(sourceIds, scope, projectId) {
+export async function createManifest(sourceIds, packageName, scope, projectId) {
   return request(`/api/v1/projects/${encodeURIComponent(projectId)}/manifests`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ source_ids: sourceIds, scope }),
+    body: JSON.stringify({ source_ids: sourceIds, package_name: packageName, scope }),
   });
 }
 

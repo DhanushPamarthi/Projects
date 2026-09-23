@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import {
   Check,
   CheckCircle2,
+  ChevronLeft,
   ChevronRight,
   CircleAlert,
   CloudUpload,
@@ -31,13 +32,17 @@ function SourceRow({ source, compact = false }) {
   const revision = source.active_revision || source.latest_revision || {};
   const filename = revision.filename || source.logical_name || source.filename || "Source document";
   const size = revision.size_bytes ? `${(revision.size_bytes / 1024).toFixed(1)} KB` : "Uploaded file";
-  const warning = source.validation_messages?.find((message) => message.startsWith("Missing expected section:") || message.startsWith("OpenAI extraction failed:") || message.startsWith("Extraction failed:"));
+  const validationMessages = source.validation_messages || revision.validation_messages || [];
+  const parsedMessages = Array.isArray(validationMessages) ? validationMessages : (() => { try { return JSON.parse(validationMessages || "[]"); } catch { return []; } })();
+  const missingWarnings = parsedMessages.filter((message) => message.startsWith("Missing expected section:")).map((message) => message.replace("Missing expected section:", "").trim());
+  const warnings = parsedMessages.filter((message) => message.startsWith("OpenAI extraction failed:") || message.startsWith("Extraction failed:"));
   return <div className={`source-row ${compact ? "compact" : ""}`}>
     <span className={`source-file-icon ${source.source_type === "brd" ? "brd" : "supporting"}`}><FileText size={17} /></span>
     <div className="source-main">
       <strong title={filename}>{filename}</strong>
       <span>{source.source_type === "brd" ? "Business requirements document" : (source.source_type || "Supporting source").replaceAll("_", " ")} - {size}</span>
-      {warning && <small className="source-warning">{warning}</small>}
+      {missingWarnings.length > 0 && <small className="source-warning">Missing sections: {missingWarnings.join(", ")}</small>}
+      {warnings.map((warning) => <small className="source-warning" key={warning}>{warning}</small>)}
     </div>
     <span className={`source-status ${tone}`}><span />{tone === "success" ? "Ready" : tone === "pending" ? "Processing" : "Needs review"}</span>
     <span className="revision-label">{source.active_revision ? "Active revision" : "Review revision"}</span>
@@ -45,10 +50,17 @@ function SourceRow({ source, compact = false }) {
   </div>;
 }
 
+function missingSectionsFor(source) {
+  const messages = source?.validation_messages || source?.active_revision?.validation_messages || [];
+  const parsed = Array.isArray(messages) ? messages : (() => { try { return JSON.parse(messages || "[]"); } catch { return []; } })();
+  return parsed.filter((message) => message.startsWith("Missing expected section: ")).map((message) => message.replace("Missing expected section: ", ""));
+}
+
 export function UploadStep() {
   const [project, setProject] = useState(() => JSON.parse(localStorage.getItem("testiq_current_project") || "null"));
   const [projects, setProjects] = useState([]);
   const [projectName, setProjectName] = useState("");
+  const [packageName, setPackageName] = useState("");
   const [sources, setSources] = useState([]);
   const [file, setFile] = useState(null);
   const [dragging, setDragging] = useState(false);
@@ -60,15 +72,18 @@ export function UploadStep() {
   const [step, setStep] = useState(1);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [uploadValidationError, setUploadValidationError] = useState("");
   const [toast, setToast] = useState("");
   const [manifest, setManifest] = useState(null);
-  const [processing, setProcessing] = useState(false);
   const [confirmNewPackage, setConfirmNewPackage] = useState(false);
+  const [missingSections, setMissingSections] = useState([]);
+  const [showMissingSections, setShowMissingSections] = useState(false);
 
-  const brds = sources.filter((item) => item.source_type === "brd");
-  const supporting = sources.filter((item) => item.source_type !== "brd");
+  const brds = sources.filter((item) => item.source_type === "brd" && item.active_revision);
+  const supporting = sources.filter((item) => item.source_type !== "brd" && item.active_revision);
   const extractionPending = sources.some((item) => ["pending", "processing"].includes(item.extraction?.status || item.extraction_status || item.status));
-  const packageReady = sources.length > 0 && !extractionPending;
+  const hasRejectedSource = sources.some((item) => ["rejected", "extraction_failed"].includes(item.status || item.active_revision?.status));
+  const packageReady = sources.length > 0 && brds.length > 0 && !extractionPending && !hasRejectedSource;
   const currentStep = !brds.length ? 1 : manifest ? 3 : step;
 
   async function refreshSources(id = project?.project_id) {
@@ -102,6 +117,17 @@ export function UploadStep() {
     setFile(next || null);
   }
 
+  function continueToSources() {
+    proceedToSources();
+  }
+
+  function proceedToSources() {
+    setShowMissingSections(false);
+    setStep(2);
+    setSourceType("api_spec");
+    setBrdSourceId(brds[0]?.source_id || "");
+  }
+
   async function handleUpload() {
     if (!file) return;
     setBusy(true);
@@ -114,7 +140,8 @@ export function UploadStep() {
       localStorage.setItem("testiq_current_project", JSON.stringify(activeProject));
       const uploaded = await uploadSource(activeProject.project_id, file, sourceType, brdSourceId, owner, ownerVersion, requiredSections);
       const isBrdUpload = sourceType === "brd";
-      setToast(uploaded.status === "duplicate" ? "Duplicate retained for traceability" : isBrdUpload ? "BRD uploaded successfully. Processing extraction..." : "Source uploaded successfully");
+      setToast(uploaded.status === "duplicate" ? "Duplicate retained for traceability" : isBrdUpload ? "BRD upload received. Validating and extracting..." : "Source uploaded successfully");
+      if (!isBrdUpload) setPackageName("");
       setFile(null);
       await refreshSources(activeProject.project_id);
       listProjects().then(setProjects).catch(() => {});
@@ -124,19 +151,20 @@ export function UploadStep() {
       }
       if (uploaded.extraction?.status === "pending") pollExtraction(uploaded, activeProject.project_id, isBrdUpload);
     } catch (err) {
-      setError(err.message);
+      setUploadValidationError(err.message);
     } finally {
       setBusy(false);
     }
   }
 
   async function pollExtraction(uploaded, id, isBrdUpload = false) {
-    setProcessing(true);
     let finalStatus = "pending";
+    let completedRevision = null;
     for (let attempt = 0; attempt < 45; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 2000));
       try {
         const revision = await getRevision(uploaded.revision_id);
+        completedRevision = revision;
         finalStatus = revision.extraction?.status || "pending";
         if (["succeeded", "failed", "skipped"].includes(finalStatus)) break;
       } catch {
@@ -145,17 +173,40 @@ export function UploadStep() {
       }
     }
     await refreshSources(id);
-    setProcessing(false);
-    if (isBrdUpload) setToast(finalStatus === "succeeded" ? "BRD uploaded and processed successfully." : finalStatus === "failed" ? "BRD uploaded, but extraction needs review." : "BRD uploaded successfully.");
+    const missing = completedRevision?.extraction_summary?.missing_sections || [];
+    setMissingSections(missing);
+    if (isBrdUpload) {
+      if (finalStatus === "succeeded") {
+        setToast("BRD uploaded and processed successfully.");
+      } else if (finalStatus === "failed") {
+        const failureMessage = completedRevision?.extraction?.error || completedRevision?.validation_messages?.find((message) => message.startsWith("Extraction failed:"))?.replace("Extraction failed: ", "") || "The BRD could not be extracted.";
+        setToast("");
+        setUploadValidationError(failureMessage);
+        setStep(1);
+      } else {
+        setToast("BRD processing timed out. Please retry the upload.");
+      }
+    }
   }
 
-  async function createPackage() {
+  async function createPackage({ allowMissingSections = false } = {}) {
     if (!project || !sources.length) return;
+    if (!packageName.trim()) {
+      setError("Enter a package name before creating the source package.");
+      return;
+    }
+    const missing = missingSectionsFor(brds[0]);
+    if (missing.length > 0 && !allowMissingSections) {
+      setMissingSections(missing);
+      setShowMissingSections(true);
+      return;
+    }
     setBusy(true);
     setError("");
     try {
-      const created = await createManifest(sources.map((item) => item.source_id), "MVP", project.project_id);
+      const created = await createManifest(sources.map((item) => item.source_id), packageName.trim(), "MVP", project.project_id);
       setManifest(created);
+      setPackageName("");
       localStorage.setItem("testiq_current_package", JSON.stringify(created));
       setToast("Source package snapshot created");
     } catch (err) {
@@ -169,9 +220,14 @@ export function UploadStep() {
     setConfirmNewPackage(false);
     setProject(null);
     setProjectName("");
+    setPackageName("");
     setSources([]);
     setManifest(null);
+    setToast("");
     setFile(null);
+    setRequiredSections("");
+    setMissingSections([]);
+    setShowMissingSections(false);
     setStep(1);
     setSourceType("brd");
     localStorage.removeItem("testiq_current_project");
@@ -191,6 +247,7 @@ export function UploadStep() {
           const selected = await getProject(event.target.value);
           setProject(selected);
           setProjectName(selected.project_name);
+          setPackageName("");
           setManifest(null);
           setSources([]);
           localStorage.removeItem("testiq_current_package");
@@ -203,24 +260,26 @@ export function UploadStep() {
     <div className="stepper">{[[1, "Start with your BRD", "Primary requirements"], [2, "Add supporting sources", "Rules, APIs and schemas"], [3, "Review package", "Create a fixed snapshot"]].map(([number, title, copy]) => <div key={number} className={`stepper-item ${currentStep === number ? "current" : ""} ${currentStep > number ? "complete" : ""}`}><span className="stepper-number">{currentStep > number ? <Check size={15} /> : number}</span><div><strong>{title}</strong><span>{copy}</span></div>{number < 3 && <ChevronRight className="stepper-arrow" size={17} />}</div>)}</div>
     {toast && <div className="toast-message"><CheckCircle2 size={17} /> {toast}<button onClick={() => setToast("")}><X size={15} /></button></div>}
     {error && <div className="error-message"><CircleAlert size={17} /> {error}<button onClick={() => setError("")}><X size={15} /></button></div>}
+    {uploadValidationError && <div className="modal-backdrop" role="presentation"><div className="confirm-modal upload-error-modal" role="dialog" aria-modal="true" aria-labelledby="upload-error-title"><button type="button" className="modal-close" aria-label="Close upload error" onClick={() => setUploadValidationError("")}><X size={18} /></button><div className="confirm-icon error"><CircleAlert size={21} /></div><h2 id="upload-error-title">Upload could not be completed</h2><p>{uploadValidationError}</p><p className="modal-helper">The original file has been preserved. Choose a valid file to continue.</p><div className="confirm-actions"><button className="primary-button" onClick={() => { setUploadValidationError(""); setFile(null); }}>Choose another file</button></div></div></div>}
+    {showMissingSections && <div className="modal-backdrop" role="presentation"><div className="confirm-modal missing-sections-modal" role="dialog" aria-modal="true" aria-labelledby="missing-sections-title"><button type="button" className="modal-close" aria-label="Close missing sections dialog" onClick={() => setShowMissingSections(false)}><X size={18} /></button><div className="confirm-icon"><CircleAlert size={21} /></div><h2 id="missing-sections-title">Expected sections are missing</h2><p>The following section{missingSections.length === 1 ? " is" : "s are"} not present in the extracted BRD:</p><ul>{missingSections.map((section) => <li key={section}>{section}</li>)}</ul><p>Do you still want to create the source package?</p><div className="confirm-actions"><button className="text-button" onClick={() => { setShowMissingSections(false); setStep(1); }}>Review BRD</button><button className="primary-button" onClick={() => { setShowMissingSections(false); createPackage({ allowMissingSections: true }); }}>Proceed and create package</button></div></div></div>}
 
     {!manifest && currentStep < 3 && <div className="content-grid">
       <section className="upload-panel">
         <div className="panel-title"><div><h2>{currentStep === 1 ? (brds.length ? "Upload an updated BRD" : "Upload your BRD") : "Add a supporting source"}</h2><p>{currentStep === 1 ? (brds.length ? "Upload an updated BRD. The previous file will remain available for traceability." : "Your business requirements document anchors this package.") : "Connect the context your team needs for accurate test data."}</p></div><span className="step-pill">Step {currentStep} of 3</span></div>
         {currentStep === 1 && <div className="field-block"><label>Project name</label><input value={projectName} disabled={Boolean(project)} onChange={(event) => setProjectName(event.target.value)} placeholder="e.g. PBM Refill Reminder" /><span className="field-hint">A project is created automatically with your first upload.</span></div>}
-        {currentStep === 2 && <><div className="field-block"><label>Source type</label><select value={sourceType} onChange={(event) => setSourceType(event.target.value)}><option value="brd">Another BRD revision</option>{supportingTypes.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></div>{sourceType !== "brd" && <div className="field-block"><label>Associated BRD</label><select value={brdSourceId} onChange={(event) => setBrdSourceId(event.target.value)}><option value="">Select a BRD</option>{brds.map((item) => <option key={item.source_id} value={item.source_id}>{item.logical_name}</option>)}</select></div>}</>}
+        {currentStep === 2 && <><div className="field-block"><label>Source type</label><select value={sourceType} onChange={(event) => setSourceType(event.target.value)}>{supportingTypes.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></div><div className="field-block"><label>Associated BRD</label><select value={brdSourceId} onChange={(event) => setBrdSourceId(event.target.value)}><option value="">Select a BRD</option>{brds.map((item) => <option key={item.source_id} value={item.source_id}>{item.logical_name}</option>)}</select></div></>}
         <div className="field-row"><div className="field-block"><label>Source owner <em>Optional</em></label><input value={owner} onChange={(event) => setOwner(event.target.value)} placeholder="e.g. Product team" /></div><div className="field-block"><label>Owner version <em>Optional</em></label><input value={ownerVersion} onChange={(event) => setOwnerVersion(event.target.value)} placeholder="e.g. 1.0" /></div></div>
         {currentStep === 1 && <div className="field-block"><label>Expected sections <em>Optional</em></label><input value={requiredSections} onChange={(event) => setRequiredSections(event.target.value)} placeholder="Scope, Requirements, Acceptance Criteria" /><span className="field-hint">Missing sections become review warnings, not upload blockers.</span></div>}
-        <div className={`drop-zone-modern ${dragging ? "dragging" : ""}`} onDragOver={(event) => { event.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={(event) => { event.preventDefault(); setDragging(false); chooseFile(event.dataTransfer.files?.[0]); }}>{currentStep === 1 && brds.length > 0 && !file ? <><div className="upload-icon existing"><FileText size={23} /></div><h3 className="existing-file-name" title={brds[0].active_revision?.filename || brds[0].logical_name}>{brds[0].active_revision?.filename || brds[0].logical_name}</h3><p>Current file - v{brds[0].active_revision?.revision || brds[0].revision || 1}</p><label className="choose-file">Upload replacement<input type="file" accept=".docx,.pdf,.txt,.md" onChange={(event) => chooseFile(event.target.files?.[0])} /></label></> : <><div className="upload-icon"><CloudUpload size={23} /></div><h3>Drop a file here</h3><p>or choose from your computer</p><label className="choose-file">Choose file<input type="file" accept=".docx,.pdf,.txt,.md" onChange={(event) => chooseFile(event.target.files?.[0])} /></label><span className="file-hint">DOCX, PDF, TXT or MD - up to 25 MB</span></>}</div>
+        <div className={`drop-zone-modern ${dragging ? "dragging" : ""}`} onDragOver={(event) => { event.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={(event) => { event.preventDefault(); setDragging(false); chooseFile(event.dataTransfer.files?.[0]); }}>{currentStep === 1 && brds.length > 0 && !file ? <><div className="upload-icon existing"><FileText size={23} /></div><h3 className="existing-file-name" title={brds[0].active_revision?.filename || brds[0].logical_name}>{brds[0].active_revision?.filename || brds[0].logical_name}</h3><p>Current file - v{brds[0].active_revision?.revision || brds[0].revision || 1}</p><label className="choose-file">Upload replacement<input type="file" accept=".docx,.pdf,.txt,.md,.json,.yaml,.yml,.sql,.csv" onChange={(event) => chooseFile(event.target.files?.[0])} /></label></> : <><div className="upload-icon"><CloudUpload size={23} /></div><h3>Drop a file here</h3><p>or choose from your computer</p><label className="choose-file">Choose file<input type="file" accept=".docx,.pdf,.txt,.md,.json,.yaml,.yml,.sql,.csv" onChange={(event) => chooseFile(event.target.files?.[0])} /></label><span className="file-hint">DOCX, PDF, TXT, MD, JSON, YAML, SQL or CSV - up to 25 MB</span></>}</div>
         {file && <div className="selected-file"><span className="file-type"><FileText size={17} /></span><div><strong>{file.name}</strong><span>{(file.size / 1024).toFixed(1)} KB - Ready to upload</span></div><button onClick={() => setFile(null)}><X size={17} /></button></div>}
-        <div className="panel-footer"><span className="secure-note"><ShieldCheck size={15} /> Original files are preserved securely</span><div className="panel-actions"><button className="primary-button" disabled={!file || busy || (sourceType !== "brd" && !brdSourceId)} onClick={handleUpload}>{busy ? <><LoaderCircle className="spin" size={16} /> Uploading...</> : <><CloudUpload size={16} /> {currentStep === 1 ? (brds.length ? "Upload updated BRD" : "Upload BRD") : "Add source"}</>}</button>{currentStep === 1 && brds.length > 0 && <button className="secondary-button" onClick={async () => { await refreshSources(project?.project_id); setStep(2); setSourceType("api_spec"); setBrdSourceId(brds[0].source_id); }}>Continue to sources <ChevronRight size={15} /></button>}</div></div>
+        <div className="panel-footer"><span className="secure-note"><ShieldCheck size={15} /> Original files are preserved securely</span><div className="panel-actions"><button className="primary-button" disabled={!file || busy || (sourceType !== "brd" && !brdSourceId)} onClick={handleUpload}>{busy ? <><LoaderCircle className="spin" size={16} /> Uploading...</> : <><CloudUpload size={16} /> {currentStep === 1 ? (brds.length ? "Upload updated BRD" : "Upload BRD") : "Add source"}</>}</button>{currentStep === 1 && brds.length > 0 && <button className="secondary-button" disabled={busy} onClick={async () => { await refreshSources(project?.project_id); continueToSources(); setSourceType("api_spec"); setBrdSourceId(brds[0].source_id); }}>Continue to sources <ChevronRight size={15} /></button>}</div></div>
       </section>
       <aside className="side-panel"><div className="side-panel-head"><span className="side-icon"><Sparkles size={17} /></span><div><h3>Smart processing</h3><p>What happens next</p></div></div><div className="info-list"><div><b>01</b><span>We preserve the original file and create a versioned revision.</span></div><div><b>02</b><span>AI extraction runs automatically with local fallback.</span></div><div><b>03</b><span>Every section stays traceable to its source and page.</span></div></div><div className="privacy-note"><ShieldCheck size={16} /><span>Your API key stays on the backend. It is never sent from this screen.</span></div></aside>
     </div>}
 
-    {currentStep === 2 && !manifest && <section className="source-list-card"><div className="list-card-header"><div><h2>Package sources</h2><p>{supporting.length ? "Your BRD and supporting context are ready to review." : "Your BRD is ready. Add a supporting source, or review now."}</p></div><span className="health-badge"><span /> {extractionPending ? "Processing" : "Healthy"}</span></div>{sources.map((source) => <SourceRow key={source.source_id} source={source} />)}<div className="list-card-actions"><button className="text-button" onClick={() => setStep(1)}>Back to BRD</button><button className="secondary-button" disabled={!packageReady} onClick={() => setStep(3)}><PackageCheck size={16} /> {packageReady ? "Review package" : "Waiting for extraction"} <ChevronRight size={15} /></button></div></section>}
-    {currentStep === 3 && !manifest && <section className="review-card"><div className="review-header"><div><div className="eyebrow">FINAL REVIEW</div><h2>Ready to create your package?</h2><p>This snapshot will lock the exact source revisions used for future traceability.</p></div><div className="review-check"><PackageCheck size={22} /></div></div><div className="review-summary"><div><span>Project</span><strong>{project?.project_name}</strong></div><div><span>Sources included</span><strong>{sources.length}</strong></div><div><span>Scope</span><strong>MVP</strong></div></div><div className="review-source-list">{sources.map((source) => <SourceRow key={source.source_id} source={source} compact />)}</div><div className="review-actions"><button className="text-button" onClick={() => setStep(2)}>Back to sources</button><button className="primary-button" onClick={createPackage} disabled={busy}>{busy ? <><LoaderCircle className="spin" size={16} /> Creating...</> : <><PackageCheck size={16} /> Create source package</>}</button></div></section>}
-    {manifest && <section className="success-card package-ready-card"><div className="success-mark"><Check size={26} /></div><div className="eyebrow">PACKAGE CREATED</div><h2>Your source package is ready</h2><p>All {manifest.items?.length || sources.length} source revisions are captured in an immutable snapshot.</p><div className="manifest-id"><span>Package version</span><strong>v{manifest.package_version || 1}</strong><span className="manifest-dot" /><span>Scope</span><strong>{manifest.scope || "MVP"}</strong></div><div className="success-actions"><button className="secondary-button" onClick={() => { setManifest(null); setStep(2); }}><RefreshCw size={16} /> Continue managing sources</button></div></section>}
-    {confirmNewPackage && <div className="modal-backdrop" role="presentation" onMouseDown={() => setConfirmNewPackage(false)}><div className="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="new-package-title" onMouseDown={(event) => event.stopPropagation()}><div className="confirm-icon"><Plus size={21} /></div><h2 id="new-package-title">Start a new package?</h2><p>Your current project and all created packages will remain saved. You'll begin a fresh source package here.</p><div className="confirm-actions"><button className="text-button" onClick={() => setConfirmNewPackage(false)}>Cancel</button><button className="primary-button" onClick={confirmResetProject}>Start new package</button></div></div></div>}
+    {currentStep === 2 && !manifest && <section className="source-list-card"><div className="list-card-header"><div><h2>Package sources</h2><p>{supporting.length ? "Your BRD and supporting context are ready to review." : "Your BRD is ready. Add a supporting source, or review now."}</p></div><span className="health-badge"><span /> {extractionPending ? "Processing" : "Healthy"}</span></div>{sources.map((source) => <SourceRow key={source.source_id} source={source} />)}<div className="list-card-actions"><button className="secondary-button" onClick={() => { setStep(1); setSourceType("brd"); setBrdSourceId(""); }}><ChevronLeft size={15} /> Back to BRD</button><button className="secondary-button" disabled={!packageReady} onClick={() => setStep(3)}><PackageCheck size={16} /> {packageReady ? "Review package" : "Waiting for extraction"} <ChevronRight size={15} /></button></div></section>}
+    {currentStep === 3 && !manifest && <section className="review-card"><div className="review-header"><div><div className="eyebrow">FINAL REVIEW</div><h2>Ready to create your package?</h2><p>This snapshot will lock the exact source revisions used for future traceability.</p></div><div className="review-check"><PackageCheck size={22} /></div></div><div className="field-block package-name-field"><label>Package name</label><input value={packageName} onChange={(event) => setPackageName(event.target.value)} placeholder="e.g. PBM Refill Reminder Source Package" /></div><div className="review-summary"><div><span>Project</span><strong>{project?.project_name}</strong></div><div><span>Sources included</span><strong>{sources.length}</strong></div><div><span>Scope</span><strong>MVP</strong></div></div><div className="review-source-list">{sources.map((source) => <SourceRow key={source.source_id} source={source} compact />)}</div><div className="review-actions"><button className="secondary-button" onClick={() => { setToast(""); setStep(2); }}><ChevronLeft size={15} /> Back to sources</button><button className="primary-button" onClick={createPackage} disabled={busy}>{busy ? <><LoaderCircle className="spin" size={16} /> Creating...</> : <><PackageCheck size={16} /> Create source package</>}</button></div></section>}
+    {manifest && <section className="success-card package-ready-card"><div className="success-mark"><Check size={26} /></div><div className="eyebrow">PACKAGE CREATED</div><h2>{manifest.package_name || packageName}</h2><p>All {manifest.items?.length || sources.length} source revisions are captured in an immutable snapshot.</p><div className="manifest-id"><span>Package version</span><strong>v{manifest.package_version || 1}</strong><span className="manifest-dot" /><span>Scope</span><strong>{manifest.scope || "MVP"}</strong></div><div className="success-actions"><button className="secondary-button" onClick={() => { setManifest(null); setToast(""); setStep(2); }}><RefreshCw size={16} /> Continue managing sources</button></div></section>}
+    {confirmNewPackage && <div className="modal-backdrop" role="presentation" onMouseDown={() => setConfirmNewPackage(false)}><div className="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="new-package-title" onMouseDown={(event) => event.stopPropagation()}><button type="button" className="modal-close" aria-label="Close new package dialog" onClick={() => setConfirmNewPackage(false)}><X size={18} /></button><div className="confirm-icon"><Plus size={21} /></div><h2 id="new-package-title">Start a new package?</h2><p>Your current project and all created packages will remain saved. You'll begin a fresh source package here.</p><div className="confirm-actions"><button className="secondary-button" onClick={() => setConfirmNewPackage(false)}>Cancel</button><button className="primary-button" onClick={confirmResetProject}>Start new package</button></div></div></div>}
   </div>;
 }
