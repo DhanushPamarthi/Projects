@@ -1,12 +1,12 @@
-import hashlib, json, mimetypes, uuid
+import difflib, hashlib, json, mimetypes, threading, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
-from .config import EXTRACTION_CONFIG_VERSION, EXTRACTION_PROMPT_VERSION, LOCAL_EXTRACTOR_VERSION, MAX_UPLOAD_BYTES, OPENAI_MODEL, REQUIRED_BRD_SECTIONS, SUPPORTED_EXTENSIONS, UPLOAD_DIR
+from .config import DATABASE_URL, EXTRACTION_CONFIG_VERSION, EXTRACTION_PROMPT_VERSION, LOCAL_EXTRACTOR_VERSION, MAX_UPLOAD_BYTES, OPENAI_MODEL, OPENAI_TIMEOUT_SECONDS, REQUIRED_BRD_SECTIONS, SUPPORTED_EXTENSIONS, UPLOAD_DIR
 from .db import connection, init_db
-from .extractors import extract_local, extract_openai, missing_sections
+from .extractors import extract_local, extract_openai, extraction_prompt_hash, missing_sections
 from .validation import validate_file_content
 
 app = FastAPI(title="TestIQ Source Package API", version="1.0.0")
@@ -15,6 +15,39 @@ SOURCE_TYPES = {"brd", "campaign_rules", "api_spec", "database_schema", "message
 def now(): return datetime.now(timezone.utc).isoformat()
 def uid(prefix): return f"{prefix}_{uuid.uuid4().hex}"
 def row_dict(row): return dict(row) if row else None
+
+def extraction_config_hash() -> str:
+    payload = {"model": OPENAI_MODEL, "timeout": OPENAI_TIMEOUT_SECONDS, "extractor": LOCAL_EXTRACTOR_VERSION, "config_version": EXTRACTION_CONFIG_VERSION}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+async def read_upload_with_limit(file: UploadFile) -> bytes:
+    chunks, total = [], 0
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk: break
+        total += len(chunk)
+        if total > MAX_UPLOAD_BYTES: raise HTTPException(413, "Uploaded file exceeds the maximum size")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+def extract_openai_with_timeout(text):
+    """Run the optional remote extractor without allowing the worker to hang."""
+    result, failure = [], []
+
+    def run():
+        try:
+            result.append(extract_openai(text))
+        except Exception as exc:
+            failure.append(exc)
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(OPENAI_TIMEOUT_SECONDS + 5)
+    if worker.is_alive():
+        raise TimeoutError(f"OpenAI extraction timed out after {OPENAI_TIMEOUT_SECONDS + 5:g} seconds")
+    if failure:
+        raise failure[0]
+    return result[0]
 
 def process_extraction(revision_id, source_id, extraction_id, storage_path, filename, required_sections):
     # Commit the visible processing state before doing local parsing or a network call.
@@ -28,7 +61,7 @@ def process_extraction(revision_id, source_id, extraction_id, storage_path, file
             local_text, local_sections = extract_local(filename, content)
             fallback_message = None
             try:
-                text, sections = extract_openai(local_text)
+                text, sections = extract_openai_with_timeout(local_text)
                 mode = "openai"
             except Exception as exc:
                 text, sections, mode = local_text, local_sections, "local"
@@ -37,12 +70,14 @@ def process_extraction(revision_id, source_id, extraction_id, storage_path, file
             messages.extend([f"Missing expected section: {item}" for item in missing_sections(local_sections, required_sections)])
             if fallback_message: messages.append(fallback_message)
             model = OPENAI_MODEL if mode == "openai" else LOCAL_EXTRACTOR_VERSION
-            conn.execute("UPDATE source_extraction SET mode=%s,status=%s,extracted_text=%s,error=%s,model_name=%s,prompt_version=%s,config_version=%s WHERE extraction_id=%s", (mode, "succeeded", text, fallback_message, model, EXTRACTION_PROMPT_VERSION, EXTRACTION_CONFIG_VERSION, extraction_id))
+            conn.execute("UPDATE source_extraction SET mode=%s,status=%s,extracted_text=%s,error=%s,model_name=%s,prompt_version=%s,config_version=%s,prompt_hash=%s,config_hash=%s WHERE extraction_id=%s", (mode, "succeeded", text, fallback_message, model, EXTRACTION_PROMPT_VERSION, EXTRACTION_CONFIG_VERSION, extraction_prompt_hash(), extraction_config_hash(), extraction_id))
             for index, section in enumerate(local_sections):
-                conn.execute("INSERT INTO source_fragment (fragment_id,revision_id,source_id,fragment_index,heading,source_reference,page_number,fragment_type,paragraph_index,table_index,row_index,cell_index,fragment_text) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (uid("frag"), revision_id, source_id, index, section.get("heading"), section.get("reference", "unknown"), section.get("page_number"), section.get("fragment_type", "paragraph"), section.get("paragraph_index"), section.get("table_index"), section.get("row_index"), section.get("cell_index"), section.get("text", "")))
+                fragment_text = section.get("text", "")
+                paragraph_index = section.get("paragraph_index")
+                conn.execute("INSERT INTO source_fragment (fragment_id,revision_id,source_id,fragment_index,heading,source_reference,page_number,fragment_type,paragraph_index,table_index,row_index,cell_index,heading_path,paragraph_start,paragraph_end,character_start,character_end,content_hash,extractor_version,provenance_mode,fragment_text) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (uid("frag"), revision_id, source_id, index, section.get("heading"), section.get("reference", "unknown"), section.get("page_number"), section.get("fragment_type", "paragraph"), paragraph_index, section.get("table_index"), section.get("row_index"), section.get("cell_index"), section.get("heading"), paragraph_index, paragraph_index, None, None, hashlib.sha256(fragment_text.encode("utf-8")).hexdigest(), LOCAL_EXTRACTOR_VERSION, mode, fragment_text))
             conn.execute("UPDATE source_revision SET status=%s,validation_messages=%s WHERE revision_id=%s", ("uploaded", json.dumps(messages), revision_id))
         except Exception as exc:
-            conn.execute("UPDATE source_extraction SET mode=%s,status=%s,error=%s,model_name=%s,prompt_version=%s,config_version=%s WHERE extraction_id=%s", ("local", "failed", str(exc), LOCAL_EXTRACTOR_VERSION, EXTRACTION_PROMPT_VERSION, EXTRACTION_CONFIG_VERSION, extraction_id))
+            conn.execute("UPDATE source_extraction SET mode=%s,status=%s,error=%s,model_name=%s,prompt_version=%s,config_version=%s,prompt_hash=%s,config_hash=%s WHERE extraction_id=%s", ("local", "failed", str(exc), LOCAL_EXTRACTOR_VERSION, EXTRACTION_PROMPT_VERSION, EXTRACTION_CONFIG_VERSION, extraction_prompt_hash(), extraction_config_hash(), extraction_id))
             row = conn.execute("SELECT validation_messages FROM source_revision WHERE revision_id=%s", (revision_id,)).fetchone()
             messages = json.loads(row["validation_messages"] or "[]") if row else []
             messages.append(f"Extraction failed: {exc}")
@@ -50,6 +85,8 @@ def process_extraction(revision_id, source_id, extraction_id, storage_path, file
 
 class ManifestRequest(BaseModel):
     source_ids: list[str] = Field(min_length=1)
+    # Kept optional for API compatibility with older clients; the UI always sends it.
+    package_name: str | None = Field(default=None, max_length=200)
     scope: str | None = None
 
 class ProjectRequest(BaseModel):
@@ -171,37 +208,66 @@ def get_project(project_id: str):
 async def upload_source(project_id: str, file: UploadFile = File(...), source_type: str = Form(...), owner: str | None = Form(None), owner_version: str | None = Form(None), brd_source_id: str | None = Form(None), required_sections: str | None = Form(None), background_tasks: BackgroundTasks = None):
     if source_type not in SOURCE_TYPES: raise HTTPException(422, "Unsupported source type")
     if source_type != "brd" and not brd_source_id: raise HTTPException(422, "Supporting sources must reference a BRD source")
-    content = await file.read()
-    if len(content) > MAX_UPLOAD_BYTES: raise HTTPException(413, "Uploaded file exceeds the maximum size")
+    content = await read_upload_with_limit(file)
     init_db()
+    with connection() as conn:
+        if not conn.execute("SELECT project_id FROM project WHERE project_id=%s", (project_id,)).fetchone():
+            raise HTTPException(404, "Project not found")
+        if source_type != "brd":
+            brd = conn.execute("SELECT * FROM source_document WHERE source_id=%s AND project_id=%s", (brd_source_id, project_id)).fetchone()
+            if not brd: raise HTTPException(422, "Associated BRD was not found in this project")
+            if brd["source_type"] != "brd": raise HTTPException(422, "Associated source must be a BRD")
+            if not brd["active_revision_id"]: raise HTTPException(422, "Associated BRD has no usable active revision")
+            brd_revision = conn.execute("SELECT status FROM source_revision WHERE revision_id=%s", (brd["active_revision_id"],)).fetchone()
+            brd_extraction = conn.execute("SELECT status FROM source_extraction WHERE revision_id=%s ORDER BY created_at DESC LIMIT 1", (brd["active_revision_id"],)).fetchone()
+            if not brd_revision or brd_revision["status"] in {"rejected", "extraction_failed"} or not brd_extraction or brd_extraction["status"] != "succeeded":
+                raise HTTPException(422, "Associated BRD must finish extraction successfully before adding supporting sources")
     try: detected_type, messages = validate_file_content(file.filename or "source", content, file.content_type)
     except ValueError as exc:
         source_id, revision_id = uid("src"), uid("rev"); path = UPLOAD_DIR / f"{revision_id}_{Path(file.filename or 'source').name}"; path.write_bytes(content)
         with connection() as conn:
-            conn.execute("INSERT INTO source_document (source_id,project_id,source_type,logical_name,owner_name,active_revision_id,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", (source_id, project_id, source_type, file.filename or "source", owner, None, now(), now()))
-            conn.execute("INSERT INTO source_revision (revision_id,source_id,revision,filename,content_type,size_bytes,sha256,storage_path,owner_version,ingestion_version,status,validation_messages,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (revision_id, source_id, 1, file.filename or "source", file.content_type, len(content), hashlib.sha256(content).hexdigest(), str(path), owner_version, "source-intake-v1", "rejected", json.dumps([str(exc)]), now()))
+            existing = conn.execute("SELECT * FROM source_document WHERE project_id=%s AND source_type=%s AND logical_name=%s", (project_id, source_type, file.filename or "source")).fetchone()
+            if existing:
+                source_id = existing["source_id"]
+                revision = (conn.execute("SELECT COALESCE(MAX(revision),0)+1 AS next_revision FROM source_revision WHERE source_id=%s", (source_id,)).fetchone()["next_revision"])
+            else:
+                revision = 1
+                conn.execute("INSERT INTO source_document (source_id,logical_source_id,project_id,source_type,logical_name,owner_name,active_revision_id,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)", (source_id, source_id, project_id, source_type, file.filename or "source", owner, None, now(), now()))
+            conn.execute("INSERT INTO source_revision (revision_id,source_id,revision,filename,content_type,size_bytes,sha256,storage_path,owner_version,ingestion_version,status,validation_messages,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (revision_id, source_id, revision, file.filename or "source", file.content_type, len(content), hashlib.sha256(content).hexdigest(), str(path), owner_version, "source-intake-v1", "rejected", json.dumps([str(exc)]), now()))
         return JSONResponse(status_code=415 if "Unsupported document format" in str(exc) else 422, content={"status": "rejected", "revision_id": revision_id, "source_id": source_id, "validation_messages": [str(exc)], "original_preserved": True})
     digest = hashlib.sha256(content).hexdigest(); filename = file.filename or "source"
     with connection() as conn:
         existing = conn.execute("SELECT s.*,r.* FROM source_document s JOIN source_revision r ON r.source_id=s.source_id WHERE s.project_id=%s AND s.source_type=%s AND s.logical_name=%s ORDER BY r.revision DESC", (project_id, source_type, filename)).fetchall()
+        # Content identity is project-scoped and independent of the physical
+        # filename. A renamed upload should remain traceable to its canonical
+        # logical source instead of creating a second package source.
+        if not existing:
+            renamed = conn.execute("SELECT s.*,r.* FROM source_document s JOIN source_revision r ON r.source_id=s.source_id WHERE s.project_id=%s AND s.source_type=%s AND r.sha256=%s ORDER BY r.revision DESC LIMIT 1", (project_id, source_type, digest)).fetchall()
+            if renamed:
+                existing = conn.execute("SELECT s.*,r.* FROM source_document s JOIN source_revision r ON r.source_id=s.source_id WHERE s.source_id=%s ORDER BY r.revision DESC", (renamed[0]["source_id"],)).fetchall()
+        if not existing and source_type == "brd":
+            # A project has one primary BRD source. A changed filename must
+            # still create a revision of that source, not a second BRD.
+            existing = conn.execute("SELECT s.*,r.* FROM source_document s JOIN source_revision r ON r.source_id=s.source_id WHERE s.project_id=%s AND s.source_type=%s ORDER BY s.updated_at DESC, r.revision DESC", (project_id, source_type)).fetchall()
         source = existing[0] if existing else None
         source_id = source["source_id"] if source else uid("src")
         if source and any(x["sha256"] == digest for x in existing):
-            reused_revision_id = next(x["revision_id"] for x in existing if x["sha256"] == digest)
+            reused_revision = next(x for x in existing if x["sha256"] == digest)
+            reused_revision_id = reused_revision["revision_id"]
             revision_id = uid("rev"); revision = max(x["revision"] for x in existing) + 1
-            conn.execute("INSERT INTO source_revision (revision_id,source_id,revision,filename,content_type,size_bytes,sha256,storage_path,owner_version,ingestion_version,status,validation_messages,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (revision_id, source_id, revision, filename, detected_type, len(content), digest, "", owner_version, "source-intake-v1", "uploaded", json.dumps(messages), now()))
+            conn.execute("INSERT INTO source_revision (revision_id,source_id,revision,filename,content_type,size_bytes,sha256,storage_path,owner_version,ingestion_version,status,validation_messages,duplicate_of_revision_id,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (revision_id, source_id, revision, filename, detected_type, len(content), digest, reused_revision["storage_path"], owner_version, "source-intake-v1", "uploaded", json.dumps(messages), reused_revision_id, now()))
             conn.execute("INSERT INTO source_extraction (extraction_id,revision_id,mode,status,extracted_text,error,extractor_version,model_name,prompt_version,config_version,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (uid("ext"), revision_id, "reused", "skipped", None, reused_revision_id, LOCAL_EXTRACTOR_VERSION, None, EXTRACTION_PROMPT_VERSION, EXTRACTION_CONFIG_VERSION, now()))
-            conn.execute("UPDATE source_document SET active_revision_id=%s,updated_at=%s WHERE source_id=%s", (revision_id, now(), source_id))
-            return JSONResponse(status_code=201, content={"status": "duplicate", "source_id": source_id, "revision_id": revision_id, "extraction": {"status": "skipped"}, "extraction_summary": {"status": "skipped", "extraction_mode": "reused", "reused_revision_id": reused_revision_id}})
+            return JSONResponse(status_code=201, content={"status": "duplicate", "source_id": source_id, "revision_id": revision_id, "active_revision_id": reused_revision_id, "duplicate_revision_id": revision_id, "extraction": {"status": "skipped", "mode": "reused"}, "extraction_summary": {"status": "succeeded", "extraction_mode": "reused", "reused_revision_id": reused_revision_id}})
         revision_id, path = uid("rev"), UPLOAD_DIR / f"{uid('file')}_{Path(filename).name}"; path.write_bytes(content)
         revision = (existing[0]["revision"] + 1) if existing else 1
-        if not source: conn.execute("INSERT INTO source_document (source_id,project_id,source_type,logical_name,owner_name,active_revision_id,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", (source_id, project_id, source_type, filename, owner, revision_id, now(), now()))
+        if not source: conn.execute("INSERT INTO source_document (source_id,logical_source_id,project_id,source_type,logical_name,owner_name,active_revision_id,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)", (source_id, source_id, project_id, source_type, filename, owner, revision_id, now(), now()))
         else: conn.execute("UPDATE source_document SET active_revision_id=%s,updated_at=%s WHERE source_id=%s", (revision_id, now(), source_id))
         conn.execute("INSERT INTO source_revision (revision_id,source_id,revision,filename,content_type,size_bytes,sha256,storage_path,owner_version,ingestion_version,status,validation_messages,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (revision_id, source_id, revision, filename, detected_type, len(content), digest, str(path), owner_version, "source-intake-v1", "pending", json.dumps(messages), now()))
         conn.execute("INSERT INTO source_extraction (extraction_id,revision_id,mode,status,extracted_text,error,extractor_version,model_name,prompt_version,config_version,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (uid("ext"), revision_id, "pending", "pending", None, None, LOCAL_EXTRACTOR_VERSION, None, EXTRACTION_PROMPT_VERSION, EXTRACTION_CONFIG_VERSION, now()))
-        if brd_source_id: conn.execute("INSERT OR IGNORE INTO source_relationship (relationship_id,brd_source_id,supporting_source_id,relationship_type,created_at) VALUES (%s,%s,%s,%s,%s)", (uid("rel"), brd_source_id, source_id, "supports", now()))
+        if brd_source_id: conn.execute("INSERT INTO source_relationship (relationship_id,brd_source_id,supporting_source_id,relationship_type,created_at) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (brd_source_id,supporting_source_id) DO NOTHING", (uid("rel"), brd_source_id, source_id, "supports", now()))
         extraction_id = conn.execute("SELECT extraction_id FROM source_extraction WHERE revision_id=%s", (revision_id,)).fetchone()["extraction_id"]
-    if background_tasks is not None: background_tasks.add_task(process_extraction, revision_id, source_id, extraction_id, str(path), filename, [x.strip() for x in (required_sections or ",".join(REQUIRED_BRD_SECTIONS)).split(",") if x.strip()])
+    expected_sections = [x.strip() for x in (required_sections or ",".join(REQUIRED_BRD_SECTIONS)).split(",") if x.strip()] if source_type == "brd" else []
+    if background_tasks is not None: background_tasks.add_task(process_extraction, revision_id, source_id, extraction_id, str(path), filename, expected_sections)
     return JSONResponse(status_code=202, content={"status": "accepted", "active": True, "source_id": source_id, "revision_id": revision_id, "revision": revision, "sha256": digest, "validation_messages": messages, "extraction": {"status": "pending"}})
 
 @app.get("/api/v1/projects/{project_id}/sources")
@@ -209,7 +275,21 @@ def list_sources(project_id: str):
     with connection() as conn:
         sources = conn.execute("SELECT * FROM source_document WHERE project_id=%s ORDER BY created_at", (project_id,)).fetchall(); result=[]
         for source in sources:
-            item=row_dict(source); rev=conn.execute("SELECT * FROM source_revision WHERE revision_id=%s", (source["active_revision_id"],)).fetchone() if source["active_revision_id"] else None; item["active_revision"]=row_dict(rev); item["extraction"]=row_dict(conn.execute("SELECT status,mode,error,model_name FROM source_extraction WHERE revision_id=%s ORDER BY created_at DESC LIMIT 1", (source["active_revision_id"],)).fetchone()) if source["active_revision_id"] else None; item["supporting_sources"]=[row_dict(x) for x in conn.execute("SELECT s.source_id,s.source_type,s.logical_name FROM source_relationship r JOIN source_document s ON s.source_id=r.supporting_source_id WHERE r.brd_source_id=%s", (source["source_id"],)).fetchall()]; result.append(item)
+            item = row_dict(source)
+            active = conn.execute("SELECT * FROM source_revision WHERE revision_id=%s", (source["active_revision_id"],)).fetchone() if source["active_revision_id"] else None
+            latest = active or conn.execute("SELECT * FROM source_revision WHERE source_id=%s ORDER BY revision DESC LIMIT 1", (source["source_id"],)).fetchone()
+            item["active_revision"] = row_dict(active)
+            item["latest_revision"] = row_dict(latest)
+            item["status"] = latest["status"] if latest else "unknown"
+            item["validation_messages"] = json.loads((latest["validation_messages"] if latest else "[]") or "[]")
+            item["extraction"] = row_dict(conn.execute("SELECT status,mode,error,model_name FROM source_extraction WHERE revision_id=%s ORDER BY created_at DESC LIMIT 1", (active["revision_id"] if active else (latest["revision_id"] if latest else ""),)).fetchone()) if latest else None
+            if item["source_type"] == "brd" and item["extraction"] and item["extraction"]["status"] == "succeeded":
+                has_fragments = conn.execute("SELECT 1 FROM source_fragment WHERE revision_id=%s LIMIT 1", (latest["revision_id"],)).fetchone()
+                if not has_fragments:
+                    item["status"] = "extraction_failed"
+                    item["validation_messages"].append("The BRD extraction produced no readable content")
+            item["supporting_sources"] = [row_dict(x) for x in conn.execute("SELECT s.source_id,s.source_type,s.logical_name FROM source_relationship r JOIN source_document s ON s.source_id=r.supporting_source_id WHERE r.brd_source_id=%s", (source["source_id"],)).fetchall()]
+            result.append(item)
         return result
 
 @app.get("/api/v1/revisions/{revision_id}")
@@ -221,19 +301,127 @@ def get_revision(revision_id: str):
         if extraction and extraction["mode"] == "reused": summary["reused_revision_id"] = extraction["error"]
         result["extraction_summary"]=summary; return result
 
+@app.get("/api/v1/sources/{source_id}/revisions")
+def list_source_revisions(source_id: str):
+    with connection() as conn:
+        source = conn.execute("SELECT * FROM source_document WHERE source_id=%s", (source_id,)).fetchone()
+        if not source: raise HTTPException(404, "Source not found")
+        revisions = conn.execute("SELECT r.*,e.mode,e.status AS extraction_status,e.model_name,e.prompt_version,e.config_version,e.prompt_hash,e.config_hash,e.extractor_version FROM source_revision r LEFT JOIN source_extraction e ON e.revision_id=r.revision_id WHERE r.source_id=%s ORDER BY r.revision DESC", (source_id,)).fetchall()
+        return {"source": row_dict(source), "revisions": [row_dict(revision) for revision in revisions]}
+
+@app.get("/api/v1/sources/{source_id}/parent-brd")
+def get_source_parent_brd(source_id: str):
+    with connection() as conn:
+        source = conn.execute("SELECT * FROM source_document WHERE source_id=%s", (source_id,)).fetchone()
+        if not source: raise HTTPException(404, "Source not found")
+        parent = conn.execute("SELECT b.* FROM source_relationship rel JOIN source_document b ON b.source_id=rel.brd_source_id WHERE rel.supporting_source_id=%s", (source_id,)).fetchone()
+        if not parent: raise HTTPException(404, "No parent BRD is associated with this source")
+        return row_dict(parent)
+
+class ActiveRevisionRequest(BaseModel):
+    revision_id: str = Field(min_length=1)
+
+@app.post("/api/v1/sources/{source_id}/active-revision")
+def select_active_revision(source_id: str, request: ActiveRevisionRequest):
+    with connection() as conn:
+        source = conn.execute("SELECT * FROM source_document WHERE source_id=%s", (source_id,)).fetchone()
+        revision = conn.execute("SELECT r.*,e.status AS extraction_status FROM source_revision r LEFT JOIN source_extraction e ON e.revision_id=r.revision_id WHERE r.source_id=%s AND r.revision_id=%s ORDER BY e.created_at DESC LIMIT 1", (source_id, request.revision_id)).fetchone()
+        if not source: raise HTTPException(404, "Source not found")
+        if not revision: raise HTTPException(404, "Revision not found for this source")
+        if revision["status"] in {"rejected", "extraction_failed", "pending", "processing"} or revision["extraction_status"] != "succeeded":
+            raise HTTPException(422, "Only a successfully extracted revision can be made active")
+        conn.execute("UPDATE source_document SET active_revision_id=%s,updated_at=%s WHERE source_id=%s", (request.revision_id, now(), source_id))
+        return {"source_id": source_id, "active_revision_id": request.revision_id}
+
+@app.get("/api/v1/revisions/{revision_id}/compare/{other_revision_id}")
+def compare_revisions(revision_id: str, other_revision_id: str):
+    with connection() as conn:
+        revisions = conn.execute("SELECT r.*,s.source_id,s.logical_name,s.source_type FROM source_revision r JOIN source_document s ON s.source_id=r.source_id WHERE r.revision_id IN (%s,%s)", (revision_id, other_revision_id)).fetchall()
+        by_id = {row["revision_id"]: row for row in revisions}
+        if revision_id not in by_id or other_revision_id not in by_id: raise HTTPException(404, "One or both revisions were not found")
+        def details(row):
+            extraction = conn.execute("SELECT status,mode,extracted_text FROM source_extraction WHERE revision_id=%s ORDER BY created_at DESC LIMIT 1", (row["revision_id"],)).fetchone()
+            return {"revision_id": row["revision_id"], "source_id": row["source_id"], "logical_name": row["logical_name"], "revision": row["revision"], "filename": row["filename"], "sha256": row["sha256"], "status": row["status"], "extraction_status": extraction["status"] if extraction else None, "text": extraction["extracted_text"] if extraction else None}
+        left, right = details(by_id[revision_id]), details(by_id[other_revision_id])
+        diff = list(difflib.unified_diff((left["text"] or "").splitlines(), (right["text"] or "").splitlines(), fromfile=revision_id, tofile=other_revision_id, lineterm=""))
+        return {"from": left, "to": right, "changed": left["sha256"] != right["sha256"], "same_source": left["source_id"] == right["source_id"], "unified_diff": diff}
+
+@app.get("/api/v1/ingestion-runs/{run_id}")
+def get_ingestion_run(run_id: str):
+    with connection() as conn:
+        run = conn.execute("SELECT * FROM source_ingestion_run WHERE run_id=%s", (run_id,)).fetchone()
+        if not run: raise HTTPException(404, "Ingestion run not found")
+        result = row_dict(run)
+        result["configuration_snapshot"] = json.loads(result["configuration_snapshot"] or "{}")
+        return result
+
+class ManifestLifecycleRequest(BaseModel):
+    status: str = Field(pattern="^(ready|invalidated|published)$")
+
+@app.post("/api/v1/manifests/{package_id}/lifecycle")
+def update_manifest_lifecycle(package_id: str, request: ManifestLifecycleRequest):
+    with connection() as conn:
+        manifest = conn.execute("SELECT * FROM source_package_manifest WHERE package_id=%s", (package_id,)).fetchone()
+        if not manifest: raise HTTPException(404, "Package manifest not found")
+        current = manifest["lifecycle_status"] or "draft"
+        allowed = {"draft": {"ready", "invalidated"}, "ready": {"published", "invalidated"}, "invalidated": {"ready"}, "published": set()}
+        if request.status not in allowed.get(current, set()):
+            raise HTTPException(409, f"Cannot change manifest lifecycle from {current} to {request.status}")
+        conn.execute("UPDATE source_package_manifest SET lifecycle_status=%s WHERE package_id=%s", (request.status, package_id))
+        return {"package_id": package_id, "lifecycle_status": request.status}
+
 @app.post("/api/v1/projects/{project_id}/manifests", status_code=201)
 def create_manifest(project_id: str, request: ManifestRequest):
     with connection() as conn:
-        sources=[]
-        for sid in request.source_ids:
-            source=conn.execute("SELECT * FROM source_document WHERE source_id=%s AND project_id=%s",(sid,project_id)).fetchone()
-            if not source: raise HTTPException(404,"Source not found")
-            if not source["active_revision_id"]: raise HTTPException(422,"Source has no active revision")
+        if not conn.execute("SELECT project_id FROM project WHERE project_id=%s", (project_id,)).fetchone(): raise HTTPException(404, "Project not found")
+        source_ids = list(dict.fromkeys(request.source_ids))
+        if not source_ids: raise HTTPException(422, "At least one source is required")
+        sources = []
+        for sid in source_ids:
+            source = conn.execute("SELECT * FROM source_document WHERE source_id=%s AND project_id=%s", (sid, project_id)).fetchone()
+            if not source: raise HTTPException(404, "Source not found")
+            if not source["active_revision_id"]: raise HTTPException(422, "Source has no usable active revision")
             sources.append(source)
-        version=conn.execute("SELECT COALESCE(MAX(package_version),0)+1 AS next_version FROM source_package_manifest WHERE project_id=%s",(project_id,)).fetchone()["next_version"]; package_id=uid("pkg"); conn.execute("INSERT INTO source_package_manifest VALUES (%s,%s,%s,%s,%s)",(package_id,project_id,version,request.scope,now())); items=[]
+        brds = [source for source in sources if source["source_type"] == "brd"]
+        if not brds: raise HTTPException(422, "A source package must contain at least one BRD")
+        resolved = []
         for source in sources:
-            rev=conn.execute("SELECT r.*,e.mode,e.model_name,e.prompt_version,e.config_version FROM source_revision r LEFT JOIN source_extraction e ON e.revision_id=r.revision_id WHERE r.revision_id=%s ORDER BY e.created_at DESC LIMIT 1",(source["active_revision_id"],)).fetchone(); conn.execute("INSERT INTO source_package_item (package_id,source_id,revision_id,source_version,ingestion_status,ingestion_version,content_hash,model_name,prompt_version,config_version) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",(package_id,source["source_id"],rev["revision_id"],rev["owner_version"],rev["status"],rev["ingestion_version"],rev["sha256"],rev["model_name"],rev["prompt_version"],rev["config_version"])); items.append({"source_id":source["source_id"],"revision_id":rev["revision_id"],"ingestion_status":rev["status"],"content_hash":rev["sha256"],"model_name":rev["model_name"],"prompt_version":rev["prompt_version"],"config_version":rev["config_version"]})
-        return {"package_id":package_id,"project_id":project_id,"package_version":version,"scope":request.scope,"items":items}
+            revision = conn.execute("SELECT r.*,e.extraction_id,e.mode,e.status AS extraction_status,e.extracted_text,e.error,e.model_name,e.prompt_version,e.config_version,e.prompt_hash,e.config_hash,e.extractor_version FROM source_revision r LEFT JOIN source_extraction e ON e.revision_id=r.revision_id WHERE r.revision_id=%s ORDER BY e.created_at DESC LIMIT 1", (source["active_revision_id"],)).fetchone()
+            if not revision: raise HTTPException(422, "Source revision metadata is incomplete")
+            if revision["extraction_status"] == "skipped" and revision["mode"] == "reused" and revision["error"]:
+                canonical = conn.execute("SELECT r.*,e.extraction_id,e.mode,e.status AS extraction_status,e.error,e.model_name,e.prompt_version,e.config_version,e.prompt_hash,e.config_hash,e.extractor_version FROM source_revision r LEFT JOIN source_extraction e ON e.revision_id=r.revision_id WHERE r.revision_id=%s", (revision["error"],)).fetchone()
+                revision = canonical or revision
+            if revision["extraction_status"] != "succeeded" or revision["status"] in {"rejected", "extraction_failed", "processing", "pending"}:
+                raise HTTPException(422, f"Source '{source['logical_name']}' is not ready for packaging")
+            if source["source_type"] == "brd":
+                has_fragments = conn.execute("SELECT 1 FROM source_fragment WHERE revision_id=%s LIMIT 1", (revision["revision_id"],)).fetchone()
+                if not (revision["extracted_text"] or "").strip() or not has_fragments:
+                    raise HTTPException(422, f"BRD '{source['logical_name']}' contains no readable extracted content")
+            if source["source_type"] != "brd":
+                placeholders = ",".join(["%s"] * len(brds))
+                relation = conn.execute(f"SELECT 1 FROM source_relationship WHERE supporting_source_id=%s AND brd_source_id IN ({placeholders})", tuple([source["source_id"]] + [brd["source_id"] for brd in brds])).fetchone()
+                if not relation: raise HTTPException(422, f"Supporting source '{source['logical_name']}' is not linked to a BRD in this package")
+            resolved.append((source, revision))
+        manifest_payload = sorted(([{"revision_id": revision["revision_id"], "content_hash": revision["sha256"]} for _, revision in resolved]), key=lambda item: item["revision_id"])
+        manifest_hash = hashlib.sha256(json.dumps(manifest_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        package_name = (request.package_name or f"{request.scope or 'Source'} package").strip()
+        if not package_name: raise HTTPException(422, "Package name cannot be empty")
+        # PostgreSQL does not allow FOR UPDATE with aggregate functions. Lock
+        # the owning project row first so package-version allocation remains
+        # serialized for this project, then calculate MAX safely.
+        if DATABASE_URL:
+            conn.execute("SELECT project_id FROM project WHERE project_id=%s FOR UPDATE", (project_id,)).fetchone()
+        version_query = "SELECT COALESCE(MAX(package_version),0)+1 AS next_version FROM source_package_manifest WHERE project_id=%s"
+        version = conn.execute(version_query, (project_id,)).fetchone()["next_version"]
+        package_id, run_id, timestamp = uid("pkg"), uid("run"), now()
+        configuration_snapshot = json.dumps({"extractor_version": LOCAL_EXTRACTOR_VERSION, "prompt_version": EXTRACTION_PROMPT_VERSION, "prompt_hash": extraction_prompt_hash(), "config_version": EXTRACTION_CONFIG_VERSION, "config_hash": extraction_config_hash()}, sort_keys=True)
+        conn.execute("INSERT INTO source_ingestion_run (run_id,project_id,package_id,status,configuration_snapshot,created_at) VALUES (%s,%s,%s,%s,%s,%s)", (run_id, project_id, package_id, "succeeded", configuration_snapshot, timestamp))
+        conn.execute("INSERT INTO source_package_manifest (package_id,project_id,package_version,package_name,scope,manifest_hash,lifecycle_status,run_id,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)", (package_id, project_id, version, package_name, request.scope, manifest_hash, "ready", run_id, timestamp))
+        items = []
+        for source, revision in resolved:
+            conn.execute("INSERT INTO source_package_item (package_id,source_id,revision_id,source_version,ingestion_status,ingestion_version,content_hash,model_name,prompt_version,config_version,extractor_version,prompt_hash,config_hash,duplicate_of_revision_id) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (package_id, source["source_id"], revision["revision_id"], revision["owner_version"], revision["extraction_status"], revision["ingestion_version"], revision["sha256"], revision["model_name"], revision["prompt_version"], revision["config_version"], revision["extractor_version"], revision["prompt_hash"], revision["config_hash"], revision["duplicate_of_revision_id"]))
+            items.append({"source_id": source["source_id"], "revision_id": revision["revision_id"], "ingestion_status": revision["extraction_status"], "content_hash": revision["sha256"], "model_name": revision["model_name"], "prompt_version": revision["prompt_version"], "config_version": revision["config_version"], "extractor_version": revision["extractor_version"], "prompt_hash": revision["prompt_hash"], "config_hash": revision["config_hash"]})
+        return {"package_id": package_id, "project_id": project_id, "package_version": version, "package_name": package_name, "scope": request.scope, "manifest_hash": manifest_hash, "lifecycle_status": "ready", "run_id": run_id, "items": items}
 
 @app.get("/api/v1/projects/{project_id}/manifests")
 def list_manifests(project_id: str):
