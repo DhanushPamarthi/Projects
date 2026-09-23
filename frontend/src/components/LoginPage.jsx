@@ -22,6 +22,7 @@ import {
 } from "react-bootstrap";
 import styles from "./LoginPage.module.css";
 import { loginUser } from "../api/client.js";
+import { toast } from "react-toastify";
 
 const FEATURES = [
   {
@@ -116,7 +117,7 @@ function ProductPanel() {
       </div>
       <img
         className={styles.workflowImage}
-        src="/ChatGPT%20Image%20Sep%2015,%202026,%2004_55_46%20PM%20%282%29.png"
+        src="/loginflow.png"
         alt="TestIQ workflow from requirements to validation"
       />
     </div>
@@ -144,6 +145,8 @@ export function LoginPage({ onLogin, onRegister }) {
     try {
       const user = await loginUser(email, password);
       localStorage.setItem("testiq_current_user", JSON.stringify(user));
+      localStorage.setItem("testiq_local_session", "true");
+      toast.success("Login successful. Welcome back to TestIQ.");
       onLogin(user);
       return;
     } catch {
@@ -160,6 +163,8 @@ export function LoginPage({ onLogin, onRegister }) {
       }
 
       localStorage.setItem("testiq_current_user", JSON.stringify(user));
+      localStorage.setItem("testiq_local_session", "true");
+      toast.success("Login successful. Welcome back to TestIQ.");
       onLogin(user);
       setIsLoading(false);
     }, 500);
