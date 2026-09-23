@@ -1,0 +1,419 @@
+.page {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  overflow: hidden;
+  background: #f8f9fb;
+}
+
+.blob {
+  position: absolute;
+  pointer-events: none;
+  border-radius: 50%;
+}
+
+.blobOrange {
+  width: 700px;
+  height: 700px;
+  background: radial-gradient(
+    circle,
+    rgba(255, 86, 64, 0.04) 0%,
+    transparent 70%
+  );
+  top: -200px;
+  right: -200px;
+}
+
+.blobNavy {
+  width: 600px;
+  height: 600px;
+  background: radial-gradient(
+    circle,
+    rgba(25, 43, 55, 0.03) 0%,
+    transparent 70%
+  );
+  bottom: -150px;
+  left: -100px;
+}
+
+.brandHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 18px 1rem;
+  background: white;
+  border-bottom: 1px solid #e8eaeb;
+}
+
+@media (min-width: 768px) {
+  .brandHeader {
+    padding-left: 3rem;
+    padding-right: 3rem;
+  }
+}
+
+.logoContainer {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.logoBox {
+  width: 44px;
+  height: 44px;
+  background: #ff5640;
+  border-radius: 0.75rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.logoText {
+  line-height: 1;
+}
+
+.logoTitle {
+  font-weight: 700;
+  color: #192b37;
+  font-size: 1.4rem;
+  margin: 0;
+}
+
+.logoSubtitle {
+  font-size: 0.85rem;
+  color: #999;
+  margin-top: 0.25rem;
+}
+
+.tagline {
+  font-size: 0.85rem;
+  color: #6c7982;
+  display: none;
+}
+
+@media (min-width: 768px) {
+  .tagline {
+    display: block;
+  }
+}
+
+.mainContent {
+  flex-grow: 1;
+  display: flex;
+  align-items: center;
+  position: relative;
+}
+
+.contentWrapper {
+  padding: 3rem 1rem;
+}
+
+@media (min-width: 768px) {
+  .contentWrapper {
+    padding: 3rem;
+  }
+}
+
+.productPanel {
+  padding-right: 0;
+}
+
+@media (min-width: 992px) {
+  .productPanel {
+    padding-right: 3rem;
+  }
+}
+
+.heading {
+  color: #192b37;
+  font-size: clamp(2rem, 4vw, 3.2rem);
+  line-height: 1.08;
+  letter-spacing: -0.02em;
+  margin: 0 0 1.5rem 0;
+  font-weight: 700;
+}
+
+.description {
+  color: #5d6c75;
+  max-width: 540px;
+  font-size: 1.05rem;
+  line-height: 1.6;
+  margin: 0 0 2rem 0;
+}
+
+.featuresGrid {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+  margin-bottom: 3rem;
+  max-width: 420px;
+}
+
+.featureItem {
+  display: flex;
+  align-items: flex-start;
+  gap: 1rem;
+}
+
+.featureIcon {
+  width: 50px;
+  height: 50px;
+  border-radius: 50%;
+  background: #edf2f7;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: #5d7a8c;
+}
+
+.featureTitle {
+  font-weight: 600;
+  color: #192b37;
+  font-size: 0.95rem;
+  margin: 0;
+}
+
+.featureDesc {
+  font-size: 0.86rem;
+  color: #999;
+  margin-top: 0.15rem;
+}
+
+.taglineContainer {
+  padding-top: 1.5rem;
+  max-width: 450px;
+  border-top: 1px solid #e8eaeb;
+}
+
+.taglineSeparator {
+  color: #ff5640;
+  margin-right: 0.5rem;
+}
+
+.taglineText {
+  margin-left: 0.5rem;
+  font-style: italic;
+  color: #6c7a8c;
+}
+
+.card {
+  border: none;
+  width: 100%;
+  max-width: 420px;
+  margin: 0 auto;
+  border-radius: 24px;
+  box-shadow: 0 24px 70px rgba(25, 43, 55, 0.09);
+}
+
+.cardBody {
+  padding: 2rem 1.5rem;
+}
+
+@media (min-width: 768px) {
+  .cardBody {
+    padding: 3rem;
+  }
+}
+
+.cardTitle {
+  color: #192b37;
+  font-size: 1.6rem;
+  font-weight: 700;
+  margin: 0 0 0.5rem 0;
+}
+
+.cardSubtitle {
+  color: #999;
+  margin: 0 0 1.5rem 0;
+}
+
+.formGroup {
+  margin-bottom: 1rem;
+}
+
+.label {
+  color: #192b37;
+  font-weight: 600;
+  font-size: 0.9rem;
+  display: block;
+  margin-bottom: 0.5rem;
+}
+
+.inputWrapper {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.input {
+  width: 100%;
+  border: 1px solid #dee2e5;
+  border-radius: 10px;
+  padding: 0.68rem 0.75rem 0.68rem 2.5rem;
+  font-size: 0.95rem;
+  color: #192b37;
+  font-family: inherit;
+}
+
+.input::placeholder {
+  color: #9aa6ad;
+}
+
+.input:focus {
+  outline: none;
+  border-color: #ff5640;
+  box-shadow: 0 0 0 3px rgba(255, 86, 64, 0.1);
+}
+
+.inputIcon {
+  position: absolute;
+  left: 0.75rem;
+  color: #9aa6ad;
+  pointer-events: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.toggleIcon {
+  position: absolute;
+  right: 0.75rem;
+  background: none;
+  border: none;
+  color: #9aa6ad;
+  cursor: pointer;
+  padding: 0.25rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.toggleIcon:hover {
+  color: #192b37;
+}
+
+.checkbox {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 1rem 0;
+  font-size: 0.85rem;
+}
+
+.checkboxInput {
+  cursor: pointer;
+}
+
+.button {
+  width: 100%;
+  background: #ff5640;
+  border: none;
+  border-radius: 10px;
+  font-weight: 700;
+  padding: 0.68rem;
+  color: white;
+  cursor: pointer;
+  font-size: 0.95rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+  transition: background 0.2s ease;
+}
+
+.button:hover:not(:disabled) {
+  background: #d63d2b;
+}
+
+.button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.divider {
+  position: relative;
+  text-align: center;
+  margin: 1.5rem 0;
+  color: #9aa6ad;
+  font-size: 0.85rem;
+}
+
+.divider::before {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: #dee2e5;
+}
+
+.dividerText {
+  position: relative;
+  background: white;
+  padding: 0 0.75rem;
+}
+
+.googleButton {
+  width: 100%;
+  background: white;
+  border: 1px solid #dee2e5;
+  border-radius: 10px;
+  color: #192b37;
+  font-weight: 600;
+  padding: 0.68rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  font-size: 0.95rem;
+  transition:
+    background 0.2s ease,
+    border-color 0.2s ease;
+}
+
+.googleButton:hover {
+  border-color: #ff5640;
+  background: #fff5f0;
+}
+
+.googleIcon {
+  font-size: 1.2rem;
+  font-weight: 800;
+  color: #ff5640;
+}
+
+.footer {
+  text-align: center;
+  margin-top: 1.5rem;
+  font-size: 0.9rem;
+  color: #6c7982;
+}
+
+.footerLink {
+  background: none;
+  border: none;
+  color: #ff5640;
+  font-weight: 700;
+  cursor: pointer;
+  text-decoration: none;
+  padding: 0;
+}
+
+.alert {
+  background: #fff5f0;
+  border: 1px solid #fed7aa;
+  border-radius: 6px;
+  padding: 0.75rem;
+  color: #9a3412;
+  font-size: 0.9rem;
+  margin-bottom: 1rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}

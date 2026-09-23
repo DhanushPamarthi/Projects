@@ -1,0 +1,66 @@
+.jsonContainer {
+  position: relative;
+  background: #1e1e1e;
+  border: 1px solid #e3e7ef;
+  border-radius: 8px;
+  overflow: hidden;
+  max-height: 24rem;
+  overflow-y: auto;
+}
+
+.jsonContent {
+  margin: 0;
+  padding: 1rem;
+  font-family: "Fira Code", "Monaco", "Courier New", monospace;
+  font-size: 0.85rem;
+  color: #d4d4d4;
+  line-height: 1.5;
+  white-space: pre;
+  overflow: auto;
+}
+
+.jsonContent::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.jsonContent::-webkit-scrollbar-track {
+  background: #2d2d2d;
+}
+
+.jsonContent::-webkit-scrollbar-thumb {
+  background: #555;
+  border-radius: 4px;
+}
+
+.jsonContent::-webkit-scrollbar-thumb:hover {
+  background: #888;
+}
+
+.jsonString {
+  color: #ce9178;
+}
+
+.jsonNumber {
+  color: #b5cea8;
+}
+
+.jsonBoolean {
+  color: #569cd6;
+}
+
+.jsonNull {
+  color: #569cd6;
+}
+
+.jsonKey {
+  color: #9cdcfe;
+}
+
+.noData {
+  padding: 2rem;
+  text-align: center;
+  color: #999;
+  background: #f8f9fb;
+  border-radius: 8px;
+}
