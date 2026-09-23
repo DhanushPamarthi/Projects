@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+data/
+.venv/
+.debug-data/
+.test-data/
+__pycache__/
+.pytest_cache/
+pytest-cache-files/
