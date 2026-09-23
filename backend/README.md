@@ -4,7 +4,7 @@ FastAPI service for BRD ingestion, source-package creation, and Requirements Ana
 
 ## What this service does
 
-- Accepts BRD files and supporting sources (`.docx`, `.pdf`, `.txt`, `.md`).
+- Accepts BRD files and supporting sources (`.docx`, `.pdf`, `.txt`, `.md`, `.json`, `.yaml`, `.yml`, `.sql`, `.csv`). JSON is syntax-validated; other structured sources are preserved and extracted as UTF-8 text.
 - Preserves original files and immutable source revisions.
 - Extracts traceable fragments with paragraph, table, page, or line references.
 - Uses OpenAI extraction when configured and local extraction as a fallback.
@@ -105,6 +105,10 @@ Expected health response:
 | POST | `/api/v1/projects/{project_id}/sources` | Upload a BRD or supporting source |
 | GET | `/api/v1/projects/{project_id}/sources` | List sources and extraction status |
 | GET | `/api/v1/revisions/{revision_id}` | Read extraction and fragments |
+| GET | `/api/v1/sources/{source_id}/revisions` | List all revisions for a logical source |
+| GET | `/api/v1/revisions/{revision_id}/compare/{other_revision_id}` | Compare two revisions with a unified diff |
+| POST | `/api/v1/sources/{source_id}/active-revision` | Select a successfully extracted active revision |
+| GET | `/api/v1/sources/{source_id}/parent-brd` | Find a supporting source's parent BRD |
 | POST | `/api/v1/projects/{project_id}/manifests` | Create an immutable source package |
 | GET | `/api/v1/projects/{project_id}/manifests` | List package versions |
 | GET | `/api/v1/manifests/{package_id}` | Read exact package revisions |
@@ -112,6 +116,8 @@ Expected health response:
 | GET | `/api/v1/packages/{package_id}/requirements` | List analysis versions |
 | GET | `/api/v1/requirement-analyses/{analysis_id}` | Read an analysis contract |
 | POST | `/api/v1/requirement-analyses/{analysis_id}/review` | Record approval/rejection and review metadata |
+| POST | `/api/v1/manifests/{package_id}/lifecycle` | Move a package to ready, invalidated, or published |
+| GET | `/api/v1/ingestion-runs/{run_id}` | Read run configuration and provenance |
 
 ## Upload example
 

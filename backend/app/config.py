@@ -13,4 +13,4 @@ EXTRACTION_CONFIG_VERSION = os.getenv("EXTRACTION_CONFIG_VERSION", "1.0.0")
 LOCAL_EXTRACTOR_VERSION = os.getenv("LOCAL_EXTRACTOR_VERSION", "local-parser-v1")
 REQUIRED_BRD_SECTIONS = [item.strip() for item in os.getenv("REQUIRED_BRD_SECTIONS", "").split(",") if item.strip()]
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
-SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md"}
+SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".json", ".yaml", ".yml", ".sql", ".csv"}

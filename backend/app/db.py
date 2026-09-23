@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS testiq.project (
   project_id TEXT PRIMARY KEY, project_name TEXT NOT NULL, created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS testiq.source_document (
-  source_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, source_type TEXT NOT NULL,
+  source_id TEXT PRIMARY KEY, logical_source_id TEXT NOT NULL, project_id TEXT NOT NULL REFERENCES testiq.project(project_id), source_type TEXT NOT NULL CHECK (source_type IN ('brd','campaign_rules','api_spec','database_schema','message_template','ui_description')),
   logical_name TEXT NOT NULL, owner_name TEXT, active_revision_id TEXT,
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
   UNIQUE(project_id, source_type, logical_name)
@@ -27,30 +27,35 @@ CREATE TABLE IF NOT EXISTS testiq.source_revision (
 );
 CREATE TABLE IF NOT EXISTS testiq.source_fragment (
   fragment_id TEXT PRIMARY KEY, revision_id TEXT NOT NULL REFERENCES testiq.source_revision(revision_id),
-  source_id TEXT,
+  source_id TEXT NOT NULL REFERENCES testiq.source_document(source_id),
   fragment_index INTEGER NOT NULL, heading TEXT, source_reference TEXT NOT NULL,
   page_number INTEGER, fragment_type TEXT NOT NULL DEFAULT 'paragraph',
   paragraph_index INTEGER, table_index INTEGER, row_index INTEGER, cell_index INTEGER,
-  fragment_text TEXT NOT NULL,
+  heading_path TEXT, paragraph_start INTEGER, paragraph_end INTEGER, character_start INTEGER, character_end INTEGER,
+  content_hash TEXT, extractor_version TEXT, fragment_text TEXT NOT NULL,
   UNIQUE(revision_id, fragment_index)
 );
 CREATE TABLE IF NOT EXISTS testiq.source_extraction (
   extraction_id TEXT PRIMARY KEY, revision_id TEXT NOT NULL REFERENCES testiq.source_revision(revision_id),
   mode TEXT NOT NULL, status TEXT NOT NULL, extracted_text TEXT, error TEXT,
   extractor_version TEXT NOT NULL, model_name TEXT, prompt_version TEXT,
-  config_version TEXT, created_at TEXT NOT NULL
+  config_version TEXT, prompt_hash TEXT, config_hash TEXT, created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS testiq.source_package_manifest (
-  package_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, package_version INTEGER NOT NULL,
-  scope TEXT, created_at TEXT NOT NULL, UNIQUE(project_id, package_version)
+  package_id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES testiq.project(project_id), package_version INTEGER NOT NULL,
+  package_name TEXT, scope TEXT, manifest_hash TEXT, lifecycle_status TEXT NOT NULL DEFAULT 'draft', run_id TEXT, created_at TEXT NOT NULL, UNIQUE(project_id, package_version)
 );
 CREATE TABLE IF NOT EXISTS testiq.source_package_item (
   package_id TEXT NOT NULL REFERENCES testiq.source_package_manifest(package_id),
   source_id TEXT NOT NULL REFERENCES testiq.source_document(source_id),
   revision_id TEXT NOT NULL REFERENCES testiq.source_revision(revision_id),
   source_version TEXT, ingestion_status TEXT NOT NULL DEFAULT 'unknown', ingestion_version TEXT,
-  content_hash TEXT, model_name TEXT, prompt_version TEXT, config_version TEXT,
+  content_hash TEXT, model_name TEXT, prompt_version TEXT, config_version TEXT, extractor_version TEXT, prompt_hash TEXT, config_hash TEXT, duplicate_of_revision_id TEXT,
   PRIMARY KEY(package_id, source_id)
+);
+CREATE TABLE IF NOT EXISTS testiq.source_ingestion_run (
+  run_id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES testiq.project(project_id), package_id TEXT, status TEXT NOT NULL,
+  configuration_snapshot TEXT NOT NULL, created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS testiq.source_relationship (
   relationship_id TEXT PRIMARY KEY, brd_source_id TEXT NOT NULL REFERENCES testiq.source_document(source_id),
@@ -60,7 +65,7 @@ CREATE TABLE IF NOT EXISTS testiq.source_relationship (
 );
 CREATE TABLE IF NOT EXISTS testiq.test_run (
   run_id TEXT PRIMARY KEY, package_id TEXT NOT NULL REFERENCES testiq.source_package_manifest(package_id),
-  project_id TEXT NOT NULL, status TEXT NOT NULL, configuration_snapshot TEXT,
+  project_id TEXT NOT NULL REFERENCES testiq.project(project_id), status TEXT NOT NULL, configuration_snapshot TEXT,
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS testiq.requirement_analysis (
@@ -82,6 +87,7 @@ CREATE TABLE IF NOT EXISTS testiq.requirement_analysis (
 SQLITE_SCHEMA = SCHEMA.replace("CREATE SCHEMA IF NOT EXISTS testiq;\n", "").replace("testiq.", "")
 
 MIGRATIONS = [
+    "ALTER TABLE source_document ADD COLUMN logical_source_id TEXT",
     "ALTER TABLE source_fragment ADD COLUMN source_id TEXT",
     "ALTER TABLE source_package_item ADD COLUMN source_version TEXT",
     "ALTER TABLE source_package_item ADD COLUMN ingestion_status TEXT NOT NULL DEFAULT 'unknown'",
@@ -99,6 +105,24 @@ MIGRATIONS = [
     "ALTER TABLE source_package_item ADD COLUMN prompt_version TEXT",
     "ALTER TABLE source_package_item ADD COLUMN config_version TEXT",
     "ALTER TABLE test_run ADD COLUMN configuration_snapshot TEXT",
+    "ALTER TABLE source_package_manifest ADD COLUMN package_name TEXT",
+    "ALTER TABLE source_extraction ADD COLUMN prompt_hash TEXT",
+    "ALTER TABLE source_extraction ADD COLUMN config_hash TEXT",
+    "ALTER TABLE source_package_manifest ADD COLUMN manifest_hash TEXT",
+    "ALTER TABLE source_package_manifest ADD COLUMN lifecycle_status TEXT NOT NULL DEFAULT 'draft'",
+    "ALTER TABLE source_package_manifest ADD COLUMN run_id TEXT",
+    "ALTER TABLE source_package_item ADD COLUMN extractor_version TEXT",
+    "ALTER TABLE source_package_item ADD COLUMN prompt_hash TEXT",
+    "ALTER TABLE source_package_item ADD COLUMN config_hash TEXT",
+    "ALTER TABLE source_package_item ADD COLUMN duplicate_of_revision_id TEXT",
+    "ALTER TABLE source_fragment ADD COLUMN heading_path TEXT",
+    "ALTER TABLE source_fragment ADD COLUMN paragraph_start INTEGER",
+    "ALTER TABLE source_fragment ADD COLUMN paragraph_end INTEGER",
+    "ALTER TABLE source_fragment ADD COLUMN character_start INTEGER",
+    "ALTER TABLE source_fragment ADD COLUMN character_end INTEGER",
+    "ALTER TABLE source_fragment ADD COLUMN content_hash TEXT",
+    "ALTER TABLE source_fragment ADD COLUMN extractor_version TEXT",
+    "ALTER TABLE source_fragment ADD COLUMN provenance_mode TEXT",
 ]
 
 class _SQLiteConnection:
@@ -129,6 +153,9 @@ def init_db():
                 except Exception:
                     conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                     conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            conn.execute("UPDATE source_document SET logical_source_id=source_id WHERE logical_source_id IS NULL")
+            conn.execute("UPDATE source_fragment f SET source_id=r.source_id FROM source_revision r WHERE f.revision_id=r.revision_id AND f.source_id IS NULL")
+            conn.execute("UPDATE source_fragment SET provenance_mode='local' WHERE provenance_mode IS NULL")
             conn.commit()
     else:
         with sqlite3.connect(DB_PATH) as conn:
@@ -137,6 +164,9 @@ def init_db():
                 try: conn.execute(statement)
                 except sqlite3.OperationalError:
                     pass
+            conn.execute("UPDATE source_document SET logical_source_id=source_id WHERE logical_source_id IS NULL")
+            conn.execute("UPDATE source_fragment SET source_id=(SELECT source_id FROM source_revision WHERE source_revision.revision_id=source_fragment.revision_id) WHERE source_id IS NULL")
+            conn.execute("UPDATE source_fragment SET provenance_mode='local' WHERE provenance_mode IS NULL")
             conn.commit()
 
 @contextmanager
