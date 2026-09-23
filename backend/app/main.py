@@ -17,6 +17,11 @@ def uid(prefix): return f"{prefix}_{uuid.uuid4().hex}"
 def row_dict(row): return dict(row) if row else None
 
 def process_extraction(revision_id, source_id, extraction_id, storage_path, filename, required_sections):
+    # Commit the visible processing state before doing local parsing or a network call.
+    # Otherwise the UI can only see "pending" while OpenAI is slow or unavailable.
+    with connection() as conn:
+        conn.execute("UPDATE source_extraction SET mode=%s,status=%s WHERE extraction_id=%s", ("local", "processing", extraction_id))
+        conn.execute("UPDATE source_revision SET status=%s WHERE revision_id=%s", ("processing", revision_id))
     with connection() as conn:
         try:
             content = Path(storage_path).read_bytes()
@@ -50,12 +55,24 @@ class ManifestRequest(BaseModel):
 class ProjectRequest(BaseModel):
     name: str = Field(min_length=1, max_length=200)
 
+class RequirementReviewItem(BaseModel):
+    item_id: str = Field(min_length=1, max_length=200)
+    approved: bool
+    title: str | None = Field(default=None, max_length=400)
+    statement: str | None = Field(default=None, max_length=10000)
+    text: str | None = Field(default=None, max_length=10000)
+    scenario: str | None = Field(default=None, max_length=400)
+    given: list[str] | None = None
+    when: str | None = Field(default=None, max_length=4000)
+    then: str | None = Field(default=None, max_length=4000)
+
 class RequirementReviewRequest(BaseModel):
     reviewer: str = Field(min_length=1, max_length=200)
     decision: str = Field(pattern="^(approved|needs_changes|rejected)$")
     comments: str | None = Field(default=None, max_length=4000)
     accepted_assumptions: list[str] = Field(default_factory=list)
     approved_items: list[str] = Field(default_factory=list)
+    items: list[RequirementReviewItem] = Field(default_factory=list)
 
 def _text_lines(fragments):
     return [{"text": " ".join(str(f.get("fragment_text") or "").split()), "heading": f.get("heading"), "source_id": f.get("source_id"), "revision_id": f.get("revision_id"), "source_reference": f.get("source_reference")} for f in fragments if str(f.get("fragment_text") or "").strip()]
@@ -77,10 +94,11 @@ def _requirement_contract(package, items, fragments):
     def make_requirement(number, title, statement, terms, criteria, outcomes, flow):
         evidence = matching(*terms)
         return {"requirement_id": f"FR-{number:02d}", "title": title, "statement": statement,
-                "business_rules": [x["text"] for x in evidence],
-                "acceptance_criteria": [{"acceptance_id": f"AC-{index:02d}", "scenario": f"Validate {title.lower()}", "given": [], "when": statement, "then": criterion, "text": criterion, "source_references": refs(evidence)} for index, criterion in enumerate(criteria, 1)],
+                "approved": False,
+                "business_rules": [{"rule_id": f"BR-{number:02d}-{index:02d}", "text": x["text"], "approved": False} for index, x in enumerate(evidence, 1)],
+                "acceptance_criteria": [{"acceptance_id": f"AC-{number:02d}-{index:02d}", "scenario": f"Validate {title.lower()}", "given": [], "when": statement, "then": criterion, "text": criterion, "approved": False, "source_references": refs(evidence)} for index, criterion in enumerate(criteria, 1)],
                 "actors": actors, "entities": entities, "flow_steps": flow,
-                "expected_outcomes": outcomes, "source_references": refs(evidence)}
+                "expected_outcomes": [{"outcome_id": f"EO-{number:02d}-{index:02d}", "text": outcome, "approved": False} for index, outcome in enumerate(outcomes, 1)], "source_references": refs(evidence)}
 
     if "refill" in lowered and "sms" in lowered:
         requirements = [
@@ -103,6 +121,26 @@ def _requirement_contract(package, items, fragments):
 
 def _analysis_response(row):
     result = row_dict(row); result["contract"] = json.loads(result.pop("contract_json")); return result
+
+def _review_items(contract):
+    """Return the individually reviewable contract items, including legacy contracts."""
+    items = []
+    for requirement in contract.get("requirements", []):
+        requirement_id = requirement["requirement_id"]
+        items.append((requirement_id, requirement, "functional_criterion"))
+        for index, rule in enumerate(requirement.get("business_rules", []), 1):
+            if isinstance(rule, str):
+                requirement["business_rules"][index - 1] = rule = {"rule_id": f"{requirement_id}:RULE-{index}", "text": rule, "approved": False}
+            items.append((rule.get("rule_id", f"{requirement_id}:RULE-{index}"), rule, "business_rule"))
+        for index, criterion in enumerate(requirement.get("acceptance_criteria", []), 1):
+            if isinstance(criterion, str):
+                requirement["acceptance_criteria"][index - 1] = criterion = {"acceptance_id": f"{requirement_id}:AC-{index}", "text": criterion, "approved": False}
+            items.append((criterion.get("acceptance_id", f"{requirement_id}:AC-{index}"), criterion, "acceptance_criterion"))
+        for index, outcome in enumerate(requirement.get("expected_outcomes", []), 1):
+            if isinstance(outcome, str):
+                requirement["expected_outcomes"][index - 1] = outcome = {"outcome_id": f"{requirement_id}:OUTCOME-{index}", "text": outcome, "approved": False}
+            items.append((outcome.get("outcome_id", f"{requirement_id}:OUTCOME-{index}"), outcome, "expected_outcome"))
+    return items
 
 @app.on_event("startup")
 def startup(): init_db()
@@ -233,7 +271,45 @@ def review_requirement_analysis(analysis_id: str, request: RequirementReviewRequ
     with connection() as conn:
         row=conn.execute("SELECT * FROM requirement_analysis WHERE analysis_id=%s",(analysis_id,)).fetchone()
         if not row: raise HTTPException(404,"Requirement analysis not found")
-        contract=json.loads(row["contract_json"]); contract["accepted_assumptions"]=list(dict.fromkeys(contract.get("accepted_assumptions",[])+request.accepted_assumptions)); contract["approved_items"]=list(dict.fromkeys(request.approved_items)); status="approved" if request.decision=="approved" else request.decision; conn.execute("UPDATE requirement_analysis SET status=%s,contract_json=%s,reviewer=%s,review_decision=%s,review_comments=%s,reviewed_at=%s,updated_at=%s WHERE analysis_id=%s",(status,json.dumps(contract),request.reviewer,request.decision,request.comments,now(),now(),analysis_id)); return _analysis_response(conn.execute("SELECT * FROM requirement_analysis WHERE analysis_id=%s",(analysis_id,)).fetchone())
+        contract=json.loads(row["contract_json"])
+        contract["accepted_assumptions"] = list(dict.fromkeys(contract.get("accepted_assumptions",[]) + request.accepted_assumptions))
+        review_items = _review_items(contract)
+        if request.items:
+            submitted = {item.item_id for item in request.items}
+            expected = {key for key, _, _ in review_items}
+            if len(submitted) != len(request.items):
+                raise HTTPException(422, "Each review item must appear only once")
+            missing = expected - submitted
+            unknown = submitted - expected
+            if missing or unknown:
+                raise HTTPException(422, {"missing_items": sorted(missing), "unknown_items": sorted(unknown)})
+            for submitted_item in request.items:
+                target = next(item for key, item, _ in review_items if key == submitted_item.item_id)
+                item_type = next(item_type for key, _, item_type in review_items if key == submitted_item.item_id)
+                if item_type == "functional_criterion":
+                    if submitted_item.title is not None: target["title"] = submitted_item.title.strip()
+                    if submitted_item.statement is not None: target["statement"] = submitted_item.statement.strip()
+                elif item_type in {"business_rule", "expected_outcome"}:
+                    if submitted_item.text is None or not submitted_item.text.strip(): raise HTTPException(422, f"text is required for {submitted_item.item_id}")
+                    target["text"] = submitted_item.text.strip()
+                else:
+                    for field in ("scenario", "when", "then"):
+                        value = getattr(submitted_item, field)
+                        if value is not None: target[field] = value.strip()
+                    if submitted_item.given is not None: target["given"] = [value.strip() for value in submitted_item.given if value.strip()]
+                    if submitted_item.text is not None: target["text"] = submitted_item.text.strip()
+                target["approved"] = submitted_item.approved
+            approved = {key for key, value, _ in review_items if value.get("approved")}
+            contract["approved_items"] = sorted(approved)
+            status = "approved" if approved == expected else "needs_changes"
+            decision = status
+        else:
+            contract["approved_items"] = list(dict.fromkeys(request.approved_items))
+            status = "approved" if request.decision == "approved" else request.decision
+            decision = request.decision
+        timestamp=now()
+        conn.execute("UPDATE requirement_analysis SET status=%s,contract_json=%s,reviewer=%s,review_decision=%s,review_comments=%s,reviewed_at=%s,updated_at=%s WHERE analysis_id=%s",(status,json.dumps(contract),request.reviewer,decision,request.comments,timestamp,timestamp,analysis_id))
+        return _analysis_response(conn.execute("SELECT * FROM requirement_analysis WHERE analysis_id=%s", (analysis_id,)).fetchone())
 
 @app.exception_handler(ValueError)
 async def value_error(_, exc): return JSONResponse(status_code=422, content={"detail":str(exc)})
