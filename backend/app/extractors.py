@@ -1,10 +1,22 @@
-import io, json, os, re
+import hashlib, io, json, os, re
 from pathlib import Path
 from typing import Any
 from .config import OPENAI_MODEL, OPENAI_TIMEOUT_SECONDS
 
+OPENAI_PROMPT_TEMPLATE = (
+    "You are extracting a business requirements document for audit and test design.\n\n"
+    "Return the complete usable text, not a summary. Preserve wording, numbers, dates, rules, constraints, headings, and ordering. "
+    "Do not invent, infer, normalize, or omit requirements. Split sections at actual headings. Preserve the supplied source references "
+    "such as page markers and line references. If content has no heading, use 'Unsectioned content'. "
+    "The input may contain [page N] markers; use those to populate page_number. "
+    "Every section's text must be copied from the input.\n\nSOURCE TEXT:\n"
+)
+
+def extraction_prompt_hash() -> str:
+    return hashlib.sha256(OPENAI_PROMPT_TEMPLATE.encode("utf-8")).hexdigest()
+
 def _sections(text: str) -> list[dict[str, Any]]:
-    result, current, current_page = [], None, None
+    result, current_heading, current_page = [], "Unsectioned content", None
     for line_no, raw in enumerate(text.splitlines(), 1):
         line = raw.strip()
         if not line:
@@ -16,14 +28,10 @@ def _sections(text: str) -> list[dict[str, Any]]:
         heading = bool(re.match(r"^(#{1,6}\s+|\d+(?:\.\d+)*[.)]?\s+)[^\n]+$", line)) or (len(line) < 120 and line.isupper())
         if heading:
             reference = f"page {current_page}, line {line_no}" if current_page else f"line {line_no}"
-            current = {"heading": re.sub(r"^#+\s*", "", line), "reference": reference, "page_number": current_page, "fragment_type": "paragraph", "paragraph_index": line_no, "table_index": None, "row_index": None, "cell_index": None, "text": ""}
-            result.append(current)
-        elif current:
-            current["text"] = (current["text"] + "\n" + line).strip()
+            current_heading = re.sub(r"^#+\s*", "", line)
         else:
             reference = f"page {current_page}, line {line_no}" if current_page else f"line {line_no}"
-            current = {"heading": "Unsectioned content", "reference": reference, "page_number": current_page, "fragment_type": "paragraph", "paragraph_index": line_no, "table_index": None, "row_index": None, "cell_index": None, "text": line}
-            result.append(current)
+            result.append({"heading": current_heading, "reference": reference, "page_number": current_page, "fragment_type": "paragraph", "paragraph_index": line_no, "table_index": None, "row_index": None, "cell_index": None, "text": line})
     return result
 
 
@@ -34,11 +42,12 @@ def _docx_sections(content: bytes) -> tuple[str, list[dict[str, Any]]]:
     from docx.text.paragraph import Paragraph
     from docx.oxml.table import CT_Tbl
     from docx.oxml.text.paragraph import CT_P
+    from docx.oxml.ns import qn
 
     doc = Document(io.BytesIO(content))
     sections: list[dict[str, Any]] = []
     text_parts: list[str] = []
-    current: dict[str, Any] | None = None
+    current_heading = "Unsectioned content"
 
     def iter_blocks(parent: DocumentType | _Cell):
         """Yield DOCX paragraphs and tables in their original document order."""
@@ -49,40 +58,56 @@ def _docx_sections(content: bytes) -> tuple[str, list[dict[str, Any]]]:
             elif isinstance(child, CT_Tbl):
                 yield Table(child, parent)
 
-    def is_heading(value: str) -> bool:
+    def is_heading(value: str, block: Paragraph | None = None) -> bool:
+        style_name = getattr(getattr(block, "style", None), "name", "") or ""
+        if style_name.lower().startswith("heading"):
+            return True
         return bool(re.match(r"^(#{1,6}\s+|\d+(?:\.\d+)*[.)]?\s+)[^\n]+$", value)) or (len(value) < 120 and value.isupper())
 
     paragraph_index = 0
     table_index = 0
+    current_page = 1
+
+    def has_page_break(paragraph: Paragraph) -> bool:
+        return any(
+            node.tag == qn("w:lastRenderedPageBreak")
+            or (node.tag == qn("w:br") and node.get(qn("w:type")) == "page")
+            for node in paragraph._p.iter()
+        )
+
     for block in iter_blocks(doc):
         if isinstance(block, Paragraph):
             paragraph_index += 1
             value = block.text.strip()
             if not value:
+                if has_page_break(block):
+                    current_page += 1
                 continue
             text_parts.append(value)
-            if is_heading(value):
-                current = {"heading": re.sub(r"^#+\s*", "", value), "reference": f"paragraph {paragraph_index}", "page_number": None, "fragment_type": "paragraph", "paragraph_index": paragraph_index, "table_index": None, "row_index": None, "cell_index": None, "text": ""}
-                sections.append(current)
-            elif current:
-                current["text"] = (current["text"] + "\n" + value).strip()
+            if is_heading(value, block):
+                current_heading = re.sub(r"^#+\s*", "", value)
             else:
-                current = {"heading": "Unsectioned content", "reference": f"paragraph {paragraph_index}", "page_number": None, "fragment_type": "paragraph", "paragraph_index": paragraph_index, "table_index": None, "row_index": None, "cell_index": None, "text": value}
-                sections.append(current)
+                sections.append({"heading": current_heading, "reference": f"paragraph {paragraph_index}", "page_number": current_page, "fragment_type": "paragraph", "paragraph_index": paragraph_index, "table_index": None, "row_index": None, "cell_index": None, "text": value})
+            if has_page_break(block):
+                current_page += 1
             continue
 
         table_index += 1
         table_text = []
-        table_heading = current["heading"] if current else f"Table {table_index}"
+        table_heading = current_heading or f"Table {table_index}"
         for row_index, row in enumerate(block.rows, 1):
             values = [cell.text.strip() for cell in row.cells]
             row_text = " | ".join(values).strip()
             if not row_text:
                 continue
             table_text.append(row_text)
-            sections.append({"heading": table_heading, "reference": f"table {table_index}, row {row_index}", "page_number": None, "fragment_type": "table", "paragraph_index": None, "table_index": table_index, "row_index": row_index, "cell_index": None, "text": row_text})
+            for cell_index, value in enumerate(values, 1):
+                if value:
+                    sections.append({"heading": table_heading, "reference": f"table {table_index}, row {row_index}, cell {cell_index}", "page_number": current_page, "fragment_type": "table", "paragraph_index": None, "table_index": table_index, "row_index": row_index, "cell_index": cell_index, "text": value})
         if table_text:
             text_parts.extend(table_text)
+        if any(has_page_break(paragraph) for row in block.rows for cell in row.cells for paragraph in cell.paragraphs):
+            current_page += 1
 
     text = "\n".join(text_parts).replace("\x00", "").strip()
     if not text:
@@ -91,8 +116,13 @@ def _docx_sections(content: bytes) -> tuple[str, list[dict[str, Any]]]:
 
 def extract_local(path: str, content: bytes) -> tuple[str, list[dict[str, Any]]]:
     suffix = Path(path).suffix.lower()
-    if suffix in {".txt", ".md"}:
+    if suffix in {".txt", ".md", ".yaml", ".yml", ".sql", ".csv"}:
         text = content.decode("utf-8", errors="replace")
+    elif suffix == ".json":
+        try:
+            text = json.dumps(json.loads(content.decode("utf-8-sig")), indent=2, ensure_ascii=False)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("The uploaded JSON file is invalid or corrupted") from exc
     elif suffix == ".docx":
         return _docx_sections(content)
     elif suffix == ".pdf":
@@ -105,9 +135,12 @@ def extract_local(path: str, content: bytes) -> tuple[str, list[dict[str, Any]]]
     else:
         raise ValueError(f"Unsupported file extension: {suffix or '[none]'}")
     text = text.replace("\x00", "").strip()
-    if not text:
+    sections = _sections(text) if text else []
+    if not text or not any(str(section.get("text") or "").strip() for section in sections):
+        if suffix == ".pdf":
+            raise ValueError("The PDF contains no readable text. It may be scanned or image-only.")
         raise ValueError("The document contains no extractable text")
-    return text, _sections(text)
+    return text, sections
 
 def missing_sections(sections: list[dict[str, Any]], required: list[str]) -> list[str]:
     def normalize(value: str) -> str:
@@ -145,14 +178,7 @@ def extract_openai(text: str) -> tuple[str, list[dict[str, Any]]]:
         },
         "required": ["text", "sections"],
     }
-    prompt = (
-        "You are extracting a business requirements document for audit and test design.\n\n"
-        "Return the complete usable text, not a summary. Preserve wording, numbers, dates, rules, constraints, headings, and ordering. "
-        "Do not invent, infer, normalize, or omit requirements. Split sections at actual headings. Preserve the supplied source references "
-        "such as page markers and line references. If content has no heading, use 'Unsectioned content'. "
-        "The input may contain [page N] markers; use those to populate page_number. "
-        "Every section's text must be copied from the input.\n\nSOURCE TEXT:\n" + text
-    )
+    prompt = OPENAI_PROMPT_TEMPLATE + text
     response = client.responses.create(
         model=OPENAI_MODEL,
         input=prompt,

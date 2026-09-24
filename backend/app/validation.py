@@ -10,6 +10,11 @@ CONTENT_TYPES = {
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".txt": "text/plain",
     ".md": "text/markdown",
+    ".json": "application/json",
+    ".yaml": "application/yaml",
+    ".yml": "application/yaml",
+    ".sql": "application/sql",
+    ".csv": "text/csv",
 }
 
 
@@ -36,7 +41,7 @@ def validate_file_content(filename: str, content: bytes, client_content_type: st
                 if archive.testzip() is not None:
                     raise ValueError("the Office document archive is corrupt")
         except (zipfile.BadZipFile, ValueError) as exc:
-            raise ValueError(f"The file extension is .docx, but the content is not a readable DOCX file: {exc}") from exc
+            raise ValueError("The uploaded DOCX file is unreadable or corrupted. Please choose a valid Word document.") from exc
     else:
         try:
             decoded = content.decode("utf-8-sig")
@@ -46,6 +51,12 @@ def validate_file_content(filename: str, content: bytes, client_content_type: st
             raise ValueError("The document contains no readable text")
         if "\x00" in decoded:
             raise ValueError("The text file contains binary content and is not readable")
+        if suffix == ".json":
+            import json
+            try:
+                json.loads(decoded)
+            except json.JSONDecodeError as exc:
+                raise ValueError("The uploaded JSON file is invalid or corrupted") from exc
 
     messages: list[str] = []
     if client_content_type and client_content_type.lower() != detected:
