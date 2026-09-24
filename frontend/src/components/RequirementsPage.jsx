@@ -6,6 +6,12 @@ function statusText(status) {
   return String(status || "not_started").replaceAll("_", " ");
 }
 
+function textValue(value) {
+  if (typeof value === "string") return value;
+  if (value && typeof value === "object") return value.text || value.statement || value.description || "";
+  return String(value ?? "");
+}
+
 export function RequirementsPage() {
   const [project, setProject] = useState(() => JSON.parse(localStorage.getItem("testiq_current_project") || "null"));
   const [projects, setProjects] = useState([]);
@@ -32,6 +38,8 @@ export function RequirementsPage() {
   }));
   const outcomeItems = requirements.flatMap((item) => (item.expected_outcomes || []).map((text, index) => ({ id: `${item.requirement_id}:OUTCOME-${index + 1}`, title: `${item.requirement_id} · Outcome ${index + 1}`, text })));
   const ruleItems = requirements.flatMap((item) => (item.business_rules || []).map((text, index) => ({ id: `${item.requirement_id}:RULE-${index + 1}`, title: `${item.requirement_id} · Rule ${index + 1}`, text })));
+  outcomeItems.forEach((item) => { item.text = textValue(item.text); });
+  ruleItems.forEach((item) => { item.text = textValue(item.text); });
   const findings = [...(contract?.ambiguities || []), ...(contract?.conflicts || []).map((item) => ({ text: item.description }))];
   const selectableItems = [
     ...requirements.map((item) => ({ id: item.requirement_id, label: item.title })),
