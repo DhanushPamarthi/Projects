@@ -81,6 +81,20 @@ CREATE TABLE IF NOT EXISTS testiq.requirement_analysis (
   UNIQUE(package_id, analysis_version)
 );
 
+CREATE TABLE IF NOT EXISTS testiq.test_case_generation (
+  generation_id TEXT PRIMARY KEY,
+  analysis_id TEXT NOT NULL REFERENCES testiq.requirement_analysis(analysis_id),
+  package_id TEXT NOT NULL REFERENCES testiq.source_package_manifest(package_id),
+  project_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  contract_json TEXT NOT NULL,
+  model_name TEXT,
+  prompt_version TEXT,
+  prompt_hash TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 ALTER TABLE testiq.source_fragment ADD COLUMN IF NOT EXISTS source_id TEXT;
 ALTER TABLE testiq.source_package_item ADD COLUMN IF NOT EXISTS source_version TEXT;
 ALTER TABLE testiq.source_package_item ADD COLUMN IF NOT EXISTS ingestion_status TEXT NOT NULL DEFAULT 'unknown';
