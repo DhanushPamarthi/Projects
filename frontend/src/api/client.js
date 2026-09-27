@@ -131,6 +131,22 @@ export async function reviewRequirementAnalysis(analysisId, review) {
   });
 }
 
+export async function generateTestCasesFromAnalysis(analysisId, count = 5) {
+  return request(`/api/v1/requirement-analyses/${encodeURIComponent(analysisId)}/test-cases`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ count }) });
+}
+
+export async function listGeneratedTestCases(analysisId) {
+  return request(`/api/v1/requirement-analyses/${encodeURIComponent(analysisId)}/test-cases`);
+}
+
+export async function reviewTestCaseGeneration(generationId, review) {
+  return request(`/api/v1/test-case-generations/${encodeURIComponent(generationId)}/review`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(review),
+  });
+}
+
 export async function getRequirement(key) {
   return request(`/requirements/${encodeURIComponent(key)}`);
 }
