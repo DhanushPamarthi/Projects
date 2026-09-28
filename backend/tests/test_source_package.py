@@ -101,9 +101,15 @@ def test_supporting_source_manifest_is_traceable(monkeypatch):
 
 def test_requirement_analysis_contract_can_be_created_and_reviewed(monkeypatch):
     client = _client(monkeypatch)
+    body = (
+        b"# Eligibility\n"
+        b"Eligible members must have a refill due. Ineligible members are excluded.\n"
+        b"# Acceptance Criteria\n"
+        b"Expected outcome: send an SMS reminder. Email may be listed as a future channel.\n"
+    )
     brd = client.post(
         "/api/v1/projects/p1/sources",
-        files={"file": ("brd.md", io.BytesIO(b"# Eligibility\nEligible members must have a refill due.\n# Acceptance Criteria\nExpected outcome: send an SMS reminder."), "text/markdown")},
+        files={"file": ("brd.md", io.BytesIO(body), "text/markdown")},
         data={"source_type": "brd"},
     )
     assert brd.status_code == 202
@@ -115,6 +121,8 @@ def test_requirement_analysis_contract_can_be_created_and_reviewed(monkeypatch):
     assert payload["status"] == "needs_review"
     assert payload["contract"]["generation_mode"] == "source_package_fallback"
     assert payload["contract"]["requirements"][0]["source_references"]
+    assert payload["contract"]["conflicting_requirements"] == []
+    assert payload["contract"]["conflicts"] == []
     reviewed = client.post(
         f"/api/v1/requirement-analyses/{payload['analysis_id']}/review",
         json={"reviewer": "product-owner", "decision": "approved", "comments": "POC scope accepted", "approved_items": ["REQ-001", "RULE-1"]},
@@ -183,3 +191,139 @@ def test_docx_fragments_preserve_paragraph_and_table_locations(monkeypatch):
     revision = client.get("/api/v1/revisions/" + response.json()["revision_id"]).json()
     assert any(fragment["fragment_type"] == "paragraph" and fragment["source_reference"] == "paragraph 2" for fragment in revision["fragments"])
     assert any(fragment["fragment_type"] == "table" and fragment["source_reference"] == "table 1, row 1, cell 1" and fragment["cell_index"] == 1 and fragment["heading"] == "Scope" for fragment in revision["fragments"])
+
+
+def test_test_case_generation_review_and_execution_lifecycle(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    client = _client(monkeypatch)
+    body = (
+        b"# PBM Refill Reminder\n"
+        b"Active members with eligible prescriptions should receive an SMS refill reminder.\n"
+        b"Inactive members and members without eligible prescriptions are excluded.\n"
+        b"Expected outcome: an eligible member receives the refill reminder SMS and communication status is recorded.\n"
+        b"If SMS fails, trigger the alternate phone call and record the call outcome.\n"
+    )
+    brd = client.post(
+        "/api/v1/projects/p1/sources",
+        files={"file": ("pbm-refill.md", io.BytesIO(body), "text/markdown")},
+        data={"source_type": "brd"},
+    )
+    assert brd.status_code == 202, brd.text
+    manifest = client.post("/api/v1/projects/p1/manifests", json={"source_ids": [brd.json()["source_id"]], "scope": "MVP"})
+    assert manifest.status_code == 201, manifest.text
+
+    analysis = client.post(f"/api/v1/packages/{manifest.json()['package_id']}/requirements/analyze")
+    assert analysis.status_code == 201, analysis.text
+    analysis_payload = analysis.json()
+    requirement = analysis_payload["contract"]["requirements"][0]
+    approved_items = [requirement["requirement_id"]]
+    approved_items.extend(f"{requirement['requirement_id']}:{rule['rule_id']}" for rule in requirement["business_rules"][:1])
+    approved_items.extend(f"{requirement['requirement_id']}:{criterion['acceptance_id']}" for criterion in requirement["acceptance_criteria"][:1])
+
+    reviewed_requirements = client.post(
+        f"/api/v1/requirement-analyses/{analysis_payload['analysis_id']}/review",
+        json={
+            "reviewer": "product-owner",
+            "decision": "approved",
+            "comments": "Approved for test design.",
+            "approved_items": approved_items,
+        },
+    )
+    assert reviewed_requirements.status_code == 200, reviewed_requirements.text
+
+    generated = client.post(f"/api/v1/requirement-analyses/{analysis_payload['analysis_id']}/test-cases", json={"count": 2})
+    assert generated.status_code == 201, generated.text
+    generation_payload = generated.json()
+    generation_id = generation_payload["generation_id"]
+    test_cases = generation_payload["test_cases"]
+    assert len(test_cases) == 2
+    assert generation_payload["generation_mode"] == "local_fallback"
+
+    coverage = client.get(f"/api/v1/test-case-generations/{generation_id}/coverage-review")
+    assert coverage.status_code == 200, coverage.text
+    coverage_payload = coverage.json()
+    assert coverage_payload["summary"]["requirements_total"] == 1
+    assert coverage_payload["matrix"][0]["requirement_id"] == requirement["requirement_id"]
+    assert coverage_payload["quality"]["summary"]["total"] >= 0
+
+    approved_case_id = test_cases[0]["test_case_id"]
+    rejected_case_id = test_cases[1]["test_case_id"]
+    reviewed_cases = client.post(
+        f"/api/v1/test-case-generations/{generation_id}/review",
+        json={
+            "reviewer": "qa-reviewer",
+            "comments": "Approved the happy path and rejected the duplicate for regeneration.",
+            "items": [
+                {
+                    "test_case_id": approved_case_id,
+                    "review_status": "approved",
+                    "title": test_cases[0]["title"] + " - reviewed",
+                    "steps": test_cases[0]["steps"] + ["Reviewer confirms deterministic cleanup ownership."],
+                    "expected_results": test_cases[0]["expected_results"],
+                },
+                {
+                    "test_case_id": rejected_case_id,
+                    "review_status": "rejected",
+                    "title": test_cases[1]["title"],
+                    "steps": test_cases[1]["steps"],
+                    "expected_results": test_cases[1]["expected_results"],
+                },
+            ],
+        },
+    )
+    assert reviewed_cases.status_code == 200, reviewed_cases.text
+    reviewed_contract = reviewed_cases.json()["contract"]
+    assert reviewed_contract["approved_test_case_ids"] == [approved_case_id]
+    assert reviewed_contract["rejected_test_case_ids"] == [rejected_case_id]
+
+    audit = client.get(f"/api/v1/test-case-generations/{generation_id}/review-audit")
+    assert audit.status_code == 200, audit.text
+    latest_audit = audit.json()[0]
+    assert latest_audit["reviewed_contract"]["approved_test_case_ids"] == [approved_case_id]
+    assert latest_audit["reviewed_items"][0]["test_case_id"] == approved_case_id
+
+    regenerated = client.post(
+        f"/api/v1/test-case-generations/{generation_id}/regenerate",
+        json={"reviewer": "qa-reviewer", "reason": "Regenerate rejected coverage.", "test_case_ids": [rejected_case_id]},
+    )
+    assert regenerated.status_code == 201, regenerated.text
+    assert regenerated.json()["parent_generation_id"] == generation_id
+    assert regenerated.json()["regeneration_request"]["source_test_case_ids"] == [rejected_case_id]
+
+    first_run = client.post(
+        f"/api/v1/test-case-generations/{generation_id}/execution-runs",
+        json={"reviewer": "qa-reviewer", "comments": "Freeze approved baseline.", "selected_test_case_ids": [approved_case_id]},
+    )
+    assert first_run.status_code == 201, first_run.text
+    second_run = client.post(
+        f"/api/v1/test-case-generations/{generation_id}/execution-runs",
+        json={"reviewer": "qa-reviewer", "comments": "Freeze second baseline.", "selected_test_case_ids": [approved_case_id]},
+    )
+    assert second_run.status_code == 201, second_run.text
+
+    cancelled = client.patch(
+        f"/api/v1/execution-runs/{first_run.json()['run_id']}/lifecycle",
+        json={"lifecycle_state": "cancelled", "reviewer": "qa-reviewer", "comments": "Weekend execution not needed."},
+    )
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["status"] == "cancelled"
+    assert cancelled.json()["lifecycle_state"] == "cancelled"
+    assert cancelled.json()["cancelled_at"]
+    assert any(item["type"] == "baseline_cancelled" for item in cancelled.json()["immutable_observations"])
+
+    failed = client.patch(
+        f"/api/v1/execution-runs/{second_run.json()['run_id']}/lifecycle",
+        json={"lifecycle_state": "failed", "reviewer": "qa-reviewer", "comments": "Environment was unavailable."},
+    )
+    assert failed.status_code == 200, failed.text
+    assert failed.json()["status"] == "failed"
+    assert failed.json()["lifecycle_state"] == "failed"
+    assert failed.json()["completed_at"]
+    assert failed.json()["error"] == "Environment was unavailable."
+    assert any(item["type"] == "baseline_failed" for item in failed.json()["immutable_observations"])
+
+    terminal_update = client.patch(
+        f"/api/v1/execution-runs/{second_run.json()['run_id']}/lifecycle",
+        json={"lifecycle_state": "cancelled", "reviewer": "qa-reviewer"},
+    )
+    assert terminal_update.status_code == 409

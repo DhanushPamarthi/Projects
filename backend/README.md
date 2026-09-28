@@ -68,14 +68,14 @@ CREATE DATABASE testiq OWNER testiq;
 From this directory:
 
 ```powershell
-uv run python -m uvicorn app.main:app --reload --env-file .env --host 127.0.0.1 --port 8000
+uv run python -m uvicorn app.main:app --reload --env-file .env --host 127.0.0.1 --port 8001
 ```
 
 Endpoints:
 
-- Health: <http://localhost:8000/health>
-- Swagger: <http://localhost:8000/docs>
-- OpenAPI: <http://localhost:8000/openapi.json>
+- Health: <http://localhost:8001/health>
+- Swagger: <http://localhost:8001/docs>
+- OpenAPI: <http://localhost:8001/openapi.json>
 
 Expected health response:
 
@@ -122,7 +122,7 @@ Expected health response:
 ## Upload example
 
 ```powershell
-curl.exe -X POST "http://localhost:8000/api/v1/projects/demo/sources" `
+curl.exe -X POST "http://localhost:8001/api/v1/projects/demo/sources" `
   -F "file=@C:\path\to\requirements.docx" `
   -F "source_type=brd" `
   -F "owner=Product" `
@@ -179,4 +179,4 @@ Confirm the package exists, all package revisions have `extraction.status=succee
 
 ### Frontend cannot reach the backend
 
-Start the backend on port `8000`. The Vite development proxy forwards `/api` requests to `http://127.0.0.1:8000`.
+Start the backend on port `8001`. The Vite development proxy forwards `/api` requests to `http://127.0.0.1:8001`.
