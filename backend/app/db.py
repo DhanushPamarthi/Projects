@@ -83,6 +83,19 @@ CREATE TABLE IF NOT EXISTS testiq.requirement_analysis (
   updated_at TEXT NOT NULL,
   UNIQUE(package_id, analysis_version)
 );
+CREATE TABLE IF NOT EXISTS testiq.test_case_generation (
+  generation_id TEXT PRIMARY KEY,
+  analysis_id TEXT NOT NULL REFERENCES testiq.requirement_analysis(analysis_id),
+  package_id TEXT NOT NULL REFERENCES testiq.source_package_manifest(package_id),
+  project_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  contract_json TEXT NOT NULL,
+  model_name TEXT,
+  prompt_version TEXT,
+  prompt_hash TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 """
 SQLITE_SCHEMA = SCHEMA.replace("CREATE SCHEMA IF NOT EXISTS testiq;\n", "").replace("testiq.", "")
 
