@@ -5,7 +5,6 @@ import { completeWorkflowStage, executeWorkflow, finalizeWorkflow, getCoverage, 
 
 const copy = {
   readiness_review: ["Readiness review", "Confirm the BRD and metadata are ready for downstream test design."],
-  surface_discovery: ["Surface discovery", "Identify the surfaces covered by this requirement."],
   coverage_review: ["Coverage review", "Review generated cases before requesting human approval."],
   human_approval: ["Human approval", "Approve the reviewed test design before selecting a scenario."],
   scenario_selection: ["Scenario selection", "Choose the scenario that will drive mapping and data generation."],
@@ -14,8 +13,8 @@ const copy = {
 };
 
 export function WorkflowGateStep({ requirement, stage, testCases = [], scenarios = [], selectedScenario, onSelectScenario, onComplete, onAgentComplete, initialTargets = {} }) {
-  const [surface, setSurface] = useState(initialTargets.webpage?.length ? "webpage" : initialTargets.api?.length ? "api" : "webpage");
-  const [targets, setTargets] = useState(() => Object.fromEntries(["webpage", "api", "cdp"].map((key) => [key, initialTargets[key]?.[0]?.url || initialTargets[key]?.[0] || ""])));
+  const [surface] = useState(initialTargets.webpage?.length ? "webpage" : initialTargets.api?.length ? "api" : "webpage");
+  const [targets] = useState(() => Object.fromEntries(["webpage", "api", "cdp"].map((key) => [key, initialTargets[key]?.[0]?.url || initialTargets[key]?.[0] || ""])));
   const [reviewNote, setReviewNote] = useState("");
   const [coverage, setCoverage] = useState(null);
   const [evidence, setEvidence] = useState([]);
@@ -32,7 +31,7 @@ export function WorkflowGateStep({ requirement, stage, testCases = [], scenarios
       const result = stage === "execution"
         ? await executeWorkflow(requirement.key, { scenario_key: selectedScenario, mode: "probe", targets: selectedTargets })
         : stage === "evidence_cleanup" ? await finalizeWorkflow(requirement.key)
-        : await completeWorkflowStage(requirement.key, stage, stage === "surface_discovery" ? { surfaces: [surface], targets: selectedTargets } : stage === "human_approval" ? { reviewer_note: reviewNote } : {});
+        : await completeWorkflowStage(requirement.key, stage, stage === "human_approval" ? { reviewer_note: reviewNote } : {});
       if (stage === "execution") setExecutionResult(result?.stages?.execution || result);
       setDone(true); onComplete?.(result);
     } catch (err) { setError(err.message); } finally { setLoading(false); }
@@ -46,7 +45,6 @@ export function WorkflowGateStep({ requirement, stage, testCases = [], scenarios
   return <Card><Card.Header className="d-flex justify-content-between align-items-center"><span>{title}</span><Badge bg={done ? "success" : "warning"}>{done ? "Complete" : "Review required"}</Badge></Card.Header><Card.Body>
     <p className="text-muted">{description}</p>
     {stage === "readiness_review" && <div className="small mb-3"><CheckCircle size={16} className="text-success me-2" />BRD parsed and CDP metadata available</div>}
-    {stage === "surface_discovery" && <><div className="d-flex flex-wrap gap-3 mb-3">{["webpage", "api", "cdp"].map((kind) => <Form.Check key={kind} type="radio" name="execution-surface" label={kind.toUpperCase()} checked={surface === kind} onChange={() => setSurface(kind)} />)}</div><div className="mb-3"><Form.Label className="small text-muted">{surface.toUpperCase()} target</Form.Label><Form.Control placeholder={surface === "cdp" ? "ws://..." : "https://..."} value={targets[surface]} onChange={(e) => setTargets({ ...targets, [surface]: e.target.value })} /></div></>}
     {stage === "coverage_review" && <div className="alert alert-info">{coverage ? `Requirement coverage: ${coverage.requirements.percentage}% · Scenario coverage: ${coverage.scenarios.percentage}% · Business-rule coverage: ${coverage.business_rules.percentage}%` : `${testCases.length} test case(s) generated from the approved requirement.`}</div>}
     {stage === "human_approval" && <div className="small mb-3"><ShieldCheck size={16} className="text-success me-2" />Coverage is ready for a human sign-off.</div>}
     {stage === "human_approval" && <Form.Control as="textarea" rows={3} className="mb-3" placeholder="Approval note (optional)" value={reviewNote} onChange={(e) => setReviewNote(e.target.value)} />}

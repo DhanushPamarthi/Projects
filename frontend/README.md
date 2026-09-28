@@ -17,7 +17,7 @@ Knowledge Fabric/GraphRAG is intentionally not included in this POC.
 ## Prerequisites
 
 - Node.js 18+ and npm
-- TestIQ backend running on `http://127.0.0.1:8000`
+- TestIQ backend running on `http://127.0.0.1:8001`
 
 ## Install
 
@@ -40,7 +40,7 @@ Open the URL shown by Vite, normally <http://localhost:5173>.
 The Vite proxy forwards requests beginning with `/api` to:
 
 ```text
-http://127.0.0.1:8000
+http://127.0.0.1:8001
 ```
 
 If the backend uses another URL, set `testiq_base_url` in browser local storage or update `vite.config.js` for local development.

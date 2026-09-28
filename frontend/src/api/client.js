@@ -1,13 +1,13 @@
-const defaultBaseUrl = import.meta.env.DEV ? "/api" : "http://127.0.0.1:8000";
+const defaultBaseUrl = import.meta.env.DEV ? "/api" : "http://127.0.0.1:8001";
 
 export function getBaseUrl() {
   const storedUrl = localStorage.getItem("testiq_base_url");
-  if (import.meta.env.DEV && (!storedUrl || storedUrl === "/api" || storedUrl === "http://127.0.0.1:8000" || storedUrl === "http://localhost:8000")) {
-    return "/api";
-  }
-  if (storedUrl === "http://127.0.0.1:8001") {
+  if (storedUrl === "http://127.0.0.1:8000" || storedUrl === "http://localhost:8000") {
     localStorage.setItem("testiq_base_url", defaultBaseUrl);
     return defaultBaseUrl;
+  }
+  if (import.meta.env.DEV && (!storedUrl || storedUrl === "/api" || storedUrl === "http://127.0.0.1:8001" || storedUrl === "http://localhost:8001")) {
+    return "/api";
   }
   return storedUrl || defaultBaseUrl;
 }
@@ -144,6 +144,38 @@ export async function reviewTestCaseGeneration(generationId, review) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(review),
+  });
+}
+
+export async function getTestCaseCoverageReview(generationId) {
+  return request(`/api/v1/test-case-generations/${encodeURIComponent(generationId)}/coverage-review`);
+}
+
+export async function regenerateTestCasesFromGeneration(generationId, payload = {}) {
+  return request(`/api/v1/test-case-generations/${encodeURIComponent(generationId)}/regenerate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function createExecutionRun(generationId, payload) {
+  return request(`/api/v1/test-case-generations/${encodeURIComponent(generationId)}/execution-runs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function listExecutionRuns(generationId) {
+  return request(`/api/v1/test-case-generations/${encodeURIComponent(generationId)}/execution-runs`);
+}
+
+export async function updateExecutionRunLifecycle(runId, payload) {
+  return request(`/api/v1/execution-runs/${encodeURIComponent(runId)}/lifecycle`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
   });
 }
 
