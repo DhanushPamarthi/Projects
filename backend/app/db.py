@@ -66,6 +66,19 @@ CREATE TABLE IF NOT EXISTS testiq.source_relationship (
 CREATE TABLE IF NOT EXISTS testiq.test_run (
   run_id TEXT PRIMARY KEY, package_id TEXT NOT NULL REFERENCES testiq.source_package_manifest(package_id),
   project_id TEXT NOT NULL REFERENCES testiq.project(project_id), status TEXT NOT NULL, configuration_snapshot TEXT,
+  generation_id TEXT,
+  selected_test_case_ids_json TEXT,
+  frozen_contract_json TEXT,
+  baseline_hash TEXT,
+  reviewer TEXT,
+  review_comments TEXT,
+  lifecycle_state TEXT,
+  approved_at TEXT,
+  started_at TEXT,
+  completed_at TEXT,
+  cancelled_at TEXT,
+  error TEXT,
+  immutable_observations_json TEXT,
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS testiq.requirement_analysis (
@@ -96,6 +109,52 @@ CREATE TABLE IF NOT EXISTS testiq.test_case_generation (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS testiq.discovery_context (
+  context_id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES testiq.project(project_id),
+  package_id TEXT REFERENCES testiq.source_package_manifest(package_id),
+  context_type TEXT NOT NULL CHECK (context_type IN ('web_ui','api','schema')),
+  name TEXT NOT NULL,
+  description TEXT,
+  details_json TEXT NOT NULL,
+  created_by TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS testiq.requirement_review_audit (
+  audit_id TEXT PRIMARY KEY,
+  analysis_id TEXT NOT NULL REFERENCES testiq.requirement_analysis(analysis_id),
+  package_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  reviewer TEXT NOT NULL,
+  decision TEXT NOT NULL,
+  comments TEXT,
+  analysis_version INTEGER NOT NULL,
+  contract_version TEXT,
+  reviewed_contract_hash TEXT NOT NULL,
+  approved_items_json TEXT NOT NULL,
+  rejected_items_json TEXT NOT NULL,
+  pending_items_json TEXT NOT NULL,
+  accepted_assumptions_json TEXT NOT NULL,
+  resolved_gaps_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS testiq.test_case_review_audit (
+  audit_id TEXT PRIMARY KEY,
+  generation_id TEXT NOT NULL REFERENCES testiq.test_case_generation(generation_id),
+  analysis_id TEXT NOT NULL,
+  package_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  reviewer TEXT NOT NULL,
+  comments TEXT,
+  reviewed_contract_hash TEXT NOT NULL,
+  approved_test_case_ids_json TEXT NOT NULL,
+  rejected_test_case_ids_json TEXT NOT NULL,
+  pending_test_case_ids_json TEXT NOT NULL,
+  reviewed_contract_json TEXT,
+  reviewed_items_json TEXT,
+  created_at TEXT NOT NULL
+);
 """
 SQLITE_SCHEMA = SCHEMA.replace("CREATE SCHEMA IF NOT EXISTS testiq;\n", "").replace("testiq.", "")
 
@@ -118,6 +177,19 @@ MIGRATIONS = [
     "ALTER TABLE source_package_item ADD COLUMN prompt_version TEXT",
     "ALTER TABLE source_package_item ADD COLUMN config_version TEXT",
     "ALTER TABLE test_run ADD COLUMN configuration_snapshot TEXT",
+    "ALTER TABLE test_run ADD COLUMN generation_id TEXT",
+    "ALTER TABLE test_run ADD COLUMN selected_test_case_ids_json TEXT",
+    "ALTER TABLE test_run ADD COLUMN frozen_contract_json TEXT",
+    "ALTER TABLE test_run ADD COLUMN baseline_hash TEXT",
+    "ALTER TABLE test_run ADD COLUMN reviewer TEXT",
+    "ALTER TABLE test_run ADD COLUMN review_comments TEXT",
+    "ALTER TABLE test_run ADD COLUMN lifecycle_state TEXT",
+    "ALTER TABLE test_run ADD COLUMN approved_at TEXT",
+    "ALTER TABLE test_run ADD COLUMN started_at TEXT",
+    "ALTER TABLE test_run ADD COLUMN completed_at TEXT",
+    "ALTER TABLE test_run ADD COLUMN cancelled_at TEXT",
+    "ALTER TABLE test_run ADD COLUMN error TEXT",
+    "ALTER TABLE test_run ADD COLUMN immutable_observations_json TEXT",
     "ALTER TABLE source_package_manifest ADD COLUMN package_name TEXT",
     "ALTER TABLE source_extraction ADD COLUMN prompt_hash TEXT",
     "ALTER TABLE source_extraction ADD COLUMN config_hash TEXT",
@@ -136,6 +208,8 @@ MIGRATIONS = [
     "ALTER TABLE source_fragment ADD COLUMN content_hash TEXT",
     "ALTER TABLE source_fragment ADD COLUMN extractor_version TEXT",
     "ALTER TABLE source_fragment ADD COLUMN provenance_mode TEXT",
+    "ALTER TABLE test_case_review_audit ADD COLUMN reviewed_contract_json TEXT",
+    "ALTER TABLE test_case_review_audit ADD COLUMN reviewed_items_json TEXT",
 ]
 
 class _SQLiteConnection:
