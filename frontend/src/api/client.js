@@ -115,6 +115,12 @@ export async function analyzeRequirements(packageId) {
   });
 }
 
+export async function generateFunctionalRequirements(packageId) {
+  return request(`/api/v1/packages/${encodeURIComponent(packageId)}/functional-requirements/generate`, {
+    method: "POST",
+  });
+}
+
 export async function listRequirementAnalyses(packageId) {
   return request(`/api/v1/packages/${encodeURIComponent(packageId)}/requirements`);
 }
@@ -131,8 +137,8 @@ export async function reviewRequirementAnalysis(analysisId, review) {
   });
 }
 
-export async function generateTestCasesFromAnalysis(analysisId, count = 5) {
-  return request(`/api/v1/requirement-analyses/${encodeURIComponent(analysisId)}/test-cases`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ count }) });
+export async function generateTestCasesFromAnalysis(analysisId) {
+  return request(`/api/v1/requirement-analyses/${encodeURIComponent(analysisId)}/test-cases`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) });
 }
 
 export async function listGeneratedTestCases(analysisId) {
