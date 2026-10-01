@@ -45,12 +45,12 @@ export function WorkflowGateStep({ requirement, stage, testCases = [], scenarios
   }
   return <Card><Card.Header className="d-flex justify-content-between align-items-center"><span>{title}</span><Badge bg={done ? "success" : "warning"}>{done ? "Complete" : "Review required"}</Badge></Card.Header><Card.Body>
     <p className="text-muted">{description}</p>
-    {stage === "readiness_review" && <div className="small mb-3"><CheckCircle size={16} className="text-success me-2" />BRD parsed and CDP metadata available</div>}
+    {stage === "readiness_review" && <div className="small mb-3"><CheckCircle size={16} className="text-success me-2" />BRD parsed and target metadata available</div>}
     {stage === "coverage_review" && <div className="alert alert-info">{coverage ? `Requirement coverage: ${coverage.requirements.percentage}% · Scenario coverage: ${coverage.scenarios.percentage}% · Business-rule coverage: ${coverage.business_rules.percentage}%` : `${testCases.length} test case(s) generated from the approved requirement.`}</div>}
     {stage === "human_approval" && <div className="small mb-3"><ShieldCheck size={16} className="text-success me-2" />Coverage is ready for a human sign-off.</div>}
     {stage === "human_approval" && <Form.Control as="textarea" rows={3} className="mb-3" placeholder="Approval note (optional)" value={reviewNote} onChange={(e) => setReviewNote(e.target.value)} />}
     {isScenario && <div className="d-flex flex-column gap-2 mb-3">{scenarios.map((scenario) => <Form.Check key={scenario.key} type="radio" name="scenario" label={`${scenario.name} (${scenario.key})`} checked={selectedScenario === scenario.key} onChange={() => onSelectScenario?.(scenario.key)} />)}</div>}
-    {stage === "execution" && <div className="small mb-3"><Compass size={16} className="text-primary me-2" />Webpage and API targets are probed; CDP targets remain manual until a browser runner is configured.</div>}
+    {stage === "execution" && <div className="small mb-3"><Compass size={16} className="text-primary me-2" />Webpage and API targets are probed; remaining targets require manual setup until a browser runner is configured.</div>}
     {stage === "execution" && executionResult?.results && <div className="alert alert-info">{executionResult.results.length} target(s) executed · {executionResult.failed || 0} failed.</div>}
     {stage === "evidence_cleanup" && <div className="alert alert-info">{evidence.length} evidence item(s) captured from validation and execution.</div>}
     {error && <Alert variant="danger">{error}</Alert>}

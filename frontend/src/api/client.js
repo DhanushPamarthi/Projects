@@ -185,6 +185,22 @@ export async function updateExecutionRunLifecycle(runId, payload) {
   });
 }
 
+export async function generateTestData(generationId, payload) {
+  return request(`/api/v1/test-case-generations/${encodeURIComponent(generationId)}/test-data`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+}
+
+export async function listTestData(generationId) {
+  return request(`/api/v1/test-case-generations/${encodeURIComponent(generationId)}/test-data`);
+}
+
+export async function reviewTestData(generationId, items) {
+  return request(`/api/v1/test-case-generations/${encodeURIComponent(generationId)}/test-data/review`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ items }) });
+}
+
+export async function saveTestDataToBronze(generationId) {
+  return request(`/api/v1/test-case-generations/${encodeURIComponent(generationId)}/test-data/save`, { method: "POST" });
+}
+
 export async function getRequirement(key) {
   return request(`/requirements/${encodeURIComponent(key)}`);
 }
