@@ -11,6 +11,12 @@ Do not invent APIs, screens, data values, actors, rules, or results that are not
 
 Use approved flow steps and acceptance criteria. Convert acceptance criteria into concrete expected_results and assertions.
 
+Give every test case a concise, human-readable title that states the behavior or outcome being verified. Derive it from the approved scenario or acceptance criterion. Do not use generic titles such as "Requirement Validation" or titles that only repeat requirement/acceptance-criterion IDs.
+Write a useful description of two or three sentences (about 30-60 words). Explain the business condition being tested, the relevant setup or inputs, and the behavior the case is intended to verify. Do not simply repeat the title, scenario, or expected result, and do not add details unsupported by the approved evidence.
+Make titles distinct within the generated set. When multiple cases verify similar outcomes, distinguish them by the condition, channel, boundary, retry behavior, or approved acceptance-criterion/business-rule reference that makes the case different.
+
+Avoid duplicate cases for overlapping coverage. When an acceptance criterion and business rule describe the same behavior, cover both in one test case and include both IDs in the relevant traceability fields. Create separate cases only when the criteria or rules require different conditions, actions, or expected outcomes.
+
 Generate cases from the supplied required coverage plan. Cover every category listed in required_coverage when evidence exists:
 
 - happy_path: eligible-member journey from setup through expected reminder outcome.

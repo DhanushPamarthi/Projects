@@ -1,4 +1,5 @@
 import copy, difflib, hashlib, json, mimetypes, os, threading, uuid
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
@@ -179,6 +180,33 @@ class ExecutionRunLifecycleRequest(BaseModel):
     reviewer: str | None = Field(default=None, max_length=200)
     comments: str | None = Field(default=None, max_length=4000)
     error: str | None = Field(default=None, max_length=4000)
+
+class TestDataTemplateDefinition(BaseModel):
+    template_id: str = Field(min_length=1, max_length=100)
+    template_name: str = Field(min_length=1, max_length=200)
+    entity_name: str = Field(min_length=1, max_length=100)
+    payload: dict
+
+class TestDataCaseAssignment(BaseModel):
+    test_case_id: str = Field(min_length=1, max_length=100)
+    template_ids: list[str] = Field(min_length=1)
+
+class TestDataGenerationRequest(BaseModel):
+    reviewer: str | None = Field(default=None, max_length=200)
+    assignments: list[TestDataCaseAssignment] = Field(default_factory=list)
+    template_definitions: list[TestDataTemplateDefinition] = Field(default_factory=list)
+    replace_existing_drafts: bool = False
+    # Legacy fields remain supported for existing clients; they apply all
+    # listed templates to each listed case.
+    test_case_ids: list[str] = Field(default_factory=list)
+    template_ids: list[str] = Field(default_factory=list)
+
+class TestDataReviewItem(BaseModel):
+    record_id: str = Field(min_length=1, max_length=100)
+    payload: dict
+
+class TestDataReviewRequest(BaseModel):
+    items: list[TestDataReviewItem] = Field(min_length=1)
 
 class DiscoveryContextRequest(BaseModel):
     package_id: str | None = None
@@ -608,6 +636,7 @@ def _test_case_generation_schema():
             "test_case_id": {"type": "string", "pattern": "^TC-[0-9]{3}$"},
             "requirement_id": {"type": "string", "pattern": "^FR-[0-9]{3}$"},
             "title": {"type": "string"},
+            "description": {"type": "string"},
             "scenario": {"type": "string"},
             "category": {"type": "string"},
             "type": {"type": "string"},
@@ -630,7 +659,7 @@ def _test_case_generation_schema():
             "cleanup_ownership": cleanup_ownership,
             "approval": approval,
             "source_references": {"type": "array", "items": source_reference, "minItems": 1}
-        }, "required": ["test_case_id", "requirement_id", "title", "scenario", "category", "type", "priority", "surfaces", "preconditions", "test_data_setup", "deterministic_inputs", "data_needs", "actions", "steps", "assertions", "expected_results", "acceptance_criteria_ids", "business_rule_ids", "discovery_context_ids", "evidence", "assumptions", "validation_results", "cleanup_ownership", "approval", "source_references"]}},
+        }, "required": ["test_case_id", "requirement_id", "title", "description", "scenario", "category", "type", "priority", "surfaces", "preconditions", "test_data_setup", "deterministic_inputs", "data_needs", "actions", "steps", "assertions", "expected_results", "acceptance_criteria_ids", "business_rule_ids", "discovery_context_ids", "evidence", "assumptions", "validation_results", "cleanup_ownership", "approval", "source_references"]}},
         "coverage": {"type": "object", "additionalProperties": False, "properties": {"required_categories": {"type": "array", "items": {"type": "string"}}, "generated_categories": {"type": "array", "items": {"type": "string"}}, "missing_categories": {"type": "array", "items": {"type": "string"}}}, "required": ["required_categories", "generated_categories", "missing_categories"]},
         "global_gaps": {"type": "array", "items": {"type": "string"}}
     }, "required": ["test_cases", "coverage", "global_gaps"]}
@@ -660,6 +689,28 @@ def _find_requirement_for_terms(approved_requirements, terms):
             return requirement
     return None
 
+_COVERAGE_STOP_WORDS = {"a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in", "into", "is", "it", "of", "on", "or", "the", "to", "when", "where", "which", "with", "must", "should", "shall", "given", "then"}
+_CONFLICTING_COVERAGE_TERMS = ({"active", "inactive"}, {"eligible", "ineligible"}, {"include", "exclude"}, {"included", "excluded"}, {"send", "suppress"}, {"success", "failure"}, {"valid", "invalid"}, {"present", "missing"}, {"primary", "alternate"}, {"approved", "rejected"})
+
+def _coverage_terms(item, acceptance=False):
+    values = (item.get(key) for key in ("given", "when", "then")) if acceptance else (item.get("text"),)
+    text = " ".join(str(value or "") for value in values).lower()
+    tokens = {token[:-1] if len(token) > 4 and token.endswith("s") else token for token in re.findall(r"[a-z0-9]+", text)}
+    return tokens - _COVERAGE_STOP_WORDS
+
+def _coverage_overlap_score(left, right):
+    left_terms, right_terms = _coverage_terms(left, "given" in left or "when" in left or "then" in left), _coverage_terms(right, "given" in right or "when" in right or "then" in right)
+    if not left_terms or not right_terms:
+        return 0.0
+    if any(len(group & left_terms) and len(group & right_terms) and not (group & left_terms) == (group & right_terms) for group in _CONFLICTING_COVERAGE_TERMS):
+        return 0.0
+    common = len(left_terms & right_terms)
+    jaccard = common / len(left_terms | right_terms)
+    containment = common / min(len(left_terms), len(right_terms))
+    if left_terms == right_terms:
+        return 1.0
+    return containment if common >= 3 and containment >= 0.7 and jaccard >= 0.3 else jaccard
+
 def _test_case_coverage_plan(approved_requirements, requested_count=None):
     categories = [
         ("happy_path", "Eligible-member happy path", ("eligible", "active", "success", "reminder", "campaign")),
@@ -673,18 +724,23 @@ def _test_case_coverage_plan(approved_requirements, requested_count=None):
         for requirement in approved_requirements:
             criteria = [item for item in requirement.get("acceptance_criteria", []) if isinstance(item, dict)]
             rules = [item for item in requirement.get("business_rules", []) if isinstance(item, dict)]
-            if criteria:
-                for criterion in criteria:
-                    plan.append({"category": "requirement_validation", "label": criterion.get("acceptance_id") or "Acceptance criterion validation", "requirement": requirement, "acceptance_criterion": criterion})
-            else:
-                plan.append({"category": "requirement_validation", "label": "Requirement validation", "requirement": requirement})
+            requirement_plan = []
+            for criterion in criteria:
+                requirement_plan.append({"category": "requirement_validation", "label": criterion.get("acceptance_id") or "Acceptance criterion validation", "requirement": requirement, "acceptance_criteria": [criterion], "business_rules": []})
             for rule in rules:
-                if len(plan) >= 100:
-                    gaps.append("Automatic test-case plan was capped at 100 cases for one generation run.")
-                    return plan, gaps
-                plan.append({"category": "requirement_validation", "label": rule.get("rule_id") or "Business rule validation", "requirement": requirement, "business_rule": rule})
-        if not plan and approved_requirements:
-            plan.append({"category": "requirement_validation", "label": "Requirement validation", "requirement": approved_requirements[0]})
+                criterion_cases = [item for item in requirement_plan if item["acceptance_criteria"]]
+                best_match = max(criterion_cases, key=lambda item: _coverage_overlap_score(item["acceptance_criteria"][0], rule), default=None)
+                if best_match and _coverage_overlap_score(best_match["acceptance_criteria"][0], rule) >= 0.58:
+                    best_match["business_rules"].append(rule)
+                    continue
+                requirement_plan.append({"category": "requirement_validation", "label": rule.get("rule_id") or "Business rule validation", "requirement": requirement, "acceptance_criteria": [], "business_rules": [rule]})
+            if not requirement_plan:
+                requirement_plan.append({"category": "requirement_validation", "label": "Requirement validation", "requirement": requirement, "acceptance_criteria": [], "business_rules": []})
+            remaining = 100 - len(plan)
+            plan.extend(requirement_plan[:remaining])
+            if len(requirement_plan) > remaining:
+                gaps.append("Automatic test-case plan was capped at 100 cases for one generation run.")
+                return plan, gaps
         return plan[:100], gaps
 
     first_requirement = approved_requirements[0] if approved_requirements else None
@@ -716,6 +772,7 @@ def _test_case_generation_input(approved_requirements, package, requested_count,
         "package_version": package["package_version"],
         "source_package_run_id": package.get("run_id"),
         "required_coverage": [item["category"] for item in plan],
+        "coverage_plan": [{"requirement_id": item["requirement"].get("requirement_id"), "category": item["category"], "acceptance_criteria_ids": [criterion.get("acceptance_id") for criterion in item.get("acceptance_criteria", []) if criterion.get("acceptance_id")], "business_rule_ids": [rule.get("rule_id") for rule in item.get("business_rules", []) if rule.get("rule_id")]} for item in plan],
         "context": {
             "mode": "approved_requirement_contract_with_knowledge_context" if discovery_contexts else "approved_requirement_contract",
             "graphrag_context_available": bool(discovery_contexts),
@@ -749,14 +806,16 @@ def _validate_test_case_contract(contract, approved_requirements, requested_coun
         raise ValueError(f"AI missed required test-case categories: {', '.join(missing_categories)}")
     for entry in plan:
         requirement_id = entry["requirement"].get("requirement_id")
-        criterion_id = (entry.get("acceptance_criterion") or {}).get("acceptance_id")
-        rule_id = (entry.get("business_rule") or {}).get("rule_id")
-        if criterion_id and not any(case.get("requirement_id") == requirement_id and criterion_id in (case.get("acceptance_criteria_ids") or []) for case in contract["test_cases"]):
-            raise ValueError(f"AI missed required acceptance criterion coverage: {criterion_id}")
-        if rule_id and not any(case.get("requirement_id") == requirement_id and rule_id in (case.get("business_rule_ids") or []) for case in contract["test_cases"]):
-            raise ValueError(f"AI missed required business rule coverage: {rule_id}")
+        criterion_ids = [criterion.get("acceptance_id") for criterion in entry.get("acceptance_criteria", []) if criterion.get("acceptance_id")]
+        rule_ids = [rule.get("rule_id") for rule in entry.get("business_rules", []) if rule.get("rule_id")]
+        for criterion_id in criterion_ids:
+            if not any(case.get("requirement_id") == requirement_id and criterion_id in (case.get("acceptance_criteria_ids") or []) for case in contract["test_cases"]):
+                raise ValueError(f"AI missed required acceptance criterion coverage: {criterion_id}")
+        for rule_id in rule_ids:
+            if not any(case.get("requirement_id") == requirement_id and rule_id in (case.get("business_rule_ids") or []) for case in contract["test_cases"]):
+                raise ValueError(f"AI missed required business rule coverage: {rule_id}")
     seen = set()
-    required_fields = ("scenario", "category", "surfaces", "test_data_setup", "deterministic_inputs", "data_needs", "actions", "assertions", "evidence", "validation_results", "cleanup_ownership", "approval")
+    required_fields = ("description", "scenario", "category", "surfaces", "test_data_setup", "deterministic_inputs", "data_needs", "actions", "assertions", "evidence", "validation_results", "cleanup_ownership", "approval")
     for test_case in contract["test_cases"]:
         case_id = test_case.get("test_case_id")
         requirement_id = test_case.get("requirement_id")
@@ -818,6 +877,7 @@ def _test_cases_with_openai(approved_requirements, package, requested_count, dis
             if not response.output_text:
                 raise ValueError("OpenAI returned no test cases")
             contract = json.loads(response.output_text)
+            _deduplicate_generated_test_cases(contract)
             _validate_test_case_contract(contract, approved_requirements, requested_count, discovery_contexts)
             contract["agent_attempts"] = [{"attempt": attempt, "status": "passed", "details": "Schema, evidence, and coverage validation passed."}]
             contract.setdefault("global_gaps", []).extend(payload["context"]["gaps"] + payload.get("coverage_gaps", []))
@@ -870,6 +930,19 @@ def _database_test_data_setup(requirement, category, seed, criteria_ids, rule_id
         })
     return setup
 
+def _fallback_test_case_title(acceptance_criterion, selected_rule, scenario):
+    behavior = (acceptance_criterion or {}).get("then") or (selected_rule or {}).get("text") or scenario
+    title = " ".join(str(behavior or "").split()).strip(" .!?\t\n")
+    if not title:
+        title = "Verify the approved requirement behavior"
+    if title.lower().startswith("verify "):
+        result = title[0].upper() + title[1:]
+    else:
+        result = f"Verify {title[0].lower() + title[1:]}"
+    if len(result) > 120:
+        result = result[:117].rsplit(" ", 1)[0].rstrip(" ,;:") + "..."
+    return result
+
 def _test_cases_fallback(approved_requirements, requested_count, package=None, discovery_contexts=None):
     package = package or {}
     discovery_contexts = discovery_contexts or []
@@ -881,8 +954,10 @@ def _test_cases_fallback(approved_requirements, requested_count, package=None, d
         template = _case_template(category)
         criteria = [item for item in requirement.get("acceptance_criteria", []) if isinstance(item, dict)]
         rules = [item for item in requirement.get("business_rules", []) if isinstance(item, dict)]
-        first = entry.get("acceptance_criterion") or (criteria[0] if criteria else {})
-        selected_rule = entry.get("business_rule")
+        case_criteria = entry.get("acceptance_criteria") or ([entry["acceptance_criterion"]] if entry.get("acceptance_criterion") else ([criteria[0]] if criteria else []))
+        selected_rules = entry.get("business_rules") or ([entry["business_rule"]] if entry.get("business_rule") else [])
+        first = case_criteria[0] if case_criteria else {}
+        selected_rule = selected_rules[0] if selected_rules else None
         seed = _test_case_seed(package, requirement, category, index)
         source_refs = _case_source_refs(requirement)
         evidence_refs = source_refs[:3] or [{"fragment_id": "unavailable", "source_reference": "approved requirement contract"}]
@@ -893,19 +968,23 @@ def _test_cases_fallback(approved_requirements, requested_count, package=None, d
         steps = requirement.get("flow_steps") or template["steps"]
         selected_rule_text = selected_rule.get("text") if isinstance(selected_rule, dict) else ""
         expected_text = first.get("then") or selected_rule_text or template["expected"]
-        rule_ids = [selected_rule.get("rule_id")] if isinstance(selected_rule, dict) and selected_rule.get("rule_id") else [rule.get("rule_id") for rule in rules if rule.get("rule_id")]
-        criteria_ids = [first.get("acceptance_id")] if first.get("acceptance_id") else []
+        rule_ids = [rule.get("rule_id") for rule in selected_rules if rule.get("rule_id")]
+        criteria_ids = [criterion.get("acceptance_id") for criterion in case_criteria if criterion.get("acceptance_id")]
         test_data_setup = _database_test_data_setup(requirement, category, seed, criteria_ids, rule_ids)
         setup_steps = [item["setup_step"] for item in test_data_setup]
+        setup_fields = ", ".join(item["name"] for item in test_data_setup if item.get("name")) or "the required test data"
+        requirement_label = requirement.get("title") or requirement.get("statement") or requirement["requirement_id"]
+        case_description = f"This case validates {template['scenario'].rstrip('.')} for {requirement_label}. It prepares {setup_fields} for the approved condition, follows the documented test steps, and confirms the expected outcome: {expected_text}"
         evidence_items = [{"evidence_id": requirement["requirement_id"], "evidence_type": "requirement", "requirement_id": requirement["requirement_id"], "summary": requirement.get("statement") or requirement.get("title") or "Approved requirement", "source_references": evidence_refs}]
-        evidence_items.extend({"evidence_id": item_id, "evidence_type": "acceptance_criterion", "requirement_id": requirement["requirement_id"], "summary": first.get("then", "Approved acceptance criterion"), "source_references": evidence_refs} for item_id in criteria_ids)
-        evidence_items.extend({"evidence_id": item_id, "evidence_type": "business_rule", "requirement_id": requirement["requirement_id"], "summary": next((rule.get("text") for rule in rules if rule.get("rule_id") == item_id), "Approved business rule"), "source_references": evidence_refs} for item_id in rule_ids[:2])
+        evidence_items.extend({"evidence_id": criterion.get("acceptance_id"), "evidence_type": "acceptance_criterion", "requirement_id": requirement["requirement_id"], "summary": criterion.get("then", "Approved acceptance criterion"), "source_references": evidence_refs} for criterion in case_criteria if criterion.get("acceptance_id"))
+        evidence_items.extend({"evidence_id": item_id, "evidence_type": "business_rule", "requirement_id": requirement["requirement_id"], "summary": next((rule.get("text") for rule in rules if rule.get("rule_id") == item_id), "Approved business rule"), "source_references": evidence_refs} for item_id in rule_ids)
         if selected_context:
             evidence_items.append({"evidence_id": selected_context["context_id"], "evidence_type": "discovery_context", "requirement_id": requirement["requirement_id"], "summary": selected_context.get("description") or selected_context["name"], "source_references": evidence_refs})
         cases.append({
             "test_case_id": f"TC-{index:03d}",
             "requirement_id": requirement["requirement_id"],
-            "title": f"{entry['label']} - {requirement.get('title') or requirement['requirement_id']}",
+            "title": _fallback_test_case_title(first, selected_rule, template["scenario"]),
+            "description": case_description,
             "scenario": template["scenario"],
             "category": category,
             "type": template["type"],
@@ -936,7 +1015,10 @@ def _test_cases_fallback(approved_requirements, requested_count, package=None, d
             "approval": {"status": "pending", "reviewer": "", "comments": "", "reviewed_at": ""},
             "source_references": source_refs[:5] or evidence_refs,
         })
-    generated_categories = [case["category"] for case in cases]
+    contract = {"test_cases": cases, "coverage": {"required_categories": [item["category"] for item in plan]}}
+    _deduplicate_generated_test_cases(contract)
+    cases = contract["test_cases"]
+    generated_categories = list(dict.fromkeys(case["category"] for case in cases))
     discovery_gap = [] if discovery_contexts else ["GraphRAG/Knowledge Fabric context is not connected; cases are grounded only in approved requirements and source references."]
     return {"test_cases": cases, "coverage": {"required_categories": [item["category"] for item in plan], "generated_categories": generated_categories, "missing_categories": []}, "global_gaps": ["LLM test-case generation was not run because OPENAI_API_KEY is not configured.", *discovery_gap, *gaps]}
 
@@ -948,6 +1030,63 @@ def _normalized_case_text(test_case):
         " ".join(test_case.get("expected_results", []) or []),
     ])
     return " ".join(value.lower().split())
+
+def _deduplicate_generated_test_cases(contract):
+    def normalize(value):
+        if isinstance(value, list):
+            return tuple(normalize(item) for item in value)
+        if isinstance(value, dict):
+            return tuple((key, normalize(value[key])) for key in sorted(value))
+        if isinstance(value, str):
+            return " ".join(re.findall(r"[a-z0-9]+", value.lower()))
+        return value
+
+    merged, by_signature = [], {}
+    array_fields = ("acceptance_criteria_ids", "business_rule_ids", "discovery_context_ids", "evidence", "source_references", "deterministic_inputs", "data_needs", "actions", "steps", "assertions", "expected_results", "preconditions", "assumptions", "validation_results")
+    for test_case in contract.get("test_cases", []):
+        signature = (
+            test_case.get("requirement_id"),
+            test_case.get("category"),
+            normalize(test_case.get("scenario", "")),
+            normalize(test_case.get("preconditions", [])),
+            normalize(test_case.get("steps", [])),
+            normalize(test_case.get("expected_results", [])),
+        )
+        duplicate_index = by_signature.get(signature)
+        if duplicate_index is None:
+            by_signature[signature] = len(merged)
+            merged.append(test_case)
+            continue
+        existing = merged[duplicate_index]
+        for field in array_fields:
+            values = existing.setdefault(field, [])
+            seen = {json.dumps(item, sort_keys=True, ensure_ascii=False) for item in values}
+            for item in test_case.get(field, []) or []:
+                encoded = json.dumps(item, sort_keys=True, ensure_ascii=False)
+                if encoded not in seen:
+                    values.append(item)
+                    seen.add(encoded)
+        setup_by_name = {str(item.get("name") or "").strip().lower(): item for item in existing.get("test_data_setup", []) if isinstance(item, dict)}
+        for setup in test_case.get("test_data_setup", []) or []:
+            name = str(setup.get("name") or "").strip().lower() if isinstance(setup, dict) else ""
+            current = setup_by_name.get(name) if name else None
+            if current is None:
+                existing.setdefault("test_data_setup", []).append(setup)
+                if name: setup_by_name[name] = setup
+            else:
+                sources = list(dict.fromkeys([value.strip() for value in f"{current.get('source', '')},{setup.get('source', '')}".split(",") if value.strip()]))
+                current["source"] = ",".join(sources)
+
+    for index, test_case in enumerate(merged, 1):
+        test_case["test_case_id"] = f"TC-{index:03d}"
+        for assertion_index, assertion in enumerate(test_case.get("assertions", []) or [], 1):
+            if isinstance(assertion, dict):
+                assertion["assertion_id"] = f"AS-{index:03d}-{assertion_index:03d}"
+    contract["test_cases"] = merged
+    coverage = contract.setdefault("coverage", {})
+    coverage["generated_categories"] = list(dict.fromkeys(test_case.get("category") for test_case in merged if test_case.get("category")))
+    coverage["missing_categories"] = sorted(set(coverage.get("required_categories", [])) - set(coverage["generated_categories"]))
+    return contract
 
 def _review_status(test_case):
     return test_case.get("review_status") or (test_case.get("approval") or {}).get("status") or "pending"
@@ -1689,7 +1828,7 @@ def generate_test_cases_from_analysis(analysis_id: str, request: TestCaseGenerat
         _validate_test_case_contract(generated, approved_requirements, requested_count, discovery_contexts)
         generation_id, timestamp = uid("tcg"), now()
         requirement_contract_hash = hashlib.sha256(json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-        generated.update({"contract_version": "1.0", "generation_id": generation_id, "analysis_id": analysis_id, "analysis_version": analysis["analysis_version"], "requirement_contract_hash": requirement_contract_hash, "package_id": package["package_id"], "package_version": package["package_version"], "source_package_run_id": package["run_id"], "requested_test_case_count": len(generated.get("test_cases", [])), "count_strategy": "derived_from_approved_functional_requirements_acceptance_criteria_and_business_rules" if requested_count is None else "user_requested", "generation_mode": mode, "generation_model": OPENAI_MODEL if mode == "openai" else LOCAL_EXTRACTOR_VERSION, "generation_prompt_version": TEST_CASE_GENERATION_PROMPT_VERSION, "generation_prompt_hash": test_case_generation_prompt_hash(), "generated_at": timestamp, "approved_requirement_ids": [item["requirement_id"] for item in approved_requirements], "source_package_items": contract.get("source_package_items", []), "discovery_contexts": discovery_contexts, "discovery_context_ids": [context["context_id"] for context in discovery_contexts]})
+        generated.update({"contract_version": "1.0", "generation_id": generation_id, "analysis_id": analysis_id, "analysis_version": analysis["analysis_version"], "project_id": analysis["project_id"], "requirement_contract_hash": requirement_contract_hash, "package_id": package["package_id"], "package_version": package["package_version"], "source_package_run_id": package["run_id"], "requested_test_case_count": len(generated.get("test_cases", [])), "count_strategy": "derived_from_approved_functional_requirements_acceptance_criteria_and_business_rules" if requested_count is None else "user_requested", "generation_mode": mode, "generation_model": OPENAI_MODEL if mode == "openai" else LOCAL_EXTRACTOR_VERSION, "generation_prompt_version": TEST_CASE_GENERATION_PROMPT_VERSION, "generation_prompt_hash": test_case_generation_prompt_hash(), "generated_at": timestamp, "approved_requirement_ids": [item["requirement_id"] for item in approved_requirements], "source_package_items": contract.get("source_package_items", []), "discovery_contexts": discovery_contexts, "discovery_context_ids": [context["context_id"] for context in discovery_contexts]})
         for test_case in generated.get("test_cases", []):
             test_case["review_status"] = "pending"
             test_case["approved"] = False
@@ -1807,6 +1946,7 @@ def regenerate_test_cases(generation_id: str, request: TestCaseRegenerationReque
             "contract_version": "1.0",
             "generation_id": new_generation_id,
             "analysis_id": parent["analysis_id"],
+            "project_id": parent["project_id"],
             "analysis_version": analysis["analysis_version"],
             "requirement_contract_hash": requirement_contract_hash,
             "package_id": package["package_id"],
@@ -1861,9 +2001,20 @@ def create_execution_run(generation_id: str, request: ExecutionRunRequest):
         not_approved = [case_id for case_id in request.selected_test_case_ids if _review_status(by_id[case_id]) != "approved"]
         if not_approved:
             raise HTTPException(422, {"message": "Only approved test cases can be frozen for execution", "not_approved": not_approved})
+        if not request.selected_test_case_ids:
+            raise HTTPException(422, "Select at least one approved test case with saved test data before freezing a baseline")
 
         timestamp = now()
         selected_cases = [json.loads(json.dumps(by_id[case_id])) for case_id in request.selected_test_case_ids]
+        selected_test_data = []
+        if request.selected_test_case_ids:
+            placeholders = ",".join(["%s"] * len(request.selected_test_case_ids))
+            data_rows = conn.execute(f"SELECT r.* FROM test_data_record r WHERE r.generation_id=%s AND r.test_case_id IN ({placeholders}) AND r.status='saved' ORDER BY r.test_case_id,r.entity_name", tuple([generation_id] + request.selected_test_case_ids)).fetchall()
+            selected_test_data = [_test_data_record_response(data_row) for data_row in data_rows]
+        cases_with_saved_data = {record["test_case_id"] for record in selected_test_data}
+        missing_test_data = sorted(set(request.selected_test_case_ids) - cases_with_saved_data)
+        if missing_test_data:
+            raise HTTPException(422, {"message": "Generate and save test data to Bronze before freezing the execution baseline", "missing_test_data": missing_test_data})
         source_contract_hash = hashlib.sha256(json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
         frozen_contract = {
             "baseline_version": "1.0",
@@ -1874,6 +2025,7 @@ def create_execution_run(generation_id: str, request: ExecutionRunRequest):
             "source_contract_hash": source_contract_hash,
             "selected_test_case_ids": request.selected_test_case_ids,
             "test_cases": selected_cases,
+            "test_data_records": selected_test_data,
             "coverage_review": contract.get("coverage_review", {}),
             "review_metadata": contract.get("review_metadata", {}),
             "frozen_by": request.reviewer,
@@ -1943,6 +2095,301 @@ def update_execution_run_lifecycle(run_id: str, request: ExecutionRunLifecycleRe
             (status, lifecycle_state, cancelled_at, completed_at, error, json.dumps(observations), run_id),
         )
         return _test_run_response(conn.execute("SELECT * FROM test_run WHERE run_id=%s", (run_id,)).fetchone())
+
+def _unique_test_value(key, template_id, test_case_id, ordinal=0):
+    suffix = hashlib.sha256(f"{template_id}:{test_case_id}:{ordinal}".encode("utf-8")).hexdigest()[:10].upper()
+    normalized = str(key).lower()
+    if normalized in {"member_id", "subscriber_id", "prescription_id", "claim_id", "payment_method_id"}:
+        return f"QA-{normalized.upper()}-{suffix}"
+    if normalized == "token":
+        return f"tok_mock_{suffix.lower()}"
+    if "email" in normalized:
+        return f"{normalized.replace('_address', '')}.{suffix.lower()}@example.test"
+    if "phone" in normalized:
+        return f"+1-555-{int(suffix[:6], 16) % 1000000:06d}"
+    return None
+
+def _set_unique_template_values(value, template_id, test_case_id):
+    counters = {}
+    def visit(current):
+        if isinstance(current, dict):
+            for key, item in list(current.items()):
+                normalized = key.lower()
+                ordinal = counters.get(normalized, 0)
+                counters[normalized] = ordinal + 1
+                generated = _unique_test_value(key, template_id, test_case_id, ordinal)
+                if generated is not None and (item is None or item == "" or normalized in {"member_id", "subscriber_id", "prescription_id", "claim_id", "payment_method_id", "email_address", "phone_number", "token"}):
+                    current[key] = generated
+                else:
+                    visit(item)
+        elif isinstance(current, list):
+            for item in current:
+                visit(item)
+        return current
+    return visit(value)
+
+def _link_member_identities(payload, identities):
+    if isinstance(payload, dict):
+        for key, value in list(payload.items()):
+            if key.lower() == "member_id" and identities:
+                payload[key] = identities[0]
+            else:
+                _link_member_identities(value, identities)
+    elif isinstance(payload, list):
+        for item in payload:
+            _link_member_identities(item, identities)
+    return payload
+
+def _test_data_record_response(row):
+    item = row_dict(row)
+    if not item:
+        return None
+    item["payload"] = json.loads(item.pop("payload_json"))
+    item["pre_steps"] = json.loads(item.pop("pre_steps_json"))
+    item["schema_context"] = json.loads(item.pop("schema_context_json") or "[]")
+    return item
+
+def _test_data_value_schema(value):
+    if isinstance(value, dict):
+        properties = {key: _test_data_value_schema(child) for key, child in value.items()}
+        return {"type": "object", "properties": properties, "required": list(properties), "additionalProperties": False}
+    if isinstance(value, list):
+        return {"type": "array", "items": _test_data_value_schema(value[0]) if value else {"type": "string"}}
+    if isinstance(value, bool): return {"type": "boolean"}
+    if isinstance(value, int): return {"type": "integer"}
+    if isinstance(value, float): return {"type": "number"}
+    if value is None: return {"type": ["string", "null"]}
+    return {"type": "string"}
+
+def _matches_test_data_template_shape(value, template):
+    if isinstance(template, dict):
+        return isinstance(value, dict) and set(value) == set(template) and all(_matches_test_data_template_shape(value[key], child) for key, child in template.items())
+    if isinstance(template, list):
+        return isinstance(value, list) and len(value) == len(template) and all(_matches_test_data_template_shape(item, template[index]) for index, item in enumerate(value))
+    if template is None:
+        return value is None or isinstance(value, str)
+    if isinstance(template, bool):
+        return isinstance(value, bool)
+    if isinstance(template, int):
+        return isinstance(value, int) and not isinstance(value, bool)
+    if isinstance(template, float):
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return isinstance(value, str)
+
+def _generate_test_data_with_openai(templates):
+    key = os.getenv("OPENAI_API_KEY")
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY is not configured for test-data generation")
+    from openai import OpenAI
+
+    client = OpenAI(api_key=key, timeout=OPENAI_TIMEOUT_SECONDS)
+    generated = {}
+    for template, case_batch in templates:
+        case_properties = {case["test_case_id"]: {"type": "object", "properties": {"payload": _test_data_value_schema(template["payload"])}, "required": ["payload"], "additionalProperties": False} for case in case_batch}
+        schema = {"type": "object", "properties": {"records": {"type": "object", "properties": case_properties, "required": list(case_properties), "additionalProperties": False}}, "required": ["records"], "additionalProperties": False}
+        prompt = {
+            "instructions": "Create realistic, synthetic test data for each approved test case using the supplied template. Return a complete payload for every case. Preserve the template's exact keys, nesting, array lengths, and value types. Use the scenario, preconditions, data needs, steps, and expected results to choose values that exercise that case. Keep fixed template values when they remain appropriate; vary values when the case requires a boundary, negative, or alternate state. Use only fictional names and example.test email addresses. Do not include explanations or keys outside the template.",
+            "template": {"entity_name": template["entity_name"], "template_name": template["template_name"], "payload_shape_and_examples": template["payload"]},
+            "approved_test_cases": [{key: case.get(key) for key in ("test_case_id", "title", "description", "scenario", "preconditions", "data_needs", "actions", "steps", "expected_results", "deterministic_inputs") if case.get(key) is not None} for case in case_batch],
+        }
+        response = client.responses.create(
+            model=OPENAI_MODEL,
+            input="Generate template-based test data as JSON.\n" + json.dumps(prompt, ensure_ascii=False),
+            store=False,
+            text={"format": {"type": "json_schema", "name": "test_data_records", "strict": True, "schema": schema}},
+        )
+        if not response.output_text:
+            raise ValueError("OpenAI returned no test data")
+        result = json.loads(response.output_text).get("records", {})
+        expected_ids = {case["test_case_id"] for case in case_batch}
+        if set(result) != expected_ids or any(not isinstance(item, dict) or not isinstance(item.get("payload"), dict) or not _matches_test_data_template_shape(item["payload"], template["payload"]) for item in result.values()):
+            raise ValueError("OpenAI returned incomplete or invalid test data for the selected cases")
+        generated.update({(case_id, template["template_id"]): item["payload"] for case_id, item in result.items()})
+    return generated
+
+def _test_data_generation_batches(assignments, cases, templates_by_case):
+    by_template = {}
+    for case_id in assignments:
+        case = cases[case_id]
+        for template in templates_by_case[case_id]:
+            key = template["template_id"]
+            by_template.setdefault(key, {"template": {"template_id": key, "entity_name": template["entity_name"], "template_name": template["template_name"], "payload": json.loads(template["payload_json"])}, "cases": []})["cases"].append(case)
+    batches = []
+    for item in by_template.values():
+        batches.extend((item["template"], item["cases"][index:index + 10]) for index in range(0, len(item["cases"]), 10))
+    return batches
+
+def _fallback_test_data_payload(template, test_case):
+    payload = json.loads(json.dumps(template["payload"]))
+    case_id = str(test_case.get("test_case_id") or "case")
+    suffix = hashlib.sha256(f"{template['template_id']}:{case_id}".encode("utf-8")).hexdigest()[:8].upper()
+    scenario = " ".join(str(test_case.get(key) or "") for key in ("title", "scenario", "expected_results")).lower()
+    inactive_case = any(term in scenario for term in ("ineligible", "inactive", "terminated", "excluded", "invalid", "rejected"))
+
+    def fill(value, key=""):
+        normalized = key.lower()
+        if isinstance(value, dict):
+            return {child_key: fill(child_value, child_key) for child_key, child_value in value.items()}
+        if isinstance(value, list):
+            return [fill(child, key) for child in value]
+        if value != "":
+            return value
+        if normalized.endswith("_id") or normalized == "id":
+            return f"QA-{normalized.upper()}-{suffix}"
+        if "email" in normalized:
+            return f"qa.{suffix.lower()}@example.test"
+        if "phone" in normalized:
+            return f"+1-555-{int(suffix[:6], 16) % 1000000:06d}"
+        if "date" in normalized:
+            return "1990-01-01" if "birth" in normalized else "2026-01-01"
+        if "status" in normalized:
+            return "INACTIVE" if inactive_case else "ACTIVE"
+        if normalized in {"first_name", "given_name"}:
+            return "Ava"
+        if normalized in {"last_name", "family_name", "surname"}:
+            return "Anderson"
+        if normalized.endswith("_name") or normalized == "name":
+            return f"QA {template['entity_name'].title()} {suffix[:4]}"
+        return f"QA-{suffix}"
+
+    return fill(payload)
+
+@app.post("/api/v1/test-case-generations/{generation_id}/test-data", status_code=201)
+def generate_test_data(generation_id: str, request: TestDataGenerationRequest):
+    with connection() as conn:
+        generation = conn.execute("SELECT * FROM test_case_generation WHERE generation_id=%s", (generation_id,)).fetchone()
+        if not generation:
+            raise HTTPException(404, "Test-case generation run not found")
+        contract = json.loads(generation["contract_json"])
+        assignments = request.assignments or [TestDataCaseAssignment(test_case_id=case_id, template_ids=request.template_ids) for case_id in request.test_case_ids]
+        if not assignments:
+            raise HTTPException(422, "Assign at least one template to each selected test case")
+        assignment_case_ids = [item.test_case_id for item in assignments]
+        if len(set(assignment_case_ids)) != len(assignment_case_ids) or any(len(set(item.template_ids)) != len(item.template_ids) for item in assignments):
+            raise HTTPException(422, "Each test case and each case-template assignment must be unique")
+        template_ids = list(dict.fromkeys(template_id for item in assignments for template_id in item.template_ids))
+        templates_by_case = {item.test_case_id: item.template_ids for item in assignments}
+        cases = {case.get("test_case_id"): case for case in contract.get("test_cases", [])}
+        unknown = sorted(set(assignment_case_ids) - set(cases))
+        if unknown:
+            raise HTTPException(422, {"unknown_test_case_ids": unknown})
+        unapproved = [case_id for case_id in assignment_case_ids if _review_status(cases[case_id]) != "approved"]
+        if unapproved:
+            raise HTTPException(422, {"message": "Test data can only be generated for approved test cases", "not_approved": unapproved})
+        by_template_id = {
+            item.template_id: {
+                "template_id": item.template_id,
+                "template_name": item.template_name,
+                "entity_name": item.entity_name,
+                "payload_json": json.dumps(item.payload, sort_keys=True),
+            }
+            for item in request.template_definitions
+        }
+        if len(by_template_id) != len(request.template_definitions):
+            raise HTTPException(422, "Template definitions must have unique IDs")
+        missing = sorted(set(template_ids) - set(by_template_id))
+        if missing:
+            raise HTTPException(422, {"unknown_template_ids": missing})
+        for case_id, case_template_ids in templates_by_case.items():
+            if not case_template_ids:
+                raise HTTPException(422, {"message": "Assign at least one template to each selected case", "test_case_id": case_id})
+        selected_templates_by_case = {case_id: sorted([by_template_id[template_id] for template_id in case_template_ids], key=lambda row: (0 if row["entity_name"].lower() == "member" else 1, row["entity_name"].lower())) for case_id, case_template_ids in templates_by_case.items()}
+        existing_rows = conn.execute("SELECT status FROM test_data_record WHERE generation_id=%s", (generation_id,)).fetchall()
+        if existing_rows:
+            if not request.replace_existing_drafts:
+                raise HTTPException(409, "Test data already exists for this generation. Use regenerate for draft records or create a new test-case generation.")
+            if any(item["status"] == "saved" for item in existing_rows):
+                raise HTTPException(409, "Saved Bronze records are immutable. Create a new test-case generation to produce another dataset.")
+        generation_mode = "openai"
+        generation_warning = None
+        try:
+            generated_payloads = _generate_test_data_with_openai(_test_data_generation_batches(assignment_case_ids, cases, selected_templates_by_case))
+        except Exception as exc:
+            generation_mode = "template_fallback"
+            generation_warning = f"LLM unavailable; generated test data with the template fallback. Details: {safe_llm_error_message(exc)}"
+            generated_payloads = {
+                (case_id, template["template_id"]): _fallback_test_data_payload(
+                    {"template_id": template["template_id"], "entity_name": template["entity_name"], "payload": json.loads(template["payload_json"])},
+                    cases[case_id],
+                )
+                for case_id in assignment_case_ids
+                for template in selected_templates_by_case[case_id]
+            }
+        if existing_rows:
+            conn.execute("DELETE FROM test_data_record WHERE generation_id=%s AND status='draft'", (generation_id,))
+        created = []
+        timestamp = now()
+        for case_id in assignment_case_ids:
+            test_case = cases[case_id]
+            identities = []
+            prepared = []
+            for template in selected_templates_by_case[case_id]:
+                payload = generated_payloads[(case_id, template["template_id"])]
+                payload = _set_unique_template_values(payload, template["template_id"], case_id)
+                if template["entity_name"].lower() != "member":
+                    _link_member_identities(payload, identities)
+                if template["entity_name"].lower() == "member":
+                    member_id = payload.get("member_id") if isinstance(payload, dict) else None
+                    if member_id:
+                        identities.append(member_id)
+                prepared.append((template, payload))
+            for template, payload in prepared:
+                record_id = uid("tdr")
+                pre_steps = []
+                conn.execute("INSERT INTO test_data_record (record_id,generation_id,test_case_id,template_id,template_name,entity_name,payload_json,pre_steps_json,schema_context_json,status,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (record_id, generation_id, case_id, template["template_id"], template["template_name"], template["entity_name"], json.dumps(payload, sort_keys=True), json.dumps(pre_steps), json.dumps([]), "draft", timestamp, timestamp))
+                created.append({"record_id": record_id, "generation_id": generation_id, "test_case_id": case_id, "template_id": template["template_id"], "template_name": template["template_name"], "entity_name": template["entity_name"], "payload": payload, "pre_steps": pre_steps, "schema_context": [], "status": "draft", "created_at": timestamp})
+        return {"generation_id": generation_id, "generation_mode": generation_mode, "generation_model": OPENAI_MODEL if generation_mode == "openai" else None, "generation_warning": generation_warning, "records": created}
+
+@app.get("/api/v1/test-case-generations/{generation_id}/test-data")
+def list_test_data(generation_id: str):
+    with connection() as conn:
+        if not conn.execute("SELECT generation_id FROM test_case_generation WHERE generation_id=%s", (generation_id,)).fetchone():
+            raise HTTPException(404, "Test-case generation run not found")
+        rows = conn.execute("SELECT r.* FROM test_data_record r WHERE r.generation_id=%s ORDER BY r.test_case_id,r.entity_name", (generation_id,)).fetchall()
+        return [_test_data_record_response(row) for row in rows]
+
+@app.put("/api/v1/test-case-generations/{generation_id}/test-data/review")
+def review_test_data(generation_id: str, request: TestDataReviewRequest):
+    with connection() as conn:
+        rows = conn.execute("SELECT record_id FROM test_data_record WHERE generation_id=%s", (generation_id,)).fetchall()
+        known = {row["record_id"] for row in rows}
+        submitted = {item.record_id for item in request.items}
+        if submitted != known:
+            raise HTTPException(422, {"unknown_record_ids": sorted(submitted - known), "missing_record_ids": sorted(known - submitted)})
+        timestamp = now()
+        for item in request.items:
+            conn.execute("UPDATE test_data_record SET payload_json=%s,updated_at=%s WHERE generation_id=%s AND record_id=%s AND status='draft'", (json.dumps(item.payload, sort_keys=True), timestamp, generation_id, item.record_id))
+        saved_rows = conn.execute("SELECT r.* FROM test_data_record r WHERE r.generation_id=%s ORDER BY r.test_case_id,r.entity_name", (generation_id,)).fetchall()
+        return [_test_data_record_response(row) for row in saved_rows]
+
+@app.post("/api/v1/test-case-generations/{generation_id}/test-data/save")
+def save_test_data_to_bronze(generation_id: str):
+    if not DATABASE_URL:
+        raise HTTPException(503, "Bronze insertion requires the PostgreSQL DATABASE_URL and bronzebox.raw_file table")
+    saved = []
+    with connection() as conn:
+        rows = conn.execute("SELECT * FROM test_data_record WHERE generation_id=%s ORDER BY test_case_id,entity_name", (generation_id,)).fetchall()
+        if not rows:
+            raise HTTPException(404, "Generate test data before saving it to Bronze")
+        for row in rows:
+            if row["status"] == "saved":
+                saved.append(_test_data_record_response(row))
+                continue
+            payload = json.loads(row["payload_json"])
+            raw_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            digest = hashlib.sha256(raw_bytes).hexdigest()
+            filename = f"{row['test_case_id']}_{row['entity_name']}_{row['record_id']}.json"
+            source_uri = f"testiq://test-data/{row['record_id']}.json"
+            try:
+                from psycopg.types.json import Jsonb
+                bronze = conn.execute("INSERT INTO bronzebox.raw_file (source_uri,source_path,original_filename,file_size_bytes,sha256,raw_bytes,payload,status) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (sha256) DO UPDATE SET sha256=EXCLUDED.sha256 RETURNING raw_file_id", (source_uri, source_uri, filename, len(raw_bytes), digest, raw_bytes, Jsonb(payload), "BRONZE_LOADED")).fetchone()
+            except Exception as exc:
+                raise HTTPException(503, f"Could not insert into bronzebox.raw_file: {exc}") from exc
+            raw_file_id = str(bronze["raw_file_id"])
+            conn.execute("UPDATE test_data_record SET status='saved',bronze_raw_file_id=%s,updated_at=%s WHERE record_id=%s", (raw_file_id, now(), row["record_id"]))
+            row = conn.execute("SELECT r.* FROM test_data_record r WHERE r.record_id=%s", (row["record_id"],)).fetchone()
+            saved.append(_test_data_record_response(row))
+        return {"generation_id": generation_id, "saved_count": len(saved), "records": saved}
 
 @app.get("/api/v1/requirement-analyses/{analysis_id}/review-audit")
 def list_requirement_review_audit(analysis_id: str):

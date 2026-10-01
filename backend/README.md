@@ -153,6 +153,12 @@ The analysis input is the exact package selected by `package_id`, including its 
 
 The PBM refill-reminder POC splits the BRD into functional requirements such as member identification, prescription eligibility, SMS communication, phone fallback, communication outcomes, and eligibility revalidation.
 
+## Test data templates and Bronze records
+
+Approved cases can use project-scoped JSON templates for entities such as members and prescriptions. Save a template with `POST /api/v1/test-data-templates`, list templates with `GET /api/v1/projects/{project_id}/test-data-templates`, and generate case-specific drafts with `POST /api/v1/test-case-generations/{generation_id}/test-data`. Pass per-case `assignments`, where each item contains a `test_case_id` and only the `template_ids` needed by that case. The frontend suggests assignments from each case's scenario, data needs, and pre-steps, and lets the reviewer adjust them before generation.
+
+Generation uses the configured OpenAI model to create scenario-specific synthetic values that follow each selected template's exact JSON shape and value types. It batches up to ten cases per template request, then assigns unique IDs and links prescription `member_id` values to generated members. If the LLM is unavailable or fails, deterministic synthetic values are generated from the template and case, and the response identifies that fallback for the reviewer. The frontend lets the reviewer edit the generated JSON before `POST /api/v1/test-case-generations/{generation_id}/test-data/save` writes the reviewed records to `bronzebox.raw_file`. Bronze saving needs PostgreSQL and the `bronzebox.raw_file` table from `pbm_ingestion/db/init.sql`.
+
 ## Test
 
 From `backend/testiq-poc/backend`:
