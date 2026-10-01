@@ -34,7 +34,7 @@ const FEATURES = [
   {
     icon: ChefHat,
     title: "Build data recipes",
-    description: "Map to CDP data model",
+    description: "Map to the data model",
   },
   {
     icon: Database,
@@ -100,7 +100,7 @@ function ProductPanel() {
 
         <p className={styles.heroSubtitle}>
           Upload your BRD, let AI understand the rules, and generate realistic,
-          validated synthetic data for your CDP use cases.
+          validated synthetic data for your data integration use cases.
         </p>
 
         <div className={styles.featureList}>
