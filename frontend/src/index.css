@@ -191,8 +191,6 @@ button { cursor: pointer; }
   box-shadow: 8px 0 24px rgb(14 29 45 / 8%);
 }
 .workspace-sidebar.sidebar-expanded { width: var(--sidebar-expanded-width); }
-.sidebar-toggle,
-.mobile-sidebar-close {
 
 :root {
   --ink: #18283a;
@@ -1658,7 +1656,8 @@ button {
   white-space: normal;
   line-height: 1.35;
 }
-.success-actions {
+.sidebar-toggle,
+.mobile-sidebar-close {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1687,6 +1686,11 @@ button {
 .workspace-sidebar.sidebar-expanded .sidebar-help-copy,
 .workspace-sidebar.sidebar-expanded .sidebar-user-copy { opacity: 1; visibility: visible; }
 .workspace-sidebar .brand-lockup { min-width: 0; padding: 0 6px 22px; gap: 11px; overflow: hidden; }
+.workspace-sidebar { height: 100dvh; max-height: 100dvh; overflow-x: hidden; overflow-y: auto; overscroll-behavior-y: contain; scrollbar-width: thin; scrollbar-color: #52667b var(--sidebar-bg); }
+.workspace-sidebar > * { flex-shrink: 0; }
+.workspace-sidebar .sidebar-spacer { flex: 1 0 16px; }
+.workspace-sidebar.sidebar-collapsed { width: var(--sidebar-collapsed-width); min-width: var(--sidebar-collapsed-width); padding: 16px 8px; }
+.workspace-sidebar.sidebar-expanded { width: var(--sidebar-expanded-width); min-width: var(--sidebar-expanded-width); padding: 16px 8px; }
 .workspace-sidebar .brand-mark { flex: 0 0 34px; }
 .workspace-sidebar .sidebar-section-label { overflow: hidden; padding-left: 12px; padding-right: 0; }
 .workspace-sidebar .sidebar-nav { gap: 4px; }
@@ -1822,9 +1826,6 @@ button {
   .requirements-pagination, .workflow-next-card { align-items: stretch; flex-direction: column; }
   .requirements-pagination > div { justify-content: space-between; }
   .workflow-next-card .primary-button { width: 100%; }
-
-  margin-top: 22px;
-  flex-wrap: wrap;
 }
 .knowledge-page {
   max-width: 1120px;
