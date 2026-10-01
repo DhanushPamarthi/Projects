@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { ArrowRight, CheckCircle, Compass, ShieldCheck } from "lucide-react";
 import { Alert, Badge, Button, Card, Form } from "react-bootstrap";
 import { completeWorkflowStage, executeWorkflow, finalizeWorkflow, getCoverage, getEvidence, runTestDesignAgent } from "../api/client.js";
+import { LoadingSpinner } from "./LoadingSpinner.jsx";
 
 const copy = {
   readiness_review: ["Readiness review", "Confirm the BRD and metadata are ready for downstream test design."],
@@ -54,6 +55,6 @@ export function WorkflowGateStep({ requirement, stage, testCases = [], scenarios
     {stage === "evidence_cleanup" && <div className="alert alert-info">{evidence.length} evidence item(s) captured from validation and execution.</div>}
     {error && <Alert variant="danger">{error}</Alert>}
     {stage === "readiness_review" && <Button variant="outline-primary" className="me-2" onClick={runAgent} disabled={loading}>Run AI preparation</Button>}
-    <Button onClick={complete} disabled={loading || done || (isScenario && !selectedScenario)}>{loading ? "Saving..." : done ? "Completed" : `Complete ${title}`} <ArrowRight size={16} className="ms-2" /></Button>
+    <Button onClick={complete} disabled={loading || done || (isScenario && !selectedScenario)}>{loading ? <LoadingSpinner variant="inline" label="Saving" /> : <>{done ? "Completed" : `Complete ${title}`} <ArrowRight size={16} className="ms-2" /></>}</Button>
   </Card.Body></Card>;
 }

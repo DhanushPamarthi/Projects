@@ -23,6 +23,7 @@ import {
 import styles from "./LoginPage.module.css";
 import { registerUser } from "../api/client.js";
 import { toast } from "react-toastify";
+import { LoadingSpinner } from "./LoadingSpinner.jsx";
 
 const FEATURES = [
   {
@@ -286,8 +287,7 @@ export function RegisterPage({ onBack }) {
                       className={styles.submitBtn}
                       disabled={isLoading}
                     >
-                      {isLoading ? "Creating account..." : "Create account"}
-                      <ArrowRight className="ms-2" size={16} />
+                      {isLoading ? <LoadingSpinner variant="inline" label="Creating account" /> : <>Create account <ArrowRight className="ms-2" size={16} /></>}
                     </Button>
                   </Form>
 

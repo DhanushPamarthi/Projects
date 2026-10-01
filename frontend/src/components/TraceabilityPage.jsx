@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
-import { ChevronDown, ChevronRight, FileSearch, LoaderCircle } from "lucide-react";
+import { ChevronDown, ChevronRight, FileSearch } from "lucide-react";
+import { LoadingSpinner } from "./LoadingSpinner.jsx";
 import { getProject, listGeneratedTestCases, listManifests, listProjects, listRequirementAnalyses } from "../api/client.js";
 
 function readStoredJson(key) {
@@ -249,7 +250,7 @@ export function TraceabilityPage() {
     <div className="page-heading"><div><div className="eyebrow">TRACEABILITY MATRIX</div><h1>Traceability</h1><p>Expand each business requirement to inspect linked functional requirements, acceptance criteria, and generated test cases.</p></div></div>
     <div className="requirements-toolbar"><div><label>Project</label><select value={project?.project_id || ""} onChange={(event) => selectProject(event.target.value)}><option value="">Select project</option>{projects.map((item) => <option key={item.project_id} value={item.project_id}>{item.project_name}</option>)}</select></div><div><label>Source package</label><select value={packageId} onChange={(event) => selectPackage(event.target.value)} disabled={!packages.length}><option value="">Select package</option>{packages.map((item) => <option key={item.package_id} value={item.package_id}>{item.package_name || item.scope || "Source package"} - v{item.package_version || "?"}</option>)}</select></div></div>
     {error && <div className="error-message">{error}</div>}
-    {loading ? <section className="requirements-panel"><LoaderCircle className="spin" size={18} /> Loading traceability...</section>
+    {loading ? <LoadingSpinner variant="page" label="Loading traceability" detail="Linking source evidence to requirements and generated artifacts." />
       : !analysis ? <section className="requirements-empty"><div className="empty-state-icon"><FileSearch size={25} /></div><h2>No analysis available yet</h2><p>Run Functional Requirements for a source package to view traceability links.</p></section>
         : tree.length ? <section className="requirements-panel traceability-panel"><div className="panel-title-row"><div><h2>Requirement traceability tree</h2><p className="panel-helper">Expand or collapse each branch to follow coverage from BRD through test cases.</p></div><span>{tree.length} BRD item{tree.length === 1 ? "" : "s"}</span></div><div className="traceability-actions"><button type="button" className="secondary-button compact-button" onClick={expandAll}>Expand all</button><button type="button" className="secondary-button compact-button" onClick={collapseAll}>Collapse all</button></div><div className="traceability-table-wrap"><table className="traceability-table"><thead><tr><th>BRD ID</th><th>Business Description</th><th>FR ID</th><th>Functional Description</th><th>Acceptance Criteria</th><th>Test Case ID</th><th>Test Case Description</th></tr></thead><tbody>{visibleRows.map(renderRow)}</tbody></table></div></section>
           : <section className="requirements-empty"><div className="empty-state-icon"><FileSearch size={25} /></div><h2>No traceability mappings found</h2><p>This analysis does not contain business requirement mappings to trace.</p></section>}

@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { ChefHat, AlertCircle, ArrowRight, Users, Link2, CheckCircle } from 'lucide-react'
 import { Card, Button, Badge, Alert, Row, Col, Table as BTable, ListGroup } from 'react-bootstrap'
 import { buildRecipe, saveRecipe } from '../api/client.js'
+import { LoadingSpinner } from './LoadingSpinner.jsx'
 
 export function RecipeStep({ scenarioKey, recipe, setRecipe }) {
   const [loading, setLoading] = useState(false)
@@ -42,7 +43,7 @@ export function RecipeStep({ scenarioKey, recipe, setRecipe }) {
         <Card.Body>
           <Card.Subtitle className="mb-3 text-muted">Review and customize the data recipe for your scenario</Card.Subtitle>
           <div className="d-flex align-items-center gap-2 mb-3"><span className="text-muted">Scenario:</span><Badge bg="primary">{scenarioKey || 'None selected'}</Badge></div>
-          <Button onClick={handleBuild} disabled={!scenarioKey || loading}><ChefHat className="me-2" size={16} />{loading ? 'Building...' : 'Generate Recipe'}</Button>
+          <Button onClick={handleBuild} disabled={!scenarioKey || loading}>{loading ? <LoadingSpinner variant="inline" label="Building recipe" /> : <><ChefHat className="me-2" size={16} />Generate Recipe</>}</Button>
           {error && <Alert variant="danger" className="mt-3">{error}</Alert>}
         </Card.Body>
       </Card>

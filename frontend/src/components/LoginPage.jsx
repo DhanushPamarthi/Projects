@@ -23,6 +23,7 @@ import {
 import styles from "./LoginPage.module.css";
 import { loginUser } from "../api/client.js";
 import { toast } from "react-toastify";
+import { LoadingSpinner } from "./LoadingSpinner.jsx";
 
 const FEATURES = [
   {
@@ -264,8 +265,7 @@ export function LoginPage({ onLogin, onRegister }) {
                       className={styles.submitBtn}
                       disabled={isLoading}
                     >
-                      {isLoading ? "Signing in..." : "Sign in"}{" "}
-                      <ArrowRight size={16} className="ms-2" />
+                      {isLoading ? <LoadingSpinner variant="inline" label="Signing in" /> : <>Sign in <ArrowRight size={16} className="ms-2" /></>}
                     </Button>
                   </Form>
                   <p className={styles.footer}>

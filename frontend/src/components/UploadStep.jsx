@@ -8,7 +8,6 @@ import {
   CloudUpload,
   FileText,
   FolderPlus,
-  LoaderCircle,
   PackageCheck,
   Plus,
   RefreshCw,
@@ -16,7 +15,9 @@ import {
   Sparkles,
   X,
 } from "lucide-react";
+import { toast as notify } from "react-toastify";
 import { createManifest, createProject, getProject, getRevision, listProjects, listSources, uploadSource } from "../api/client.js";
+import { LoadingSpinner } from "./LoadingSpinner.jsx";
 
 const supportingTypes = [
   ["campaign_rules", "Campaign rules"],
@@ -56,7 +57,7 @@ function missingSectionsFor(source) {
   return parsed.filter((message) => message.startsWith("Missing expected section: ")).map((message) => message.replace("Missing expected section: ", ""));
 }
 
-export function UploadStep() {
+export function UploadStep({ onOpenPackages }) {
   const [project, setProject] = useState(() => JSON.parse(localStorage.getItem("testiq_current_project") || "null"));
   const [projects, setProjects] = useState([]);
   const [projectName, setProjectName] = useState("");
@@ -83,8 +84,11 @@ export function UploadStep() {
   const supporting = sources.filter((item) => item.source_type !== "brd" && item.active_revision);
   const extractionPending = sources.some((item) => ["pending", "processing"].includes(item.extraction?.status || item.extraction_status || item.status));
   const hasRejectedSource = sources.some((item) => ["rejected", "extraction_failed"].includes(item.status || item.active_revision?.status));
-  const packageReady = sources.length > 0 && brds.length > 0 && !extractionPending && !hasRejectedSource;
-  const currentStep = !brds.length ? 1 : manifest ? 3 : step;
+  const hasApiSpecification = supporting.some((item) => item.source_type === "api_spec");
+  const hasDatabaseSchema = supporting.some((item) => item.source_type === "database_schema");
+  const requiredSupportingReady = hasApiSpecification && hasDatabaseSchema;
+  const packageReady = sources.length > 0 && brds.length > 0 && requiredSupportingReady && !extractionPending && !hasRejectedSource;
+  const currentStep = manifest ? 3 : step;
 
   async function refreshSources(id = project?.project_id) {
     if (id) setSources(await listSources(id));
@@ -130,25 +134,40 @@ export function UploadStep() {
 
   async function handleUpload() {
     if (!file) return;
+    if (sourceType === "brd" && !project && !projectName.trim()) {
+      setError("Enter a project name before uploading the BRD.");
+      return;
+    }
     setBusy(true);
     setError("");
     try {
       if (sourceType !== "brd" && !brdSourceId) throw new Error("Choose the BRD this source belongs to.");
-      const activeProject = project || await createProject(projectName.trim() || "Untitled source package");
+      const activeProject = project || await createProject(projectName.trim());
       setProject(activeProject);
       setProjectName(activeProject.project_name);
       localStorage.setItem("testiq_current_project", JSON.stringify(activeProject));
       const uploaded = await uploadSource(activeProject.project_id, file, sourceType, brdSourceId, owner, ownerVersion, requiredSections);
       const isBrdUpload = sourceType === "brd";
-      setToast(uploaded.status === "duplicate" ? "Duplicate retained for traceability" : isBrdUpload ? "BRD upload received. Validating and extracting..." : "Source uploaded successfully");
+      const successMessage = uploaded.status === "duplicate"
+        ? "Duplicate retained for traceability."
+        : isBrdUpload
+          ? "BRD uploaded successfully. Validation and extraction have started."
+          : "Source uploaded successfully.";
+      notify.success(successMessage);
+      setToast("");
       if (!isBrdUpload) setPackageName("");
       setFile(null);
-      await refreshSources(activeProject.project_id);
-      listProjects().then(setProjects).catch(() => {});
       if (isBrdUpload) {
         setBrdSourceId(uploaded.source_id);
-        setSourceType("brd");
+        setSourceType("api_spec");
+        setStep(2);
       }
+      try {
+        await refreshSources(activeProject.project_id);
+      } catch {
+        setError("Upload succeeded, but the source list could not refresh. Reload the page to see the uploaded file.");
+      }
+      listProjects().then(setProjects).catch(() => {});
       if (uploaded.extraction?.status === "pending") pollExtraction(uploaded, activeProject.project_id, isBrdUpload);
     } catch (err) {
       setUploadValidationError(err.message);
@@ -209,6 +228,7 @@ export function UploadStep() {
       setPackageName("");
       localStorage.setItem("testiq_current_package", JSON.stringify(created));
       setToast("Source package snapshot created");
+      notify.success("Source package created successfully.");
     } catch (err) {
       setError(err.message);
     } finally {
@@ -237,7 +257,7 @@ export function UploadStep() {
   return <div className="source-page">
     <div className="page-heading">
       <div><div className="eyebrow">SOURCE CONTROL CENTER</div><h1>Source packages</h1><p>Bring business and technical context together before creating test data.</p></div>
-      <button className="secondary-button" onClick={() => setConfirmNewPackage(true)}><Plus size={17} /> New package</button>
+      {(project?.project_id || sources.length > 0 || manifest) && <button className="secondary-button" onClick={() => setConfirmNewPackage(true)}><Plus size={17} /> New package</button>}
     </div>
 
     <div className="project-bar">
@@ -267,19 +287,19 @@ export function UploadStep() {
       <section className="upload-panel">
         <div className="panel-title"><div><h2>{currentStep === 1 ? (brds.length ? "Upload an updated BRD" : "Upload your BRD") : "Add a supporting source"}</h2><p>{currentStep === 1 ? (brds.length ? "Upload an updated BRD. The previous file will remain available for traceability." : "Your business requirements document anchors this package.") : "Connect the context your team needs for accurate test data."}</p></div><span className="step-pill">Step {currentStep} of 3</span></div>
         {currentStep === 1 && <div className="field-block"><label>Project name</label><input value={projectName} disabled={Boolean(project)} onChange={(event) => setProjectName(event.target.value)} placeholder="e.g. PBM Refill Reminder" /><span className="field-hint">A project is created automatically with your first upload.</span></div>}
-        {currentStep === 2 && <><div className="field-block"><label>Source type</label><select value={sourceType} onChange={(event) => setSourceType(event.target.value)}>{supportingTypes.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></div><div className="field-block"><label>Associated BRD</label><select value={brdSourceId} onChange={(event) => setBrdSourceId(event.target.value)}><option value="">Select a BRD</option>{brds.map((item) => <option key={item.source_id} value={item.source_id}>{item.logical_name}</option>)}</select></div></>}
+        {currentStep === 2 && <><div className="field-block"><label>Source type <em>API Specification and Database Schema are required</em></label><select value={sourceType} onChange={(event) => setSourceType(event.target.value)}>{supportingTypes.map(([value, label]) => <option key={value} value={value}>{label}{["api_spec", "database_schema"].includes(value) ? " *" : ""}</option>)}</select><span className="field-hint required-source-hint"><strong>* Required:</strong> upload one API Specification and one Database Schema before reviewing the package.</span></div><div className="field-block"><label>Associated BRD</label><select value={brdSourceId} onChange={(event) => setBrdSourceId(event.target.value)}><option value="">Select a BRD</option>{brds.map((item) => <option key={item.source_id} value={item.source_id}>{item.logical_name}</option>)}</select></div></>}
         <div className="field-row"><div className="field-block"><label>Source owner <em>Optional</em></label><input value={owner} onChange={(event) => setOwner(event.target.value)} placeholder="e.g. Product team" /></div><div className="field-block"><label>Owner version <em>Optional</em></label><input value={ownerVersion} onChange={(event) => setOwnerVersion(event.target.value)} placeholder="e.g. 1.0" /></div></div>
         {currentStep === 1 && <div className="field-block"><label>Expected sections <em>Optional</em></label><input value={requiredSections} onChange={(event) => setRequiredSections(event.target.value)} placeholder="Scope, Requirements, Acceptance Criteria" /><span className="field-hint">Missing sections become review warnings, not upload blockers.</span></div>}
         <div className={`drop-zone-modern ${dragging ? "dragging" : ""}`} onDragOver={(event) => { event.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={(event) => { event.preventDefault(); setDragging(false); chooseFile(event.dataTransfer.files?.[0]); }}>{currentStep === 1 && brds.length > 0 && !file ? <><div className="upload-icon existing"><FileText size={23} /></div><h3 className="existing-file-name" title={brds[0].active_revision?.filename || brds[0].logical_name}>{brds[0].active_revision?.filename || brds[0].logical_name}</h3><p>Current file - v{brds[0].active_revision?.revision || brds[0].revision || 1}</p><label className="choose-file">Upload replacement<input type="file" accept=".docx,.pdf,.txt,.md,.json,.yaml,.yml,.sql,.csv" onChange={(event) => chooseFile(event.target.files?.[0])} /></label></> : <><div className="upload-icon"><CloudUpload size={23} /></div><h3>Drop a file here</h3><p>or choose from your computer</p><label className="choose-file">Choose file<input type="file" accept=".docx,.pdf,.txt,.md,.json,.yaml,.yml,.sql,.csv" onChange={(event) => chooseFile(event.target.files?.[0])} /></label><span className="file-hint">DOCX, PDF, TXT, MD, JSON, YAML, SQL or CSV - up to 25 MB</span></>}</div>
         {file && <div className="selected-file"><span className="file-type"><FileText size={17} /></span><div><strong>{file.name}</strong><span>{(file.size / 1024).toFixed(1)} KB - Ready to upload</span></div><button onClick={() => setFile(null)}><X size={17} /></button></div>}
-        <div className="panel-footer"><span className="secure-note"><ShieldCheck size={15} /> Original files are preserved securely</span><div className="panel-actions"><button className="primary-button" disabled={!file || busy || (sourceType !== "brd" && !brdSourceId)} onClick={handleUpload}>{busy ? <><LoaderCircle className="spin" size={16} /> Uploading...</> : <><CloudUpload size={16} /> {currentStep === 1 ? (brds.length ? "Upload updated BRD" : "Upload BRD") : "Add source"}</>}</button>{currentStep === 1 && brds.length > 0 && <button className="secondary-button" disabled={busy} onClick={async () => { await refreshSources(project?.project_id); continueToSources(); setSourceType("api_spec"); setBrdSourceId(brds[0].source_id); }}>Continue to sources <ChevronRight size={15} /></button>}</div></div>
+        <div className="panel-footer"><span className="secure-note"><ShieldCheck size={15} /> Original files are preserved securely</span><div className="panel-actions"><button className="primary-button" disabled={!file || busy || (sourceType === "brd" && !project && !projectName.trim()) || (sourceType !== "brd" && !brdSourceId)} onClick={handleUpload}>{busy ? <LoadingSpinner variant="inline" label="Uploading" /> : <><CloudUpload size={16} /> {currentStep === 1 ? (brds.length ? "Upload updated BRD" : "Upload BRD") : "Add source"}</>}</button>{currentStep === 1 && brds.length > 0 && <button className="secondary-button" disabled={busy} onClick={async () => { await refreshSources(project?.project_id); continueToSources(); setSourceType("api_spec"); setBrdSourceId(brds[0].source_id); }}>Continue to sources <ChevronRight size={15} /></button>}</div></div>
       </section>
       <aside className="side-panel"><div className="side-panel-head"><span className="side-icon"><Sparkles size={17} /></span><div><h3>Smart processing</h3><p>What happens next</p></div></div><div className="info-list"><div><b>01</b><span>We preserve the original file and create a versioned revision.</span></div><div><b>02</b><span>AI extraction runs automatically with local fallback.</span></div><div><b>03</b><span>Every section stays traceable to its source and page.</span></div></div><div className="privacy-note"><ShieldCheck size={16} /><span>Your API key stays on the backend. It is never sent from this screen.</span></div></aside>
     </div>}
 
-    {currentStep === 2 && !manifest && <section className="source-list-card"><div className="list-card-header"><div><h2>Package sources</h2><p>{supporting.length ? "Your BRD and supporting context are ready to review." : "Your BRD is ready. Add a supporting source, or review now."}</p></div><span className="health-badge"><span /> {extractionPending ? "Processing" : "Healthy"}</span></div>{sources.map((source) => <SourceRow key={source.source_id} source={source} />)}<div className="list-card-actions"><button className="secondary-button" onClick={() => { setStep(1); setSourceType("brd"); setBrdSourceId(""); }}><ChevronLeft size={15} /> Back to BRD</button><button className="secondary-button" disabled={!packageReady} onClick={() => setStep(3)}><PackageCheck size={16} /> {packageReady ? "Review package" : "Waiting for extraction"} <ChevronRight size={15} /></button></div></section>}
-    {currentStep === 3 && !manifest && <section className="review-card"><div className="review-header"><div><div className="eyebrow">FINAL REVIEW</div><h2>Ready to create your package?</h2><p>This snapshot will lock the exact source revisions used for future traceability.</p></div><div className="review-check"><PackageCheck size={22} /></div></div><div className="field-block package-name-field"><label>Package name</label><input value={packageName} onChange={(event) => setPackageName(event.target.value)} placeholder="e.g. PBM Refill Reminder Source Package" /></div><div className="review-summary"><div><span>Project</span><strong>{project?.project_name}</strong></div><div><span>Sources included</span><strong>{sources.length}</strong></div><div><span>Scope</span><strong>MVP</strong></div></div><div className="review-source-list">{sources.map((source) => <SourceRow key={source.source_id} source={source} compact />)}</div><div className="review-actions"><button className="secondary-button" onClick={() => { setToast(""); setStep(2); }}><ChevronLeft size={15} /> Back to sources</button><button className="primary-button" onClick={createPackage} disabled={busy}>{busy ? <><LoaderCircle className="spin" size={16} /> Creating...</> : <><PackageCheck size={16} /> Create source package</>}</button></div></section>}
-    {manifest && <section className="success-card package-ready-card"><div className="success-mark"><Check size={26} /></div><div className="eyebrow">PACKAGE CREATED</div><h2>{manifest.package_name || packageName}</h2><p>All {manifest.items?.length || sources.length} source revisions are captured in an immutable snapshot.</p><div className="manifest-id"><span>Package version</span><strong>v{manifest.package_version || 1}</strong><span className="manifest-dot" /><span>Scope</span><strong>{manifest.scope || "MVP"}</strong></div><div className="success-actions"><button className="secondary-button" onClick={() => { setManifest(null); setToast(""); setStep(2); }}><RefreshCw size={16} /> Continue managing sources</button></div></section>}
+    {currentStep === 2 && !manifest && <section className="source-list-card"><div className="list-card-header"><div><h2>Package sources</h2><p>{requiredSupportingReady ? "Your BRD and required supporting sources are ready to review." : "Upload the required API Specification and Database Schema to continue."}</p></div><span className="health-badge"><span /> {extractionPending ? "Processing" : "Healthy"}</span></div>{extractionPending && <LoadingSpinner variant="section" label="Processing uploaded sources" detail="Extracting content and preparing traceable source evidence." />}<div className="required-source-checks" aria-label="Required supporting sources"><span className={hasApiSpecification ? "complete" : "missing"}>{hasApiSpecification ? <Check size={14} /> : "*"} API Specification</span><span className={hasDatabaseSchema ? "complete" : "missing"}>{hasDatabaseSchema ? <Check size={14} /> : "*"} Database Schema</span></div>{sources.map((source) => <SourceRow key={source.source_id} source={source} />)}<div className="list-card-actions"><button className="secondary-button" onClick={() => { setStep(1); setSourceType("brd"); setBrdSourceId(""); }}><ChevronLeft size={15} /> Back to BRD</button><button className="secondary-button" disabled={!packageReady} onClick={() => setStep(3)}><PackageCheck size={16} /> {extractionPending ? "Waiting for extraction" : !requiredSupportingReady ? "Required sources missing" : "Review package"} <ChevronRight size={15} /></button></div></section>}
+    {currentStep === 3 && !manifest && <section className="review-card"><div className="review-header"><div><div className="eyebrow">FINAL REVIEW</div><h2>Ready to create your package?</h2><p>This snapshot will lock the exact source revisions used for future traceability.</p></div><div className="review-check"><PackageCheck size={22} /></div></div><div className="field-block package-name-field"><label>Package name <em>Required</em></label><input value={packageName} onChange={(event) => setPackageName(event.target.value)} placeholder="e.g. PBM Refill Reminder Source Package" /></div><div className="review-summary"><div><span>Project</span><strong>{project?.project_name}</strong></div><div><span>Sources included</span><strong>{sources.length}</strong></div><div><span>Scope</span><strong>MVP</strong></div></div><div className="review-source-list">{sources.map((source) => <SourceRow key={source.source_id} source={source} compact />)}</div><div className="review-actions"><button className="secondary-button" onClick={() => { setToast(""); setStep(2); }}><ChevronLeft size={15} /> Back to sources</button><button className="primary-button" onClick={createPackage} disabled={busy || !packageName.trim()}>{busy ? <LoadingSpinner variant="inline" label="Creating" /> : <><PackageCheck size={16} /> Create source package</>}</button></div></section>}
+    {manifest && <section className="success-card package-ready-card"><div className="success-mark"><Check size={26} /></div><div className="eyebrow">PACKAGE CREATED</div><h2>{manifest.package_name || packageName}</h2><p>All {manifest.items?.length || sources.length} source revisions are captured in an immutable snapshot.</p><div className="manifest-id"><span>Package version</span><strong>v{manifest.package_version || 1}</strong><span className="manifest-dot" /><span>Scope</span><strong>{manifest.scope || "MVP"}</strong></div><div className="success-actions"><button className="secondary-button" onClick={() => { setManifest(null); setToast(""); setStep(2); }}><RefreshCw size={16} /> Continue managing sources</button><button className="primary-button" onClick={() => onOpenPackages?.()} disabled={!onOpenPackages}><PackageCheck size={16} /> View packages</button></div></section>}
     {confirmNewPackage && <div className="modal-backdrop" role="presentation" onMouseDown={() => setConfirmNewPackage(false)}><div className="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="new-package-title" onMouseDown={(event) => event.stopPropagation()}><button type="button" className="modal-close" aria-label="Close new package dialog" onClick={() => setConfirmNewPackage(false)}><X size={18} /></button><div className="confirm-icon"><Plus size={21} /></div><h2 id="new-package-title">Start a new package?</h2><p>Your current project and all created packages will remain saved. You'll begin a fresh source package here.</p><div className="confirm-actions"><button className="secondary-button" onClick={() => setConfirmNewPackage(false)}>Cancel</button><button className="primary-button" onClick={confirmResetProject}>Start new package</button></div></div></div>}
   </div>;
 }

@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { ShieldCheck, CheckCircle, XCircle, Download, RefreshCw } from 'lucide-react'
 import { Card, Button, Badge, Alert, Row, Col, ListGroup } from 'react-bootstrap'
 import { validateData, exportData, generateData, generateSelectedTestCases } from '../api/client.js'
+import { LoadingSpinner } from './LoadingSpinner.jsx'
 
 function downloadCsv(filename, csv) {
   const blob = new Blob([csv], { type: 'text/csv' })
@@ -102,7 +103,7 @@ export function ValidateStep({ scenarioKey, scenarioKeys = [], result, setResult
           </div>
           <Button onClick={handleValidate} disabled={!scenarioKey || loading}>
             <ShieldCheck className="me-2" size={16} />
-            {loading ? 'Validating...' : 'Validate Records'}
+            {loading ? <LoadingSpinner variant="inline" label="Validating" /> : 'Validate Records'}
           </Button>
           {error && <Alert variant="danger" className="mt-3">{error}</Alert>}
         </Card.Body>

@@ -376,3 +376,17 @@
 
 
 
+/* Shared application loading indicator */
+.app-loading { --loader-size: 30px; --loader-stroke: 3px; display: flex; align-items: center; justify-content: center; gap: 12px; color: var(--muted); }
+.app-loading__spinner { position: relative; width: var(--loader-size); height: var(--loader-size); flex: 0 0 var(--loader-size); border: var(--loader-stroke) solid color-mix(in srgb, var(--orange) 22%, transparent); border-top-color: var(--orange); border-radius: 50%; animation: app-loader-spin .78s linear infinite; }
+.app-loading__spinner span { position: absolute; inset: 5px; border: 2px solid transparent; border-bottom-color: color-mix(in srgb, var(--orange) 62%, #fff); border-radius: inherit; }
+.app-loading__copy { display: grid; gap: 3px; min-width: 0; }
+.app-loading__copy strong { color: var(--ink); font-size: 12px; line-height: 1.35; }
+.app-loading__copy > span { color: var(--muted); font-size: 10px; line-height: 1.45; }
+.app-loading--page { min-height: min(52vh, 520px); flex-direction: column; text-align: center; --loader-size: 44px; --loader-stroke: 4px; }
+.app-loading--section { min-height: 112px; padding: 22px; border: 1px solid var(--line); border-radius: 12px; background: #fff; box-shadow: 0 8px 24px rgb(16 34 56 / 5%); }
+.app-loading--inline { --loader-size: 16px; --loader-stroke: 2px; display: inline-flex; min-height: 1em; gap: 7px; color: inherit; }
+.app-loading--inline .app-loading__copy strong { color: inherit; font: inherit; }
+@keyframes app-loader-spin { to { transform: rotate(360deg); } }
+:root[data-theme="dark"] .app-loading--section { background: #172334; border-color: #334155; }
+@media (prefers-reduced-motion: reduce) { .app-loading__spinner { animation-duration: 1.8s; } }

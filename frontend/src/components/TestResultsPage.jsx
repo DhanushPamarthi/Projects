@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
-import { FileCheck2, LoaderCircle } from "lucide-react";
+import { FileCheck2 } from "lucide-react";
+import { LoadingSpinner } from "./LoadingSpinner.jsx";
 import { getProject, listGeneratedTestCases, listManifests, listProjects, listRequirementAnalyses, listExecutionRuns } from "../api/client.js";
 
 function readStoredJson(key) {
@@ -164,7 +165,7 @@ export function TestResultsPage() {
     <div className="page-heading"><div><div className="eyebrow">EXECUTION BASELINES</div><h1>Test Results</h1><p>Review frozen test execution runs created from approved test cases.</p></div></div>
     <div className="requirements-toolbar"><div><label>Project</label><select value={project?.project_id || ""} onChange={(event) => selectProject(event.target.value)}><option value="">Select project</option>{projects.map((item) => <option key={item.project_id} value={item.project_id}>{item.project_name}</option>)}</select></div><div><label>Source package</label><select value={packageId} onChange={(event) => selectPackage(event.target.value)} disabled={!packages.length}><option value="">Select package</option>{packages.map((item) => <option key={item.package_id} value={item.package_id}>{item.package_name || item.scope || "Source package"} - v{item.package_version || "?"}</option>)}</select></div></div>
     {error && <div className="error-message">{error}</div>}
-    {loading ? <section className="requirements-panel"><LoaderCircle className="spin" size={18} /> Loading test results...</section>
+    {loading ? <LoadingSpinner variant="page" label="Loading test results" detail="Retrieving the selected package and execution history." />
       : !runs.length ? <section className="requirements-empty"><div className="empty-state-icon"><FileCheck2 size={25} /></div><h2>No test results available yet</h2><p>Freeze approved test cases into an execution baseline to populate this page.</p></section>
         : <>
           <div className="requirements-summary-grid"><div><span>Total runs</span><strong>{runs.length}</strong></div><div><span>Pass</span><strong>{summary.passed}</strong></div><div><span>Fail</span><strong>{summary.failed}</strong></div><div><span>Test cases</span><strong>{runs.reduce((total, run) => total + (run.selected_test_case_ids?.length || 0), 0)}</strong></div></div>

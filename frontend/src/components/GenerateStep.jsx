@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { Database, Check, Table, Download } from 'lucide-react'
 import { Card, Button, Table as BTable, Badge, Alert, Form, Row, Col, ListGroup } from 'react-bootstrap'
 import { generateData, generateSelectedTestCases, exportData, listGenerationRuns } from '../api/client.js'
+import { LoadingSpinner } from './LoadingSpinner.jsx'
 
 function recordsToCsv(records) {
   if (!records?.length) return ''
@@ -98,7 +99,7 @@ export function GenerateStep({ scenarioKey, scenarioKeys = [], recipe, result, s
               </div>
               <Button onClick={handleGenerate} disabled={!scenarioKey || loading}>
                 <Database className="me-2" size={16} />
-                {loading ? 'Generating...' : 'Generate Data'}
+                {loading ? <LoadingSpinner variant="inline" label="Generating" /> : 'Generate Data'}
               </Button>
             </Col>
 
