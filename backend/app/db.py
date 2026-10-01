@@ -155,10 +155,28 @@ CREATE TABLE IF NOT EXISTS testiq.test_case_review_audit (
   reviewed_items_json TEXT,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS testiq.test_data_record (
+  record_id TEXT PRIMARY KEY,
+  generation_id TEXT NOT NULL REFERENCES testiq.test_case_generation(generation_id),
+  test_case_id TEXT NOT NULL,
+  template_id TEXT NOT NULL,
+  template_name TEXT NOT NULL,
+  entity_name TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  pre_steps_json TEXT NOT NULL,
+  schema_context_json TEXT NOT NULL DEFAULT '[]',
+  status TEXT NOT NULL DEFAULT 'draft',
+  bronze_raw_file_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(generation_id, test_case_id, template_id)
+);
 """
 SQLITE_SCHEMA = SCHEMA.replace("CREATE SCHEMA IF NOT EXISTS testiq;\n", "").replace("testiq.", "")
 
 MIGRATIONS = [
+    "ALTER TABLE test_data_record ADD COLUMN schema_context_json TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE test_data_record ADD COLUMN template_name TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE source_document ADD COLUMN logical_source_id TEXT",
     "ALTER TABLE source_fragment ADD COLUMN source_id TEXT",
     "ALTER TABLE source_package_item ADD COLUMN source_version TEXT",
@@ -243,6 +261,10 @@ def init_db():
             conn.execute("UPDATE source_document SET logical_source_id=source_id WHERE logical_source_id IS NULL")
             conn.execute("UPDATE source_fragment f SET source_id=r.source_id FROM source_revision r WHERE f.revision_id=r.revision_id AND f.source_id IS NULL")
             conn.execute("UPDATE source_fragment SET provenance_mode='local' WHERE provenance_mode IS NULL")
+            if conn.execute("SELECT to_regclass('testiq.test_data_template')").fetchone()[0]:
+                conn.execute("UPDATE test_data_record r SET template_name=t.template_name FROM test_data_template t WHERE r.template_id=t.template_id AND r.template_name=''")
+                conn.execute("ALTER TABLE test_data_record DROP CONSTRAINT IF EXISTS test_data_record_template_id_fkey")
+                conn.execute("DROP TABLE test_data_template")
             conn.commit()
     else:
         with sqlite3.connect(DB_PATH) as conn:
@@ -255,6 +277,48 @@ def init_db():
             conn.execute("UPDATE source_fragment SET source_id=(SELECT source_id FROM source_revision WHERE source_revision.revision_id=source_fragment.revision_id) WHERE source_id IS NULL")
             conn.execute("UPDATE source_fragment SET provenance_mode='local' WHERE provenance_mode IS NULL")
             conn.commit()
+            _migrate_sqlite_test_data_templates(conn)
+
+def _migrate_sqlite_test_data_templates(conn):
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if "test_data_record" not in tables:
+        return
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(test_data_record)").fetchall()}
+    if "template_name" not in columns:
+        conn.execute("ALTER TABLE test_data_record ADD COLUMN template_name TEXT NOT NULL DEFAULT ''")
+        columns.add("template_name")
+    if "test_data_template" in tables:
+        conn.execute("UPDATE test_data_record SET template_name=(SELECT template_name FROM test_data_template WHERE test_data_template.template_id=test_data_record.template_id) WHERE template_name='' AND EXISTS (SELECT 1 FROM test_data_template WHERE test_data_template.template_id=test_data_record.template_id)")
+    foreign_keys = conn.execute("PRAGMA foreign_key_list(test_data_record)").fetchall()
+    references_templates = any(row[2] == "test_data_template" for row in foreign_keys)
+    if references_templates:
+        conn.commit()
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("""CREATE TABLE test_data_record_new (
+          record_id TEXT PRIMARY KEY,
+          generation_id TEXT NOT NULL REFERENCES test_case_generation(generation_id),
+          test_case_id TEXT NOT NULL,
+          template_id TEXT NOT NULL,
+          template_name TEXT NOT NULL DEFAULT '',
+          entity_name TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          pre_steps_json TEXT NOT NULL,
+          schema_context_json TEXT NOT NULL DEFAULT '[]',
+          status TEXT NOT NULL DEFAULT 'draft',
+          bronze_raw_file_id TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(generation_id, test_case_id, template_id)
+        )""")
+        column_list = "record_id,generation_id,test_case_id,template_id,template_name,entity_name,payload_json,pre_steps_json,schema_context_json,status,bronze_raw_file_id,created_at,updated_at"
+        conn.execute(f"INSERT INTO test_data_record_new ({column_list}) SELECT {column_list} FROM test_data_record")
+        conn.execute("DROP TABLE test_data_record")
+        conn.execute("ALTER TABLE test_data_record_new RENAME TO test_data_record")
+        conn.commit()
+        conn.execute("PRAGMA foreign_keys=ON")
+    if "test_data_template" in tables:
+        conn.execute("DROP TABLE test_data_template")
+        conn.commit()
 
 @contextmanager
 def connection():
