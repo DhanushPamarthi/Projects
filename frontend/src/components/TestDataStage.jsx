@@ -53,7 +53,7 @@ function displayCaseName(testCase) {
 }
 function autoTemplateIds(testCase, templates) {
   const suggested = suggestTemplates(testCase, templates);
-  if (suggested.length) return suggested;
+  if (suggested.length) return [suggested[0]];
   const member = templates.find((template) => String(template.entity_name).toLowerCase() === "member");
   return member ? [member.template_id] : templates.slice(0, 1).map((template) => template.template_id);
 }
