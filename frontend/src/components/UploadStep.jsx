@@ -57,12 +57,13 @@ function missingSectionsFor(source) {
   return parsed.filter((message) => message.startsWith("Missing expected section: ")).map((message) => message.replace("Missing expected section: ", ""));
 }
 
-export function UploadStep({ onOpenPackages }) {
+export function UploadStep({ onContinueToBusinessUseCases }) {
   const [project, setProject] = useState(() => JSON.parse(localStorage.getItem("testiq_current_project") || "null"));
   const [projects, setProjects] = useState([]);
   const [projectName, setProjectName] = useState("");
   const [packageName, setPackageName] = useState("");
   const [sources, setSources] = useState([]);
+  const [selectedPackageSourceIds, setSelectedPackageSourceIds] = useState([]);
   const [file, setFile] = useState(null);
   const [dragging, setDragging] = useState(false);
   const [sourceType, setSourceType] = useState("brd");
@@ -81,18 +82,25 @@ export function UploadStep({ onOpenPackages }) {
   const packageNameRef = useRef(null);
 
   const brds = sources.filter((item) => item.source_type === "brd" && item.active_revision);
-  const supporting = sources.filter((item) => item.source_type !== "brd" && item.active_revision);
-  const extractionPending = sources.some((item) => ["pending", "processing"].includes(item.extraction?.status || item.extraction_status || item.status));
-  const hasRejectedSource = sources.some((item) => ["rejected", "extraction_failed"].includes(item.status || item.active_revision?.status));
-  const hasApiSpecification = supporting.some((item) => item.source_type === "api_spec");
-  const hasDatabaseSchema = supporting.some((item) => item.source_type === "database_schema");
-  const requiredSupportingReady = hasApiSpecification && hasDatabaseSchema;
-  const packageReady = sources.length > 0 && brds.length > 0 && requiredSupportingReady && !extractionPending && !hasRejectedSource;
+  const packageSources = sources.filter((item) => selectedPackageSourceIds.includes(item.source_id));
+  const selectedBrds = packageSources.filter((item) => item.source_type === "brd");
+  const packagePending = packageSources.some((item) => ["pending", "processing"].includes(item.extraction?.status || item.extraction_status || item.status));
+  const packageRejected = packageSources.some((item) => ["rejected", "extraction_failed"].includes(item.status || item.active_revision?.status));
+  const packageReady = selectedBrds.length === 1 && !packagePending && !packageRejected;
   const activeBrdSourceId = brdSourceId || brds[0]?.source_id || "";
   const currentStep = manifest ? 3 : step;
 
   async function refreshSources(id = project?.project_id) {
-    if (id) setSources(await listSources(id));
+    if (id) {
+      const rows = await listSources(id);
+      setSources(rows);
+      setSelectedPackageSourceIds((current) => {
+        const valid = current.filter((sourceId) => rows.some((row) => row.source_id === sourceId));
+        const brd = rows.find((row) => row.source_type === "brd" && valid.includes(row.source_id)) || rows.find((row) => row.source_type === "brd");
+        const supportingIds = rows.filter((row) => row.source_type !== "brd" && (!valid.length || valid.includes(row.source_id))).map((row) => row.source_id);
+        return [...new Set([...supportingIds, ...(brd ? [brd.source_id] : [])])];
+      });
+    }
   }
 
   useEffect(() => { listProjects().then(setProjects).catch(() => {}); }, []);
@@ -170,6 +178,10 @@ export function UploadStep({ onOpenPackages }) {
       setFile(null);
       try {
         await refreshSources(activeProject.project_id);
+        setSelectedPackageSourceIds((current) => {
+          const withoutOtherBrds = sourceType === "brd" ? current.filter((sourceId) => !brds.some((item) => item.source_id === sourceId)) : current;
+          return [...new Set([...withoutOtherBrds, uploaded.source_id])];
+        });
       } catch {
         setError("Upload succeeded, but the source list could not refresh. Reload the page to see the uploaded file.");
       }
@@ -220,7 +232,16 @@ export function UploadStep({ onOpenPackages }) {
       setError("Enter a package name before creating the source package.");
       return;
     }
-    const missing = missingSectionsFor(brds[0]);
+    const selectedBrd = selectedBrds[0];
+    if (!selectedBrd) {
+      setError("Select exactly one BRD for the source package.");
+      return;
+    }
+    if (selectedBrds.length !== 1) {
+      setError("A source package must contain exactly one BRD.");
+      return;
+    }
+    const missing = missingSectionsFor(selectedBrd);
     if (missing.length > 0 && !allowMissingSections) {
       setMissingSections(missing);
       setShowMissingSections(true);
@@ -229,12 +250,12 @@ export function UploadStep({ onOpenPackages }) {
     setBusy(true);
     setError("");
     try {
-      const created = await createManifest(sources.map((item) => item.source_id), packageName.trim(), "MVP", project.project_id);
+      const created = await createManifest(packageSources.map((item) => item.source_id), packageName.trim(), "MVP", project.project_id);
       setManifest(created);
       setPackageName("");
       localStorage.setItem("testiq_current_package", JSON.stringify(created));
-      setToast("Source package snapshot created");
-      notify.success("Source package created successfully.");
+      setToast("Source package snapshot created. Knowledge Base preparation started.");
+      notify.success("Source package created. Knowledge Base preparation started.");
     } catch (err) {
       setError(err.message);
     } finally {
@@ -276,6 +297,7 @@ export function UploadStep({ onOpenPackages }) {
           setPackageName("");
           setManifest(null);
           setSources([]);
+          setSelectedPackageSourceIds([]);
           localStorage.removeItem("testiq_current_package");
           await refreshSources(selected.project_id);
         }}><option value="">Choose project</option>{projects.map((item) => <option key={item.project_id} value={item.project_id}>{item.project_name}</option>)}</select>}
@@ -283,7 +305,7 @@ export function UploadStep({ onOpenPackages }) {
       </div>
     </div>
 
-    <div className="stepper">{[[1, "Start with your BRD", "Primary requirements"], [2, "Add supporting sources", "Rules, APIs and schemas"], [3, "Review package", "Create a fixed snapshot"]].map(([number, title, copy]) => { const complete = currentStep > number || (Boolean(manifest) && number === 3); return <div key={number} className={`stepper-item ${currentStep === number && !complete ? "current" : ""} ${complete ? "complete" : ""}`}><span className="stepper-number">{complete ? <Check size={15} /> : number}</span><div><strong>{title}</strong><span>{copy}</span></div>{number < 3 && <ChevronRight className="stepper-arrow" size={17} />}</div>; })}</div>
+    <div className="stepper">{[[1, "Start with your BRD", "Primary requirements"], [2, "Add supporting sources", "Optional API and schema"], [3, "Review package", "Create a fixed snapshot"]].map(([number, title, copy]) => { const complete = currentStep > number || (Boolean(manifest) && number === 3); return <div key={number} className={`stepper-item ${currentStep === number && !complete ? "current" : ""} ${complete ? "complete" : ""}`}><span className="stepper-number">{complete ? <Check size={15} /> : number}</span><div><strong>{title}</strong><span>{copy}</span></div>{number < 3 && <ChevronRight className="stepper-arrow" size={17} />}</div>; })}</div>
     {toast && <div className="toast-message"><CheckCircle2 size={17} /> {toast}<button onClick={() => setToast("")}><X size={15} /></button></div>}
     {error && <div className="error-message"><CircleAlert size={17} /> {error}<button onClick={() => setError("")}><X size={15} /></button></div>}
     {uploadValidationError && <div className="modal-backdrop" role="presentation"><div className="confirm-modal upload-error-modal" role="dialog" aria-modal="true" aria-labelledby="upload-error-title"><button type="button" className="modal-close" aria-label="Close upload error" onClick={() => setUploadValidationError("")}><X size={18} /></button><div className="confirm-icon error"><CircleAlert size={21} /></div><h2 id="upload-error-title">Upload could not be completed</h2><p>{uploadValidationError}</p><p className="modal-helper">The original file has been preserved. Choose a valid file to continue.</p><div className="confirm-actions"><button className="primary-button" onClick={() => { setUploadValidationError(""); setFile(null); }}>Choose another file</button></div></div></div>}
@@ -293,7 +315,7 @@ export function UploadStep({ onOpenPackages }) {
       <section className="upload-panel">
         <div className="panel-title"><div><h2>{currentStep === 1 ? (brds.length ? "Upload an updated BRD" : "Upload your BRD") : "Add a supporting source"}</h2><p>{currentStep === 1 ? (brds.length ? "Upload an updated BRD. The previous file will remain available for traceability." : "Your business requirements document anchors this package.") : "Connect the context your team needs for accurate test data."}</p></div><span className="step-pill">Step {currentStep} of 3</span></div>
         {currentStep === 1 && <div className="field-block"><label>Project name</label><input value={projectName} disabled={Boolean(project)} onChange={(event) => setProjectName(event.target.value)} placeholder="e.g. PBM Refill Reminder" /><span className="field-hint">A project is created automatically with your first upload.</span></div>}
-        {currentStep === 2 && <div className="field-block"><label>Source type <em>API Specification and Database Schema are required</em></label><select ref={sourceTypeRef} value={sourceType} onChange={(event) => setSourceType(event.target.value)}>{supportingTypes.map(([value, label]) => <option key={value} value={value}>{label}{["api_spec", "database_schema"].includes(value) ? " *" : ""}</option>)}</select><span className="field-hint required-source-hint"><strong>* Required:</strong> upload one API Specification and one Database Schema before reviewing the package. Supporting sources are automatically associated with the current BRD.</span></div>}
+        {currentStep === 2 && <div className="field-block"><label>Source type <em>Optional technical context</em></label><select ref={sourceTypeRef} value={sourceType} onChange={(event) => setSourceType(event.target.value)}>{supportingTypes.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><span className="field-hint">Add API, database schema, or other supporting sources when they are available. The BRD is the only required document.</span></div>}
         {currentStep === 1 && <div className="field-block"><label>Expected sections <em>Optional</em></label><input value={requiredSections} onChange={(event) => setRequiredSections(event.target.value)} placeholder="Scope, Requirements, Acceptance Criteria" /><span className="field-hint">Missing sections become review warnings, not upload blockers.</span></div>}
         <div className={`drop-zone-modern ${dragging ? "dragging" : ""}`} onDragOver={(event) => { event.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={(event) => { event.preventDefault(); setDragging(false); chooseFile(event.dataTransfer.files?.[0]); }}>{currentStep === 1 && brds.length > 0 && !file ? <><div className="upload-icon existing"><FileText size={23} /></div><h3 className="existing-file-name" title={brds[0].active_revision?.filename || brds[0].logical_name}>{brds[0].active_revision?.filename || brds[0].logical_name}</h3><p>Current file - v{brds[0].active_revision?.revision || brds[0].revision || 1}</p><label className="choose-file">Upload replacement<input type="file" accept=".docx,.pdf,.txt,.md,.json,.yaml,.yml,.sql,.csv" onChange={(event) => chooseFile(event.target.files?.[0])} /></label></> : <><div className="upload-icon"><CloudUpload size={23} /></div><h3>Drop a file here</h3><p>or choose from your computer</p><label className="choose-file">Choose file<input type="file" accept=".docx,.pdf,.txt,.md,.json,.yaml,.yml,.sql,.csv" onChange={(event) => chooseFile(event.target.files?.[0])} /></label><span className="file-hint">DOCX, PDF, TXT, MD, JSON, YAML, SQL or CSV - up to 25 MB</span></>}</div>
         {file && <div className="selected-file"><span className="file-type"><FileText size={17} /></span><div><strong>{file.name}</strong><span>{(file.size / 1024).toFixed(1)} KB - Ready to upload</span></div><button onClick={() => setFile(null)}><X size={17} /></button></div>}
@@ -302,9 +324,9 @@ export function UploadStep({ onOpenPackages }) {
       <aside className="side-panel"><div className="side-panel-head"><span className="side-icon"><Sparkles size={17} /></span><div><h3>Smart processing</h3><p>What happens next</p></div></div><div className="info-list"><div><b>01</b><span>We preserve the original file and create a versioned revision.</span></div><div><b>02</b><span>AI extraction runs automatically with local fallback.</span></div><div><b>03</b><span>Every section stays traceable to its source and page.</span></div></div><div className="privacy-note"><ShieldCheck size={16} /><span>Your API key stays on the backend. It is never sent from this screen.</span></div></aside>
     </div>}
 
-    {currentStep === 2 && !manifest && <section className="source-list-card"><div className="list-card-header"><div><h2>Package sources</h2><p>{requiredSupportingReady ? "Your BRD and required supporting sources are ready to review." : "Upload the required API Specification and Database Schema to continue."}</p></div><span className="health-badge"><span /> {extractionPending ? "Processing" : "Healthy"}</span></div>{extractionPending && <LoadingSpinner variant="section" label="Processing uploaded sources" detail="Extracting content and preparing traceable source evidence." />}<div className="required-source-checks" aria-label="Required supporting sources"><span className={hasApiSpecification ? "complete" : "missing"}>{hasApiSpecification ? <Check size={14} /> : "*"} API Specification</span><span className={hasDatabaseSchema ? "complete" : "missing"}>{hasDatabaseSchema ? <Check size={14} /> : "*"} Database Schema</span></div>{sources.map((source) => <SourceRow key={source.source_id} source={source} />)}<div className="list-card-actions"><button className="secondary-button" onClick={() => { setStep(1); setSourceType("brd"); setBrdSourceId(""); }}><ChevronLeft size={15} /> Back to BRD</button><button className="secondary-button" disabled={!packageReady} onClick={() => setStep(3)}><PackageCheck size={16} /> {extractionPending ? "Waiting for extraction" : !requiredSupportingReady ? "Required sources missing" : "Review package"} <ChevronRight size={15} /></button></div></section>}
-    {currentStep === 3 && !manifest && <section className="review-card"><div className="review-header"><div><div className="eyebrow">FINAL REVIEW</div><h2>Ready to create your package?</h2><p>This snapshot will lock the exact source revisions used for future traceability.</p></div><div className="review-check"><PackageCheck size={22} /></div></div><div className="field-block package-name-field"><label>Package name <em>Required</em></label><input ref={packageNameRef} value={packageName} onChange={(event) => setPackageName(event.target.value)} placeholder="e.g. PBM Refill Reminder Source Package" /></div><div className="review-summary"><div><span>Project</span><strong>{project?.project_name}</strong></div><div><span>Sources included</span><strong>{sources.length}</strong></div><div><span>Scope</span><strong>MVP</strong></div></div><div className="review-source-list">{sources.map((source) => <SourceRow key={source.source_id} source={source} compact />)}</div><div className="review-actions"><button className="secondary-button" onClick={() => { setToast(""); setStep(2); }}><ChevronLeft size={15} /> Back to sources</button><button className="primary-button" onClick={createPackage} disabled={busy || !packageName.trim()}>{busy ? <LoadingSpinner variant="inline" label="Creating" /> : <><PackageCheck size={16} /> Create source package</>}</button></div></section>}
-    {manifest && <section className="success-card package-ready-card"><div className="success-mark"><Check size={26} /></div><div className="eyebrow">PACKAGE CREATED</div><h2>{manifest.package_name || packageName}</h2><p>All {manifest.items?.length || sources.length} source revisions are captured in an immutable snapshot.</p><div className="manifest-id"><span>Package version</span><strong>v{manifest.package_version || 1}</strong><span className="manifest-dot" /><span>Scope</span><strong>{manifest.scope || "MVP"}</strong></div><div className="success-actions"><button className="secondary-button" onClick={() => { setManifest(null); setToast(""); setStep(2); }}><RefreshCw size={16} /> Continue managing sources</button><button className="primary-button" onClick={() => onOpenPackages?.()} disabled={!onOpenPackages}><PackageCheck size={16} /> View packages</button></div></section>}
+    {currentStep === 2 && !manifest && <section className="source-list-card"><div className="list-card-header"><div><h2>Package sources</h2><p>All supporting sources and the active BRD are included in this package.</p></div><span className="health-badge"><span /> {packagePending ? "Processing" : "Sources ready"}</span></div>{packagePending && <LoadingSpinner variant="section" label="Processing package sources" detail="Extracting content and preparing traceable source evidence." />}<div className="package-source-selection">{sources.filter((source) => selectedPackageSourceIds.includes(source.source_id)).map((source) => <div className="package-source-option" key={source.source_id}><SourceRow source={source} compact /></div>)}</div><div className="list-card-actions"><button className="secondary-button" onClick={() => { setStep(1); setSourceType("brd"); setBrdSourceId(""); }}><ChevronLeft size={15} /> Back to BRD</button><button className="secondary-button" disabled={!packageReady} onClick={() => setStep(3)}><PackageCheck size={16} /> {packagePending ? "Waiting for extraction" : packageRejected ? "Fix selected sources" : selectedBrds.length !== 1 ? "Select one BRD" : "Review package"} <ChevronRight size={15} /></button></div></section>}
+    {currentStep === 3 && !manifest && <section className="review-card"><div className="review-header"><div><div className="eyebrow">FINAL REVIEW</div><h2>Ready to create your package?</h2><p>This snapshot locks the exact source revisions selected below for traceable downstream generation.</p></div><div className="review-check"><PackageCheck size={22} /></div></div><div className="field-block package-name-field"><label>Package name <em>Required</em></label><input ref={packageNameRef} value={packageName} onChange={(event) => setPackageName(event.target.value)} placeholder="e.g. PBM Refill Reminder Source Package" /></div><div className="review-summary"><div><span>Project</span><strong>{project?.project_name}</strong></div><div><span>Sources included</span><strong>{packageSources.length}</strong></div><div><span>Scope</span><strong>MVP</strong></div></div><div className="review-source-list">{packageSources.map((source) => <SourceRow key={source.source_id} source={source} compact />)}</div><div className="review-actions"><button className="secondary-button" onClick={() => { setToast(""); setStep(2); }}><ChevronLeft size={15} /> Back to sources</button><button className="primary-button" onClick={createPackage} disabled={busy || !packageName.trim()}>{busy ? <LoadingSpinner variant="inline" label="Creating" /> : <><PackageCheck size={16} /> Create source package</>}</button></div></section>}
+    {manifest && <section className="success-card package-ready-card"><div className="success-mark"><Check size={26} /></div><div className="eyebrow">PACKAGE CREATED</div><h2>{manifest.package_name || packageName}</h2><p>All {manifest.items?.length || packageSources.length} source revisions are captured in an immutable snapshot.</p><div className="manifest-id"><span>Package version</span><strong>v{manifest.package_version || 1}</strong><span className="manifest-dot" /><span>Scope</span><strong>{manifest.scope || "MVP"}</strong></div><div className="success-actions"><button className="secondary-button" onClick={() => { setManifest(null); setToast(""); setStep(2); }}><RefreshCw size={16} /> Continue managing sources</button><button className="primary-button" onClick={() => onContinueToBusinessUseCases?.()} disabled={!onContinueToBusinessUseCases}><PackageCheck size={16} /> Continue to Business Use Cases</button></div></section>}
     {confirmNewPackage && <div className="modal-backdrop" role="presentation" onMouseDown={() => setConfirmNewPackage(false)}><div className="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="new-package-title" onMouseDown={(event) => event.stopPropagation()}><button type="button" className="modal-close" aria-label="Close new package dialog" onClick={() => setConfirmNewPackage(false)}><X size={18} /></button><div className="confirm-icon"><Plus size={21} /></div><h2 id="new-package-title">Start a new package?</h2><p>Your current project and all created packages will remain saved. You'll begin a fresh source package here.</p><div className="confirm-actions"><button className="secondary-button" onClick={() => setConfirmNewPackage(false)}>Cancel</button><button className="primary-button" onClick={confirmResetProject}>Start new package</button></div></div></div>}
   </div>;
 }

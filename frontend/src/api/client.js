@@ -34,7 +34,9 @@ async function request(path, options = {}) {
     const message = typeof detail === "string"
       ? detail
       : detail?.validation_messages?.join("; ") || data?.validation_messages?.join("; ") || detail?.message || `${response.status} ${response.statusText}`;
-    throw new Error(message);
+    const error = new Error(message);
+    error.status = response.status;
+    throw error;
   }
   return data;
 }
@@ -105,6 +107,31 @@ export async function createManifest(sourceIds, packageName, scope, projectId) {
 
 export async function listManifests(projectId) {
   return request(`/api/v1/projects/${encodeURIComponent(projectId)}/manifests`);
+}
+
+export async function buildKnowledgeIndex(packageId, options = {}) {
+  return request(`/api/v1/packages/${encodeURIComponent(packageId)}/knowledge-index`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(options) });
+}
+export async function listKnowledgeIndexes(packageId) {
+  return request(`/api/v1/packages/${encodeURIComponent(packageId)}/knowledge-indexes`);
+}
+export async function getKnowledgeIndex(indexId) {
+  return request(`/api/v1/knowledge-indexes/${encodeURIComponent(indexId)}`);
+}
+export async function getRagReadiness(packageId) {
+  return request(`/api/v1/packages/${encodeURIComponent(packageId)}/rag-readiness`);
+}
+export async function listPackageBusinessRules(packageId) {
+  return request(`/api/v1/packages/${encodeURIComponent(packageId)}/business-rules`);
+}
+export async function reviewPackageBusinessRules(packageId, payload) {
+  return request(`/api/v1/packages/${encodeURIComponent(packageId)}/business-rules/review`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+}
+export async function retrieveKnowledge(indexId, payload) {
+  return request(`/api/v1/knowledge-indexes/${encodeURIComponent(indexId)}/retrieve`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+}
+export async function evaluateKnowledgeIndex(indexId, payload = {}) {
+  return request(`/api/v1/knowledge-indexes/${encodeURIComponent(indexId)}/evaluate`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
 }
 
 export async function generateBusinessRequirements(packageId) {
