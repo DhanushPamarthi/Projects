@@ -75,13 +75,11 @@ export async function listProjects() {
   return request("/api/v1/projects");
 }
 
-export async function uploadSource(projectId, file, sourceType = "brd", brdSourceId = "", owner = "", ownerVersion = "", requiredSections = "") {
+export async function uploadSource(projectId, file, sourceType = "brd", brdSourceId = "", requiredSections = "") {
   const formData = new FormData();
   formData.append("file", file);
   formData.append("source_type", sourceType);
   if (brdSourceId) formData.append("brd_source_id", brdSourceId);
-  if (owner) formData.append("owner", owner);
-  if (ownerVersion) formData.append("owner_version", ownerVersion);
   if (requiredSections) formData.append("required_sections", requiredSections);
   return request(`/api/v1/projects/${encodeURIComponent(projectId)}/sources`, {
     method: "POST",
@@ -109,6 +107,11 @@ export async function listManifests(projectId) {
   return request(`/api/v1/projects/${encodeURIComponent(projectId)}/manifests`);
 }
 
+export async function generateBusinessRequirements(packageId) {
+  return request(`/api/v1/packages/${encodeURIComponent(packageId)}/business-requirements/generate`, {
+    method: "POST",
+  });
+}
 export async function analyzeRequirements(packageId) {
   return request(`/api/v1/packages/${encodeURIComponent(packageId)}/requirements/analyze`, {
     method: "POST",

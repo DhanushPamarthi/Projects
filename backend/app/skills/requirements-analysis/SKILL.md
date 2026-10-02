@@ -11,6 +11,10 @@ Return exactly the requested JSON schema. Do not add approved flags or any field
 
 Create concise requirements. For each requirement include type, priority, actors, entities, flow steps, at least one business rule, at least one acceptance criterion, ambiguities, assumptions, and source references.
 
+For business_rules, generate meaningful business use cases, not duplicate sentence fragments. Each business rule should express one distinct business outcome or decision from the BRD, such as eligibility, suppression, communication, fallback, status recording, auditability, data retention, or exception handling. Avoid restating the same intent with different wording. Merge overlapping statements into one clear business requirement and keep the strongest source references.
+
+Do not create separate business rules for minor wording variations, repeated headings, repeated table rows, or the same rule appearing in BRD and supporting sources. If two source fragments describe the same business intent, return one business rule with combined source references.
+
 Use globally unique sequential IDs with exactly three digits:
 
 - Requirements: FR-001, FR-002

@@ -546,6 +546,60 @@ GENERIC_ANALYSIS_NOTICE_TEXTS = {
 
 GENERIC_FALLBACK_CONFLICT_PAIRS = (("eligible", "ineligible"), ("include", "exclude"), ("retry", "no retry"), ("sms", "email"))
 
+BUSINESS_RULE_STOPWORDS = {
+    "a", "an", "and", "are", "as", "be", "by", "for", "from", "if", "in", "is", "it", "of", "on", "or", "shall", "should", "system", "the", "to", "when", "will", "with", "must", "business", "requirement", "rule"
+}
+
+def _business_rule_tokens(text):
+    words = re.findall(r"[a-z0-9]+", str(text or "").lower())
+    return {word for word in words if len(word) > 2 and word not in BUSINESS_RULE_STOPWORDS}
+
+def _business_rule_similarity(left, right):
+    if not left or not right:
+        return 0.0
+    return len(left & right) / max(1, len(left | right))
+
+def _merge_source_references(*collections):
+    merged = {}
+    for refs in collections:
+        for ref in refs or []:
+            if isinstance(ref, dict) and (ref.get("fragment_id") or ref.get("source_reference")):
+                key = (ref.get("fragment_id"), ref.get("source_reference"))
+                merged[key] = {"fragment_id": ref.get("fragment_id"), "source_reference": ref.get("source_reference")}
+    return list(merged.values())
+
+def _dedupe_business_rules(contract):
+    """Remove duplicate or near duplicate business rules while preserving traceability."""
+    seen = []
+    sequence = 1
+    for requirement in contract.get("requirements", []) or []:
+        unique_rules = []
+        for rule in requirement.get("business_rules", []) or []:
+            if isinstance(rule, str):
+                rule = {"text": rule, "source_references": requirement.get("source_references", [])}
+            text = str(rule.get("text") or "").strip()
+            tokens = _business_rule_tokens(text)
+            if not text or not tokens:
+                continue
+            duplicate = None
+            for entry in seen:
+                exact_match = " ".join(sorted(tokens)) == entry["signature"]
+                close_match = _business_rule_similarity(tokens, entry["tokens"]) >= 0.82
+                if exact_match or close_match:
+                    duplicate = entry
+                    break
+            if duplicate:
+                duplicate["rule"]["source_references"] = _merge_source_references(duplicate["rule"].get("source_references"), rule.get("source_references"))
+                continue
+            rule["rule_id"] = f"BR-{sequence:03d}"
+            rule["text"] = text
+            rule["source_references"] = _merge_source_references(rule.get("source_references"), requirement.get("source_references"))
+            sequence += 1
+            unique_rules.append(rule)
+            seen.append({"signature": " ".join(sorted(tokens)), "tokens": tokens, "rule": rule})
+        requirement["business_rules"] = unique_rules
+    return contract
+
 def _is_generic_fallback_conflict(conflict):
     if not isinstance(conflict, dict) or conflict.get("requirement_ids"):
         return False
@@ -561,7 +615,8 @@ def _is_generic_fallback_conflict(conflict):
     return False
 
 def _clean_requirement_contract(contract):
-    """Hide legacy fallback warnings that were only generic keyword/ambiguity notices."""
+    """Hide generic notices and normalize generated business requirements for review."""
+    contract = _dedupe_business_rules(contract)
     conflicts = [item for item in contract.get("conflicting_requirements", []) if not _is_generic_fallback_conflict(item)]
     legacy_conflicts = [item for item in contract.get("conflicts", []) if not _is_generic_fallback_conflict(item)]
     if "conflicting_requirements" in contract:
@@ -1534,6 +1589,206 @@ def delete_discovery_context(context_id: str):
         conn.execute("DELETE FROM discovery_context WHERE context_id=%s", (context_id,))
         return {"deleted": True, "context_id": context_id}
 
+def _business_requirements_schema():
+    source_reference = {"type": "object", "additionalProperties": False, "properties": {"fragment_id": {"type": "string"}, "source_reference": {"type": "string"}}, "required": ["fragment_id", "source_reference"]}
+    references = {"type": "array", "items": source_reference, "minItems": 1}
+    item = {"type": "object", "additionalProperties": False, "properties": {
+        "business_requirement_id": {"type": "string", "pattern": "^BR-[0-9]{3}$"},
+        "description": {"type": "string"},
+        "priority": {"type": "string"},
+        "business_use_case": {"type": "string"},
+        "data_entities": {"type": "array", "items": {"type": "string"}},
+        "source_references": references,
+        "supporting_source_references": {"type": "array", "items": source_reference},
+    }, "required": ["business_requirement_id", "description", "priority", "business_use_case", "data_entities", "source_references", "supporting_source_references"]}
+    return {"type": "object", "additionalProperties": False, "properties": {
+        "business_requirements": {"type": "array", "minItems": 1, "items": item},
+        "global_gaps": {"type": "array", "items": {"type": "string"}},
+        "global_assumptions": {"type": "array", "items": {"type": "string"}},
+    }, "required": ["business_requirements", "global_gaps", "global_assumptions"]}
+
+def _business_requirement_prompt_payload(package, items, fragments):
+    item_by_source = {item.get("source_id"): item for item in items}
+    source_documents = []
+    for item in items:
+        source_type = item.get("source_type")
+        source_documents.append({
+            "source_id": item.get("source_id"),
+            "revision_id": item.get("revision_id"),
+            "source_type": source_type,
+            "logical_name": item.get("logical_name"),
+            "filename": item.get("filename"),
+            "role": "business_scope" if source_type == "brd" else "supporting_context",
+            "full_text": " ".join(str(item.get("extracted_text") or "").split()),
+        })
+    return {
+        "package": {"package_id": package.get("package_id"), "package_name": package.get("package_name"), "scope": package.get("scope")},
+        "source_documents": source_documents,
+        "citation_anchors": [
+            {
+                "fragment_id": fragment.get("fragment_id"),
+                "source_reference": fragment.get("source_reference"),
+                "source_id": fragment.get("source_id"),
+                "source_type": item_by_source.get(fragment.get("source_id"), {}).get("source_type"),
+                "heading": fragment.get("heading"),
+            }
+            for fragment in fragments if fragment.get("fragment_id")
+        ],
+    }
+
+def _validate_business_requirements_contract(contract, fragments):
+    if not isinstance(contract, dict) or not contract.get("business_requirements"):
+        raise ValueError("The AI returned no business requirements")
+    fragments_by_id = {fragment.get("fragment_id"): fragment for fragment in fragments if fragment.get("fragment_id")}
+    seen = set()
+    for item in contract.get("business_requirements", []):
+        business_id = item.get("business_requirement_id")
+        description = str(item.get("description") or "").strip()
+        if not business_id or business_id in seen or not description:
+            raise ValueError("The AI returned an invalid or duplicate business requirement")
+        seen.add(business_id)
+        refs = item.get("source_references") or []
+        if not refs:
+            raise ValueError(f"AI returned no source references for {business_id}")
+        for ref in [*refs, *(item.get("supporting_source_references") or [])]:
+            fragment = fragments_by_id.get(ref.get("fragment_id"))
+            if not fragment:
+                raise ValueError(f"AI returned an unknown source reference for {business_id}")
+            ref["fragment_id"] = fragment["fragment_id"]
+            ref["source_reference"] = fragment["source_reference"]
+
+def _dedupe_business_requirement_items(items):
+    deduped = []
+    for item in items:
+        text = str(item.get("description") or item.get("text") or "").strip()
+        if not text:
+            continue
+        tokens = _business_rule_tokens(text)
+        duplicate = None
+        for existing in deduped:
+            if _business_rule_similarity(tokens, existing["_tokens"]) >= 0.72:
+                duplicate = existing
+                break
+        if duplicate:
+            duplicate["source_references"] = _merge_source_references(duplicate.get("source_references"), item.get("source_references"))
+            duplicate["supporting_source_references"] = _merge_source_references(duplicate.get("supporting_source_references"), item.get("supporting_source_references"))
+            duplicate["data_entities"] = sorted(set((duplicate.get("data_entities") or []) + (item.get("data_entities") or [])))
+            continue
+        next_item = dict(item)
+        next_item["description"] = text
+        next_item["source_references"] = _merge_source_references(item.get("source_references"))
+        next_item["supporting_source_references"] = _merge_source_references(item.get("supporting_source_references"))
+        next_item["data_entities"] = list(dict.fromkeys(item.get("data_entities") or []))
+        next_item["_tokens"] = tokens
+        deduped.append(next_item)
+    for index, item in enumerate(deduped, 1):
+        item["business_requirement_id"] = f"BR-{index:03d}"
+        item.pop("_tokens", None)
+    return deduped
+
+def _business_requirements_to_review_contract(package, items, business_items, mode, model, note=None):
+    business_items = _dedupe_business_requirement_items(business_items)
+    source_refs = _merge_source_references(*(item.get("source_references") for item in business_items))
+    if not source_refs and business_items:
+        source_refs = business_items[0].get("source_references", [])
+    rules = [
+        {
+            "rule_id": item["business_requirement_id"],
+            "text": item["description"],
+            "business_use_case": item.get("business_use_case") or item["description"],
+            "priority": item.get("priority") or "Must have",
+            "data_entities": item.get("data_entities") or [],
+            "source_references": _merge_source_references(item.get("source_references"), item.get("supporting_source_references")),
+            "approved": False,
+            "review_status": "pending",
+        }
+        for item in business_items
+    ]
+    contract = {
+        "contract_version": "1.0",
+        "package_id": package["package_id"],
+        "project_id": package["project_id"],
+        "package_scope": package.get("scope"),
+        "business_requirements_generation": True,
+        "requirements": [{
+            "requirement_id": "BRD-001",
+            "title": "Business requirement scope",
+            "type": "Business",
+            "statement": "Review the deduplicated business use cases extracted from the BRD and supporting source package.",
+            "priority": "Must have",
+            "actors": [],
+            "entities": sorted({entity for item in business_items for entity in item.get("data_entities", [])}),
+            "business_rules": rules,
+            "acceptance_criteria": [{"acceptance_id": "AC-001", "given": "A source package has been created.", "when": "Business requirements are reviewed.", "then": "Approved business requirements define the scope for Functional Requirements.", "source_references": source_refs or []}],
+            "flow_steps": ["Extract BRD business intent", "Consolidate duplicates", "Review and approve business scope"],
+            "ambiguities": [],
+            "assumptions": [],
+            "source_references": source_refs or [],
+        }],
+        "business_requirements": business_items,
+        "global_gaps": [],
+        "global_assumptions": [],
+        "conflicting_requirements": [],
+        "conflicts": [],
+        "accepted_assumptions": [],
+        "source_package_items": [{"source_id": item["source_id"], "revision_id": item["revision_id"], "source_type": item["source_type"], "logical_name": item["logical_name"], "sha256": item["sha256"]} for item in items],
+        "generated_at": now(),
+        "generation_mode": mode,
+        "generation_model": model,
+    }
+    if note:
+        contract["generation_note"] = note
+        contract["global_gaps"].append(note)
+    contract["readiness"] = _contract_readiness(contract)
+    return contract
+
+def _business_requirements_with_openai(package, items, fragments):
+    if not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError("OPENAI_API_KEY is not configured for Business Requirements generation")
+    from openai import OpenAI
+    payload = _business_requirement_prompt_payload(package, items, fragments)
+    prompt = (
+        "Generate a flat list of distinct business requirements from the source package. "
+        "Use source_documents[].full_text as the primary input. The BRD full_text is the authority for business scope. "
+        "Use database schema, API, campaign rules, and templates full_text only to clarify entities, data dependencies, eligibility checks, and implementation context. "
+        "Do not derive requirements by enumerating citation_anchors; citation_anchors exist only so you can return traceable source IDs. "
+        "Do not generate Functional Requirements, acceptance criteria, flow steps, UI behavior, or test cases. "
+        "Merge duplicates and near duplicates across BRD tables, repeated headings, and supporting sources. "
+        "Each item must be a meaningful end-to-end business use case or business decision, not a copied sentence fragment. "
+        "Prefer 5 to 12 consolidated requirements for a small BRD; create more only when the BRD has truly separate business outcomes. "
+        "Use Must have/Should have/Could have priority. Cite BRD anchors in source_references and put supporting schema/API/template anchors in supporting_source_references. "
+        "If a precise anchor is not obvious, choose the nearest anchor from the same source document and heading.\n\nINPUT JSON:\n"
+        + json.dumps(payload, ensure_ascii=False)
+    )
+    response = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=OPENAI_TIMEOUT_SECONDS).responses.create(
+        model=OPENAI_MODEL,
+        input=prompt,
+        store=False,
+        text={"format": {"type": "json_schema", "name": "business_requirements_contract", "strict": True, "schema": _business_requirements_schema()}},
+    )
+    if not response.output_text:
+        raise ValueError("OpenAI returned no Business Requirements")
+    contract = json.loads(response.output_text)
+    _validate_business_requirements_contract(contract, fragments)
+    return contract["business_requirements"]
+
+def _business_requirements_fallback(package, items, fragments):
+    contract = _requirement_contract(package, items, fragments)
+    business_items = []
+    for requirement in contract.get("requirements", []):
+        for rule in requirement.get("business_rules", []):
+            business_items.append({
+                "business_requirement_id": rule.get("rule_id") or f"BR-{len(business_items)+1:03d}",
+                "description": rule.get("text") or requirement.get("statement"),
+                "priority": "Must have",
+                "business_use_case": requirement.get("title") or rule.get("text") or "Business requirement",
+                "data_entities": requirement.get("entities", []),
+                "source_references": rule.get("source_references") or requirement.get("source_references", []),
+                "supporting_source_references": [],
+            })
+    return _dedupe_business_requirement_items(business_items)
+
+
 def _approved_business_requirements(contract):
     if contract.get("approved_business_requirements"):
         return contract["approved_business_requirements"]
@@ -1687,6 +1942,37 @@ def generate_functional_requirements(package_id: str):
         analysis_id, timestamp = uid("req"), now()
         conn.execute("INSERT INTO requirement_analysis (analysis_id,package_id,project_id,analysis_version,status,contract_json,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", (analysis_id, package_id, package["project_id"], version, "needs_review", json.dumps(contract), timestamp, timestamp))
         return _analysis_response(conn.execute("SELECT * FROM requirement_analysis WHERE analysis_id=%s", (analysis_id,)).fetchone(), len(contexts))
+
+
+
+@app.post("/api/v1/packages/{package_id}/business-requirements/generate", status_code=201)
+def generate_business_requirements(package_id: str):
+    with connection() as conn:
+        package = conn.execute("SELECT * FROM source_package_manifest WHERE package_id=%s", (package_id,)).fetchone()
+        if not package:
+            raise HTTPException(404, "Package manifest not found")
+        items = conn.execute("SELECT pi.*,s.logical_name,s.source_type,r.sha256,r.filename,e.status AS extraction_status,e.extracted_text AS extracted_text FROM source_package_item pi JOIN source_document s ON s.source_id=pi.source_id JOIN source_revision r ON r.revision_id=pi.revision_id LEFT JOIN source_extraction e ON e.revision_id=pi.revision_id WHERE pi.package_id=%s", (package_id,)).fetchall()
+        not_ready = [item["logical_name"] for item in items if item["extraction_status"] != "succeeded"]
+        if not_ready:
+            raise HTTPException(422, f"Business Requirements cannot be generated until extraction succeeds for: {', '.join(not_ready)}")
+        ids = [item["revision_id"] for item in items]
+        fragments = conn.execute(f"SELECT * FROM source_fragment WHERE revision_id IN ({','.join('%s' for _ in ids)}) ORDER BY revision_id,fragment_index", ids).fetchall()
+        item_rows = [row_dict(item) for item in items]
+        fragment_rows = [row_dict(fragment) for fragment in fragments]
+        if not os.getenv("OPENAI_API_KEY"):
+            raise HTTPException(422, "Business Requirements generation requires OPENAI_API_KEY because local fragment fallback is disabled for business use cases.")
+        try:
+            business_items = _business_requirements_with_openai(row_dict(package), item_rows, fragment_rows)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(502, f"LLM Business Requirements generation failed: {safe_llm_error_message(exc)}")
+        contract = _business_requirements_to_review_contract(row_dict(package), item_rows, business_items, "openai", OPENAI_MODEL)
+        version = conn.execute("SELECT COALESCE(MAX(analysis_version),0)+1 AS v FROM requirement_analysis WHERE package_id=%s", (package_id,)).fetchone()["v"]
+        analysis_id, timestamp = uid("req"), now()
+        conn.execute("INSERT INTO requirement_analysis (analysis_id,package_id,project_id,analysis_version,status,contract_json,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", (analysis_id, package_id, package["project_id"], version, "needs_review", json.dumps(contract), timestamp, timestamp))
+        discovery_count = _discovery_context_count(conn, package["project_id"], package_id)
+        return _analysis_response(conn.execute("SELECT * FROM requirement_analysis WHERE analysis_id=%s", (analysis_id,)).fetchone(), discovery_count)
 
 
 @app.post("/api/v1/packages/{package_id}/requirements/analyze", status_code=201)
