@@ -1,6 +1,6 @@
 ﻿import { useEffect, useMemo, useState } from "react";
 import { AlertCircle, ArrowLeft, Check, CheckCircle2, ClipboardList, LoaderCircle, Pencil, RefreshCw, ShieldCheck, X } from "lucide-react";
-import { generateTestCasesFromAnalysis, listGeneratedTestCases, regenerateTestCasesFromGeneration, reviewTestCaseGeneration } from "../api/client.js";
+import { generateTestCasesFromAnalysis, getRequirementAnalysis, listGeneratedTestCases, regenerateTestCasesFromGeneration, reviewTestCaseGeneration } from "../api/client.js";
 
 function lines(value) {
   return String(value || "").split("\n").map((item) => item.trim()).filter(Boolean);
@@ -68,7 +68,10 @@ function caseDisplayTitle(item, allCases = []) {
   return `${title} · ${sameSource.length > 1 ? item.test_case_id : sourceId}`;
 }
 
-export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData, onReviewSaved }) {
+export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData, onReviewSaved, onAnalysisUnavailable }) {
+  const [verifiedAnalysis, setVerifiedAnalysis] = useState(null);
+  const [analysisLoading, setAnalysisLoading] = useState(Boolean(analysis?.analysis_id));
+  const [analysisError, setAnalysisError] = useState("");
   const [generation, setGeneration] = useState(null);
   const [selected, setSelected] = useState([]);
   const [statuses, setStatuses] = useState({});
@@ -84,8 +87,10 @@ export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData,
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
 
-  const requirements = analysis?.contract?.requirements || [];
-  const approvedIds = new Set(analysis?.contract?.approved_items || []);
+  const currentAnalysis = verifiedAnalysis?.analysis_id === analysis?.analysis_id ? verifiedAnalysis : null;
+  const isAnalysisLoading = analysisLoading || Boolean(analysis?.analysis_id && !currentAnalysis && !analysisError);
+  const requirements = currentAnalysis?.contract?.requirements || [];
+  const approvedIds = new Set(currentAnalysis?.contract?.approved_items || []);
   const approvedRequirements = requirements.filter((item) => approvedIds.has(item.requirement_id) || item.review_status === "approved");
   const contract = caseContract(generation);
   const generationId = generation?.generation_id || contract.generation_id;
@@ -105,22 +110,43 @@ export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData,
   }
 
   useEffect(() => {
-    if (!analysis?.analysis_id) return;
-    listGeneratedTestCases(analysis.analysis_id)
+    let active = true;
+    setVerifiedAnalysis(null);
+    setAnalysisError("");
+    if (!analysis?.analysis_id) {
+      setAnalysisLoading(false);
+      setGeneration(null);
+      return () => { active = false; };
+    }
+    setAnalysisLoading(true);
+    getRequirementAnalysis(analysis.analysis_id)
       .then((items) => {
-        const next = items[0] || null;
-        applyGeneration(next);
+        if (active) setVerifiedAnalysis(items);
       })
-      .catch(() => {});
-  }, [analysis?.analysis_id]);
+      .catch((err) => {
+        if (!active) return;
+        setAnalysisError(err.status === 404 ? "not-found" : err.message || "load-failed");
+        setGeneration(null);
+        if (err.status === 404) onAnalysisUnavailable?.();
+      })
+      .finally(() => { if (active) setAnalysisLoading(false); });
+    return () => { active = false; };
+  }, [analysis?.analysis_id, onAnalysisUnavailable]);
+
+  useEffect(() => {
+    if (isAnalysisLoading || !currentAnalysis?.analysis_id) return;
+    listGeneratedTestCases(currentAnalysis.analysis_id)
+      .then((items) => applyGeneration(items[0] || null))
+      .catch((err) => setError(err.message || "Could not load generated test cases."));
+  }, [currentAnalysis?.analysis_id, isAnalysisLoading]);
 
   async function generate() {
-    if (!analysis?.analysis_id) return;
+    if (!currentAnalysis?.analysis_id) return;
     setLoading(true);
     setError("");
     setSuccess("");
     try {
-      const next = await generateTestCasesFromAnalysis(analysis.analysis_id);
+      const next = await generateTestCasesFromAnalysis(currentAnalysis.analysis_id);
       applyGeneration(next);
       setSelected([]);
     } catch (err) {
@@ -264,8 +290,11 @@ export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData,
     </article>;
   }
 
-  if (!analysis) {
-    return <div className="requirements-page test-generation-page"><div className="empty-state-panel"><div className="empty-state-icon"><ClipboardList size={25} /></div><h2>No requirement analysis selected</h2><p>Open Requirements, approve the scope, then continue to test-case generation.</p><button type="button" className="primary-button" onClick={onBack}>Back to requirements</button></div></div>;
+  if (isAnalysisLoading) {
+    return <div className="requirements-page test-generation-page"><section className="generation-empty" role="status"><LoaderCircle className="spin" size={22} /><h3>Checking approved requirements</h3></section></div>;
+  }
+  if (!currentAnalysis) {
+    return <div className="requirements-page test-generation-page"><div className="empty-state-panel"><div className="empty-state-icon"><ClipboardList size={25} /></div><h2>{analysisError === "not-found" ? "No saved requirement analysis" : analysisError ? "Could not verify requirement analysis" : "No requirement analysis selected"}</h2><p>{analysisError === "not-found" ? "This saved analysis is not in the database. Return to Requirements to load current data before generating test cases." : analysisError ? "The saved analysis could not be loaded. Check the database connection, then return to Requirements and try again." : "Open Requirements, approve the scope, then continue to test-case generation."}</p><button type="button" className="primary-button" onClick={onBack}>Back to requirements</button></div></div>;
   }
 
   return <div className="requirements-page test-generation-page">
@@ -273,7 +302,7 @@ export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData,
     {error && <div className="error-message"><AlertCircle size={17} /> {error}</div>}
     {success && <div className="toast-message"><CheckCircle2 size={17} /> {success}</div>}
     <section className="generation-ready-card"><div className="generation-ready-icon"><CheckCircle2 size={24} /></div><div><div className="eyebrow">APPROVED SCOPE</div><h2>{approvedRequirements.length} approved requirement{approvedRequirements.length === 1 ? "" : "s"} ready</h2><p>Pending and rejected requirements are excluded. {generation ? `${testCases.length} test cases generated using ${generationMode === "openai" ? generationModel : "the local fallback"}.` : "Generate grounded test cases from the approved functional requirements and acceptance criteria."}</p></div><span className={`requirements-status ${allApproved ? "approved" : ""}`}>{allApproved ? "Approved" : generation ? "Needs review" : "Ready"}</span></section>
-    <section className="generation-next-card"><div><div className="eyebrow">LLM TEST DESIGN</div><h2>{generation ? "Generate another set" : "Generate test cases from approved scope"}</h2><p>The backend derives coverage from approved functional requirements, acceptance criteria, business requirements, source package evidence, and available Knowledge Fabric context.</p></div><div className="generation-controls"><button type="button" className="primary-button" disabled={!approvedRequirements.length || loading} onClick={generate}>{loading ? <><LoaderCircle className="spin" size={16} /> Generating...</> : <><ShieldCheck size={16} /> Generate test cases</>}</button></div></section>
+    <section className="generation-next-card"><div><div className="eyebrow">LLM TEST DESIGN</div><h2>{generation ? "Generate another set" : "Generate test cases from approved scope"}</h2><p>Generate cases from approved Functional Requirements and acceptance criteria, grounded in retrieved package evidence and approved business use cases.</p></div><div className="generation-controls"><button type="button" className="primary-button" disabled={!approvedRequirements.length || loading} onClick={generate}>{loading ? <><LoaderCircle className="spin" size={16} /> Generating...</> : <><ShieldCheck size={16} /> Generate test cases</>}</button></div></section>
     {generation && <section className="requirements-panel generated-cases-panel"><div className="panel-title-row"><div><h2>Review generated test cases</h2><p className="panel-helper">Approve or reject each case. Edit title, steps, or expected result before saving.</p></div><span>{approvedCount}/{testCases.length} approved</span></div><div className="selection-actions"><label className="select-all"><input type="checkbox" checked={selectedAll} onChange={(event) => toggleAll(event.target.checked)} /> Select all</label><div className="review-move-actions"><button type="button" className="review-icon-action approved-action" disabled={!selected.length} title="Approve selected test cases" onClick={() => moveSelected("approved")}><Check size={16} /></button><button type="button" className="review-icon-action rejected-action" disabled={!selected.length} title="Reject selected test cases" onClick={() => moveSelected("rejected")}><X size={16} /></button><button type="button" className="secondary-button compact-button" disabled={regenerating || (!selected.length && !(contract.rejected_test_case_ids || []).length)} title="Create a new generation version from selected or rejected cases" onClick={regenerateSelected}>{regenerating ? <><LoaderCircle className="spin" size={14} /> Regenerating</> : <><RefreshCw size={14} /> Regenerate</>}</button><button type="button" className="text-button" onClick={() => toggleAll(false)}>Clear all</button></div></div><div className="test-case-review-list">{caseItems.map(testCaseCard)}</div></section>}
     {generation && <section className="requirements-review-card"><div><div className="eyebrow">HUMAN REVIEW</div><h2>{allApproved ? "Test cases approved" : "Save test-case review"}</h2><p>{allApproved ? "Approved cases can continue to test data generation." : "Save reviewer, comments, and approval decisions for the generated cases."}</p></div><div className="review-fields"><label>Reviewer<input value={reviewer} onChange={(event) => setReviewer(event.target.value)} /></label><label>Review comments<textarea value={comments} onChange={(event) => setComments(event.target.value)} placeholder="Add review notes" /></label><button className="primary-button" onClick={saveReview} disabled={saving || !testCases.length}>{saving ? <><LoaderCircle className="spin" size={16} /> Saving review...</> : <><ShieldCheck size={16} /> Save test-case review</>}</button></div></section>}
   </div>;

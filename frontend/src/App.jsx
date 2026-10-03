@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Activity, Bell, ChevronDown, ChevronLeft, ChevronRight, CircleHelp, ClipboardCheck, Database, FileCheck2, FileStack, FlaskConical, LayoutDashboard, ListChecks, LogOut, Menu, PackageOpen, Settings, ShieldCheck, X } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Activity, Bell, BookOpen, ChevronDown, ChevronLeft, ChevronRight, CircleHelp, ClipboardCheck, Database, FileCheck2, FileStack, FlaskConical, LayoutDashboard, ListChecks, LogOut, Menu, PackageOpen, Settings, ShieldCheck, X } from "lucide-react";
 import { LoginPage } from "./components/LoginPage.jsx";
 import { RegisterPage } from "./components/RegisterPage.jsx";
 import { UploadStep } from "./components/UploadStep.jsx";
@@ -10,6 +10,7 @@ import { TraceabilityPage } from "./components/TraceabilityPage.jsx";
 import { TestCaseGenerationPage } from "./components/TestCaseGenerationPage.jsx";
 import { TestDataGenerationPage } from "./components/TestDataGenerationPage.jsx";
 import { TestResultsPage } from "./components/TestResultsPage.jsx";
+import { KnowledgeBasePage } from "./components/KnowledgeBasePage.jsx";
 import { logoutUser } from "./api/client.js";
 import { ToastContainer } from "react-toastify";
 import { toast } from "react-toastify";
@@ -18,18 +19,19 @@ function displayNameFromEmail(email) { return String(email || "").split("@")[0].
 
 const ACTIVE_NAV_KEY = "testiq_active_nav";
 const GENERATION_ANALYSIS_KEY = "testiq_generation_analysis";
-const VALID_NAV_ITEMS = new Set(["overview", "sources", "packages", "business-requirements", "requirements", "test-cases", "test-data", "test-results", "activity", "traceability"]);
+const VALID_NAV_ITEMS = new Set(["overview", "sources", "packages", "business-requirements", "requirements", "test-cases", "test-data", "test-results", "activity", "traceability", "knowledge-base"]);
 const NAV_ITEMS = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
-  { id: "sources", label: "Sources", icon: FileStack, badge: "1", badgeLabel: "1 source issue" },
+  { id: "sources", label: "Source Package", icon: FileStack, badge: "1", badgeLabel: "1 source issue" },
   { id: "packages", label: "Packages", icon: PackageOpen },
-  { id: "business-requirements", label: "Business Requirements", icon: ListChecks },
+  { id: "business-requirements", label: "Business Use Cases", icon: ListChecks },
   { id: "requirements", label: "Functional Requirements", icon: ListChecks },
   { id: "test-cases", label: "Test cases", icon: ClipboardCheck },
   { id: "test-data", label: "Test data", icon: Database },
   { id: "test-results", label: "Test Results", icon: FileCheck2 },
   { id: "activity", label: "Activity", icon: Activity },
   { id: "traceability", label: "Traceability", icon: ShieldCheck, section: "Workspace tools" },
+  { id: "knowledge-base", label: "Knowledge Base", icon: BookOpen, section: "Workspace tools" },
   { id: "settings", label: "Settings", icon: Settings, section: "Workspace tools", disabled: true },
 ];
 
@@ -102,6 +104,7 @@ export default function App() {
   useEffect(() => { localStorage.setItem("testiq_sidebar_expanded", String(sidebarExpanded)); }, [sidebarExpanded]);
   useEffect(() => { workspaceContentRef.current?.scrollTo({ top: 0 }); }, [activeNav]);
   function setGenerationAnalysis(next) { setGenerationAnalysisState(next); if (next) localStorage.setItem(GENERATION_ANALYSIS_KEY, JSON.stringify(next)); else localStorage.removeItem(GENERATION_ANALYSIS_KEY); }
+  const clearGenerationAnalysis = useCallback(() => { setGenerationAnalysisState(null); localStorage.removeItem(GENERATION_ANALYSIS_KEY); }, []);
   function openTestCaseGeneration(next) { setGenerationAnalysis(next); setActiveNav("test-cases"); }
   function handleLogin(userData) { const enrichedUser = { ...userData, name: userData?.name || displayNameFromEmail(userData?.email) }; setUser(enrichedUser); localStorage.setItem("testiq_current_user", JSON.stringify(enrichedUser)); if (!localStorage.getItem("testiq_auth_token")) localStorage.setItem("testiq_local_session", "true"); }
   async function handleLogout() { try { await logoutUser(); } catch { /* local cleanup still applies */ } localStorage.removeItem("testiq_current_user"); localStorage.removeItem("testiq_auth_token"); localStorage.removeItem("testiq_local_session"); localStorage.removeItem(ACTIVE_NAV_KEY); localStorage.removeItem(GENERATION_ANALYSIS_KEY); setGenerationAnalysisState(null); setActiveNav("sources"); toast.success("You have been logged out successfully."); setUser(null); }
@@ -116,10 +119,10 @@ export default function App() {
     </aside>
     <button type="button" className="sidebar-edge-toggle" aria-label={sidebarExpanded ? "Collapse sidebar" : "Expand sidebar"} aria-expanded={sidebarExpanded} onClick={() => setSidebarExpanded((expanded) => !expanded)}>{sidebarExpanded ? <ChevronLeft size={17} /> : <ChevronRight size={17} />}</button>
     <div className={`mobile-sidebar-backdrop ${mobileMenuOpen ? "is-visible" : ""}`} aria-hidden="true" onClick={() => setMobileMenuOpen(false)} />
-    <aside id="mobile-navigation" className={`workspace-sidebar mobile-sidebar ${mobileMenuOpen ? "is-open" : ""}`} aria-label="Mobile navigation" aria-hidden={!mobileMenuOpen} inert={!mobileMenuOpen}>
+    <aside id="mobile-navigation" className={`workspace-sidebar mobile-sidebar ${mobileMenuOpen ? "is-open" : ""}`} aria-label="Mobile navigation" aria-hidden={!mobileMenuOpen} {...(!mobileMenuOpen ? { inert: "" } : {})}>
       <button type="button" className="mobile-sidebar-close" aria-label="Close navigation menu" onClick={() => setMobileMenuOpen(false)}><X size={20} /></button>
       <Navigation items={visibleNavItems} activeNav={currentNav} onNavigate={navigate} onLogout={handleLogout} user={{ ...user, name }} initials={initials} expanded mobile />
     </aside>
-    <main className="workspace-main"><header className="workspace-topbar"><div className="topbar-leading"><button type="button" className="mobile-menu-button" aria-label="Open navigation menu" aria-controls="mobile-navigation" aria-expanded={mobileMenuOpen} onClick={() => setMobileMenuOpen(true)}><Menu size={20} /></button><div className="breadcrumb"><span>Workspace</span><span className="breadcrumb-slash">/</span><strong>{activeLabel}</strong></div></div><div className="topbar-actions"><button className="icon-button" aria-label="Notifications"><Bell size={18} /><span className="notification-dot" /></button><div className="topbar-user"><span className="avatar">{initials}</span><span>{name}</span><ChevronDown size={15} /></div></div></header><div className="workspace-content" ref={workspaceContentRef}>{!authorizedNav ? <div className="empty-state-panel"><h2>No workspace sections available</h2><p>Your account does not have access to any workspace sections.</p></div> : currentNav === "sources" ? <UploadStep onOpenPackages={() => navigate("packages")} /> : currentNav === "packages" ? <PackagesPage onOpenBusinessRequirements={() => navigate("business-requirements")} /> : currentNav === "business-requirements" ? <BusinessRequirementsPage onContinueToFunctional={() => navigate("requirements")} /> : currentNav === "traceability" ? <TraceabilityPage /> : currentNav === "requirements" ? <RequirementsPage onContinueToGeneration={openTestCaseGeneration} onOpenBusinessRequirements={() => navigate("business-requirements")} /> : currentNav === "test-cases" ? <TestCaseGenerationPage analysis={currentGenerationAnalysis} onBack={() => setActiveNav("requirements")} onContinueToTestData={() => setActiveNav("test-data")} onReviewSaved={() => { toast.success("Test case review saved."); setActiveNav("test-data"); }} /> : currentNav === "test-data" ? <TestDataGenerationPage analysis={currentGenerationAnalysis} onGoToTestCases={() => setActiveNav("test-cases")} /> : currentNav === "test-results" ? <TestResultsPage /> : <div className="empty-state-panel"><div className="empty-state-icon"><Activity size={25} /></div><h2>{currentNav === "overview" ? "Your workspace at a glance" : "Workspace activity"}</h2><p>This view is ready for the next stage of your source-to-test-data workflow. Manage source packages from the sidebar.</p><button className="primary-button" onClick={() => navigate("sources")}>Open sources</button></div>}</div></main>
+    <main className="workspace-main"><header className="workspace-topbar"><div className="topbar-leading"><button type="button" className="mobile-menu-button" aria-label="Open navigation menu" aria-controls="mobile-navigation" aria-expanded={mobileMenuOpen} onClick={() => setMobileMenuOpen(true)}><Menu size={20} /></button><div className="breadcrumb"><span>Workspace</span><span className="breadcrumb-slash">/</span><strong>{activeLabel}</strong></div></div><div className="topbar-actions"><button className="icon-button" aria-label="Notifications"><Bell size={18} /><span className="notification-dot" /></button><div className="topbar-user"><span className="avatar">{initials}</span><span>{name}</span><ChevronDown size={15} /></div></div></header><div className="workspace-content" ref={workspaceContentRef}>{!authorizedNav ? <div className="empty-state-panel"><h2>No workspace sections available</h2><p>Your account does not have access to any workspace sections.</p></div> : currentNav === "sources" ? <UploadStep onContinueToBusinessUseCases={() => navigate("business-requirements")} /> : currentNav === "packages" ? <PackagesPage onOpenBusinessRequirements={() => navigate("business-requirements")} /> : currentNav === "business-requirements" ? <BusinessRequirementsPage onContinueToFunctional={() => navigate("requirements")} /> : currentNav === "traceability" ? <TraceabilityPage /> : currentNav === "knowledge-base" ? <KnowledgeBasePage onContinueToBusinessRequirements={() => navigate("business-requirements")} /> : currentNav === "requirements" ? <RequirementsPage onContinueToGeneration={openTestCaseGeneration} onOpenBusinessRequirements={() => navigate("business-requirements")} /> : currentNav === "test-cases" ? <TestCaseGenerationPage analysis={currentGenerationAnalysis} onBack={() => setActiveNav("requirements")} onContinueToTestData={() => setActiveNav("test-data")} onReviewSaved={() => { toast.success("Test case review saved."); setActiveNav("test-data"); }} onAnalysisUnavailable={clearGenerationAnalysis} /> : currentNav === "test-data" ? <TestDataGenerationPage analysis={currentGenerationAnalysis} onGoToTestCases={() => setActiveNav("test-cases")} /> : currentNav === "test-results" ? <TestResultsPage /> : <div className="empty-state-panel"><div className="empty-state-icon"><Activity size={25} /></div><h2>{currentNav === "overview" ? "Your workspace at a glance" : "Workspace activity"}</h2><p>This view is ready for the next stage of your source-to-test-data workflow. Manage source packages from the sidebar.</p><button className="primary-button" onClick={() => navigate("sources")}>Open sources</button></div>}</div></main>
   </div></>;
 }
