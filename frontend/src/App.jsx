@@ -119,7 +119,7 @@ export default function App() {
     </aside>
     <button type="button" className="sidebar-edge-toggle" aria-label={sidebarExpanded ? "Collapse sidebar" : "Expand sidebar"} aria-expanded={sidebarExpanded} onClick={() => setSidebarExpanded((expanded) => !expanded)}>{sidebarExpanded ? <ChevronLeft size={17} /> : <ChevronRight size={17} />}</button>
     <div className={`mobile-sidebar-backdrop ${mobileMenuOpen ? "is-visible" : ""}`} aria-hidden="true" onClick={() => setMobileMenuOpen(false)} />
-    <aside id="mobile-navigation" className={`workspace-sidebar mobile-sidebar ${mobileMenuOpen ? "is-open" : ""}`} aria-label="Mobile navigation" aria-hidden={!mobileMenuOpen} inert={!mobileMenuOpen}>
+    <aside id="mobile-navigation" className={`workspace-sidebar mobile-sidebar ${mobileMenuOpen ? "is-open" : ""}`} aria-label="Mobile navigation" aria-hidden={!mobileMenuOpen} {...(!mobileMenuOpen ? { inert: "" } : {})}>
       <button type="button" className="mobile-sidebar-close" aria-label="Close navigation menu" onClick={() => setMobileMenuOpen(false)}><X size={20} /></button>
       <Navigation items={visibleNavItems} activeNav={currentNav} onNavigate={navigate} onLogout={handleLogout} user={{ ...user, name }} initials={initials} expanded mobile />
     </aside>
