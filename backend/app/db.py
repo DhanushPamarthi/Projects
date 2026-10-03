@@ -191,6 +191,37 @@ CREATE TABLE IF NOT EXISTS testiq.test_data_record (
   updated_at TEXT NOT NULL,
   UNIQUE(generation_id, test_case_id, template_id)
 );
+CREATE TABLE IF NOT EXISTS testiq.test_data_bronze_ref (
+  bronze_ref_id TEXT PRIMARY KEY,
+  record_id TEXT NOT NULL REFERENCES testiq.test_data_record(record_id),
+  generation_id TEXT NOT NULL REFERENCES testiq.test_case_generation(generation_id),
+  test_case_id TEXT NOT NULL,
+  bronze_schema TEXT NOT NULL,
+  bronze_table TEXT NOT NULL,
+  bronze_id TEXT NOT NULL,
+  bronze_load_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(record_id, bronze_schema, bronze_table, bronze_id)
+);
+CREATE INDEX IF NOT EXISTS testiq_test_data_bronze_ref_record_idx ON testiq.test_data_bronze_ref(record_id);
+CREATE INDEX IF NOT EXISTS testiq_test_data_bronze_ref_case_idx ON testiq.test_data_bronze_ref(generation_id,test_case_id);
+CREATE TABLE IF NOT EXISTS testiq.test_execution_result (
+  result_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES testiq.test_run(run_id),
+  generation_id TEXT NOT NULL REFERENCES testiq.test_case_generation(generation_id),
+  test_case_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  expected_json TEXT NOT NULL,
+  actual_json TEXT NOT NULL,
+  assertions_json TEXT NOT NULL,
+  bronze_refs_json TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  completed_at TEXT NOT NULL,
+  error TEXT,
+  UNIQUE(run_id, test_case_id)
+);
+CREATE INDEX IF NOT EXISTS testiq_test_execution_result_run_idx ON testiq.test_execution_result(run_id);
+CREATE INDEX IF NOT EXISTS testiq_test_execution_result_case_idx ON testiq.test_execution_result(generation_id,test_case_id);
 CREATE TABLE IF NOT EXISTS testiq.knowledge_index (
   index_id TEXT PRIMARY KEY, package_id TEXT NOT NULL REFERENCES testiq.source_package_manifest(package_id),
   project_id TEXT NOT NULL REFERENCES testiq.project(project_id), manifest_hash TEXT NOT NULL,
@@ -306,6 +337,12 @@ MIGRATIONS = [
     "ALTER TABLE knowledge_index ADD COLUMN progress_percent INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE knowledge_index ADD COLUMN progress_stage TEXT NOT NULL DEFAULT 'pending'",
     "ALTER TABLE knowledge_index ADD COLUMN progress_message TEXT",
+    "CREATE TABLE IF NOT EXISTS test_data_bronze_ref (bronze_ref_id TEXT PRIMARY KEY, record_id TEXT NOT NULL REFERENCES test_data_record(record_id), generation_id TEXT NOT NULL REFERENCES test_case_generation(generation_id), test_case_id TEXT NOT NULL, bronze_schema TEXT NOT NULL, bronze_table TEXT NOT NULL, bronze_id TEXT NOT NULL, bronze_load_id TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(record_id, bronze_schema, bronze_table, bronze_id))",
+    "CREATE INDEX IF NOT EXISTS testiq_test_data_bronze_ref_record_idx ON test_data_bronze_ref(record_id)",
+    "CREATE INDEX IF NOT EXISTS testiq_test_data_bronze_ref_case_idx ON test_data_bronze_ref(generation_id,test_case_id)",
+    "CREATE TABLE IF NOT EXISTS test_execution_result (result_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES test_run(run_id), generation_id TEXT NOT NULL REFERENCES test_case_generation(generation_id), test_case_id TEXT NOT NULL, status TEXT NOT NULL, expected_json TEXT NOT NULL, actual_json TEXT NOT NULL, assertions_json TEXT NOT NULL, bronze_refs_json TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT NOT NULL, error TEXT, UNIQUE(run_id, test_case_id))",
+    "CREATE INDEX IF NOT EXISTS testiq_test_execution_result_run_idx ON test_execution_result(run_id)",
+    "CREATE INDEX IF NOT EXISTS testiq_test_execution_result_case_idx ON test_execution_result(generation_id,test_case_id)",
 ]
 
 class _SQLiteConnection:

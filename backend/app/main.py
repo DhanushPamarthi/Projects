@@ -345,6 +345,10 @@ class ExecutionRunLifecycleRequest(BaseModel):
     comments: str | None = Field(default=None, max_length=4000)
     error: str | None = Field(default=None, max_length=4000)
 
+class ExecutionRunExecuteRequest(BaseModel):
+    reviewer: str | None = Field(default=None, max_length=200)
+    comments: str | None = Field(default=None, max_length=4000)
+
 class TestDataTemplateDefinition(BaseModel):
     template_id: str = Field(min_length=1, max_length=100)
     template_name: str = Field(min_length=1, max_length=200)
@@ -1492,7 +1496,32 @@ def _apply_coverage_and_quality_review(contract, approved_requirements, timestam
     contract["coverage_review"] = coverage_review
     return contract
 
-def _test_run_response(row):
+def _test_execution_result_response(row):
+    result = row_dict(row)
+    if not result:
+        return None
+    for key in ("expected_json", "actual_json", "assertions_json", "bronze_refs_json"):
+        value = result.pop(key, None)
+        result[key[:-5]] = json.loads(value or ("[]" if key in {"assertions_json", "bronze_refs_json"} else "{}"))
+    return result
+
+def _execution_results_for_run(conn, run_id: str):
+    rows = conn.execute("SELECT * FROM test_execution_result WHERE run_id=%s ORDER BY test_case_id", (run_id,)).fetchall()
+    return [_test_execution_result_response(row) for row in rows]
+
+def _execution_summary(results):
+    total = len(results)
+    passed = sum(1 for item in results if item.get("status") == "passed")
+    failed = sum(1 for item in results if item.get("status") == "failed")
+    if not total:
+        status = "not_executed"
+    elif failed:
+        status = "fail"
+    else:
+        status = "pass"
+    return {"total": total, "passed": passed, "failed": failed, "status": status}
+
+def _test_run_response(row, conn=None):
     result = row_dict(row)
     if not result:
         return None
@@ -1500,6 +1529,9 @@ def _test_run_response(row):
     for key in ("selected_test_case_ids_json", "frozen_contract_json", "immutable_observations_json"):
         value = result.pop(key, None)
         result[key[:-5]] = json.loads(value or ("{}" if key == "frozen_contract_json" else "[]"))
+    results = _execution_results_for_run(conn, result["run_id"]) if conn else []
+    result["execution_results"] = results
+    result["execution_summary"] = _execution_summary(results)
     return result
 
 def _test_case_generation_response(row):
@@ -2678,7 +2710,7 @@ def create_execution_run(generation_id: str, request: ExecutionRunRequest):
         }
         observations = [{"type": "baseline_frozen", "message": "Approved test cases were selected and frozen for an execution run.", "created_at": timestamp}]
         conn.execute("INSERT INTO test_run (run_id,package_id,project_id,status,configuration_snapshot,generation_id,selected_test_case_ids_json,frozen_contract_json,baseline_hash,reviewer,review_comments,lifecycle_state,approved_at,immutable_observations_json,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (run_id, row["package_id"], row["project_id"], "selected", json.dumps(configuration_snapshot), generation_id, json.dumps(request.selected_test_case_ids), json.dumps(frozen_contract), baseline_hash, request.reviewer, request.comments, "selected", timestamp, json.dumps(observations), timestamp))
-        return _test_run_response(conn.execute("SELECT * FROM test_run WHERE run_id=%s", (run_id,)).fetchone())
+        return _test_run_response(conn.execute("SELECT * FROM test_run WHERE run_id=%s", (run_id,)).fetchone(), conn)
 
 @app.get("/api/v1/test-case-generations/{generation_id}/execution-runs")
 def list_execution_runs_for_generation(generation_id: str):
@@ -2686,7 +2718,57 @@ def list_execution_runs_for_generation(generation_id: str):
         if not conn.execute("SELECT generation_id FROM test_case_generation WHERE generation_id=%s", (generation_id,)).fetchone():
             raise HTTPException(404, "Test-case generation run not found")
         rows = conn.execute("SELECT * FROM test_run WHERE generation_id=%s ORDER BY created_at DESC", (generation_id,)).fetchall()
-        return [_test_run_response(row) for row in rows]
+        return [_test_run_response(row, conn) for row in rows]
+
+@app.post("/api/v1/execution-runs/{run_id}/execute")
+def execute_run(run_id: str, request: ExecutionRunExecuteRequest | None = None):
+    if not DATABASE_URL:
+        raise HTTPException(503, f"Execution requires PostgreSQL and the {BRONZE_SCHEMA} schema")
+    with connection() as conn:
+        row = conn.execute("SELECT * FROM test_run WHERE run_id=%s", (run_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Execution run not found")
+        current_state = str(row["lifecycle_state"] or row["status"] or "selected").lower()
+        if current_state == "cancelled":
+            raise HTTPException(409, "Execution run is cancelled")
+
+        started_at = now()
+        selected_case_ids = json.loads(row["selected_test_case_ids_json"] or "[]")
+        if not selected_case_ids:
+            raise HTTPException(422, "Execution baseline has no selected test cases")
+
+        observations = json.loads(row["immutable_observations_json"] or "[]")
+        reviewer = request.reviewer if request else None
+        comments = request.comments if request else None
+        observations.append({
+            "type": "execution_started",
+            "message": "Execution started by validating saved Bronze data for each selected test case.",
+            "created_at": started_at,
+            "reviewer": reviewer or row["reviewer"],
+            "comments": comments,
+        })
+        conn.execute(
+            "UPDATE test_run SET status=%s,lifecycle_state=%s,started_at=%s,error=%s,immutable_observations_json=%s WHERE run_id=%s",
+            ("running", "running", started_at, None, json.dumps(observations), run_id),
+        )
+
+        statuses = [_execute_case_against_bronze(conn, run_id, row["generation_id"], test_case_id, started_at) for test_case_id in selected_case_ids]
+        completed_at = now()
+        passed = sum(status == "passed" for status in statuses)
+        failed = sum(status == "failed" for status in statuses)
+        message = f"Execution completed with {passed} passed and {failed} failed test case(s)."
+        observations.append({
+            "type": "execution_completed",
+            "message": message,
+            "created_at": completed_at,
+            "reviewer": reviewer or row["reviewer"],
+            "comments": comments,
+        })
+        conn.execute(
+            "UPDATE test_run SET status=%s,lifecycle_state=%s,completed_at=%s,error=%s,immutable_observations_json=%s WHERE run_id=%s",
+            ("completed", "completed", completed_at, None if failed == 0 else message, json.dumps(observations), run_id),
+        )
+        return _test_run_response(conn.execute("SELECT * FROM test_run WHERE run_id=%s", (run_id,)).fetchone(), conn)
 
 @app.patch("/api/v1/execution-runs/{run_id}/lifecycle")
 def update_execution_run_lifecycle(run_id: str, request: ExecutionRunLifecycleRequest):
@@ -2728,7 +2810,7 @@ def update_execution_run_lifecycle(run_id: str, request: ExecutionRunLifecycleRe
             "UPDATE test_run SET status=%s,lifecycle_state=%s,cancelled_at=%s,completed_at=%s,error=%s,immutable_observations_json=%s WHERE run_id=%s",
             (status, lifecycle_state, cancelled_at, completed_at, error, json.dumps(observations), run_id),
         )
-        return _test_run_response(conn.execute("SELECT * FROM test_run WHERE run_id=%s", (run_id,)).fetchone())
+        return _test_run_response(conn.execute("SELECT * FROM test_run WHERE run_id=%s", (run_id,)).fetchone(), conn)
 
 def _unique_test_value(key, template_id, test_case_id, ordinal=0):
     suffix = hashlib.sha256(f"{template_id}:{test_case_id}:{ordinal}".encode("utf-8")).hexdigest()[:10].upper()
@@ -3621,6 +3703,183 @@ def _insert_bronze_domain_row(conn, table, load_id, data):
     bronze_row = conn.execute(statement, (load_id, Jsonb(data))).fetchone()
     return {"table": table, "id": str(bronze_row["id"])}
 
+def _bronze_ref_id(record_id: str, bronze_schema: str, bronze_table: str, bronze_id: str) -> str:
+    digest = hashlib.sha256(f"{record_id}:{bronze_schema}:{bronze_table}:{bronze_id}".encode("utf-8")).hexdigest()[:24]
+    return f"bref_{digest}"
+
+def _record_bronze_refs(conn, row, bronze_refs, load_id: str) -> None:
+    timestamp = now()
+    for ref in bronze_refs:
+        bronze_table = ref["table"]
+        bronze_id = str(ref["id"])
+        conn.execute(
+            "INSERT INTO test_data_bronze_ref (bronze_ref_id,record_id,generation_id,test_case_id,bronze_schema,bronze_table,bronze_id,bronze_load_id,created_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (record_id, bronze_schema, bronze_table, bronze_id) DO NOTHING",
+            (_bronze_ref_id(row["record_id"], BRONZE_SCHEMA, bronze_table, bronze_id), row["record_id"], row["generation_id"], row["test_case_id"], BRONZE_SCHEMA, bronze_table, bronze_id, load_id, timestamp),
+        )
+
+def _parse_legacy_bronze_refs(row):
+    refs = []
+    for item in str(row.get("bronze_raw_file_id") or "").split(","):
+        if ":" not in item:
+            continue
+        table, bronze_id = [part.strip() for part in item.split(":", 1)]
+        if table in _BRONZE_TABLES and bronze_id:
+            refs.append({
+                "bronze_ref_id": _bronze_ref_id(row["record_id"], BRONZE_SCHEMA, table, bronze_id),
+                "record_id": row["record_id"],
+                "generation_id": row["generation_id"],
+                "test_case_id": row["test_case_id"],
+                "bronze_schema": BRONZE_SCHEMA,
+                "bronze_table": table,
+                "bronze_id": bronze_id,
+                "bronze_load_id": f"testiq-{row['generation_id']}",
+                "created_at": row.get("updated_at") or row.get("created_at") or now(),
+            })
+    return refs
+
+def _bronze_refs_for_record(conn, row):
+    refs = [row_dict(item) for item in conn.execute(
+        "SELECT * FROM test_data_bronze_ref WHERE record_id=%s ORDER BY bronze_table,bronze_id",
+        (row["record_id"],),
+    ).fetchall()]
+    if refs:
+        return refs
+    refs = _parse_legacy_bronze_refs(row_dict(row))
+    for ref in refs:
+        conn.execute(
+            "INSERT INTO test_data_bronze_ref (bronze_ref_id,record_id,generation_id,test_case_id,bronze_schema,bronze_table,bronze_id,bronze_load_id,created_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (record_id, bronze_schema, bronze_table, bronze_id) DO NOTHING",
+            (ref["bronze_ref_id"], ref["record_id"], ref["generation_id"], ref["test_case_id"], ref["bronze_schema"], ref["bronze_table"], ref["bronze_id"], ref["bronze_load_id"], ref["created_at"]),
+        )
+    return refs
+
+def _fetch_bronze_domain_row(conn, table: str, bronze_id: str):
+    if table not in _BRONZE_TABLES:
+        return None
+    from psycopg import sql
+    identifier = int(bronze_id) if str(bronze_id).isdigit() else bronze_id
+    statement = sql.SQL("SELECT id, load_id, created_time, data FROM {} WHERE id=%s").format(sql.Identifier(BRONZE_SCHEMA, table))
+    row = conn.execute(statement, (identifier,)).fetchone()
+    if not row:
+        return None
+    item = row_dict(row)
+    item["id"] = str(item["id"])
+    return item
+
+def _add_assertion(assertions, name: str, passed: bool, expected=None, actual=None, message: str | None = None) -> None:
+    assertions.append({
+        "name": name,
+        "status": "passed" if passed else "failed",
+        "expected": expected,
+        "actual": actual,
+        "message": message or ("Matched expected value." if passed else "Value did not match expected data."),
+    })
+
+def _first_actual(actual_by_table, table: str):
+    rows = actual_by_table.get(table) or []
+    return rows[0]["data"] if rows else None
+
+def _assert_equal_if_present(assertions, name: str, expected, actual):
+    if expected is None:
+        return
+    _add_assertion(assertions, name, expected == actual, expected, actual)
+
+def _evaluate_record_payload(payload, actual_by_table, assertions):
+    member = payload.get("member") or payload.get("membership") or {}
+    decision = payload.get("eligibility_decision") or {}
+    prescription = payload.get("prescription") or {}
+    communication = payload.get("communication") or {}
+    campaign = payload.get("campaign") or {}
+    expected_outcome = payload.get("expected_outcome") or {}
+
+    membership = _first_actual(actual_by_table, "membership")
+    if member or decision:
+        _add_assertion(assertions, "membership row exists", bool(membership), "membership row", "found" if membership else "missing")
+    if membership:
+        _assert_equal_if_present(assertions, "member_id stored in Bronze", member.get("member_id") or decision.get("member_id") or communication.get("member_id"), membership.get("member_id"))
+        _assert_equal_if_present(assertions, "member status stored in Bronze", member.get("member_status") or member.get("status") or decision.get("eligibility_status"), membership.get("status"))
+        _assert_equal_if_present(assertions, "eligibility status stored in Bronze", member.get("eligibility_status") or decision.get("eligibility_status"), membership.get("eligibility_status"))
+        if expected_outcome.get("should_identify_member") is not None:
+            _add_assertion(assertions, "member can be identified", bool(membership.get("member_id")) == bool(expected_outcome.get("should_identify_member")), expected_outcome.get("should_identify_member"), bool(membership.get("member_id")))
+
+    prescription_row = _first_actual(actual_by_table, "prescription")
+    if prescription:
+        _add_assertion(assertions, "prescription row exists", bool(prescription_row), "prescription row", "found" if prescription_row else "missing")
+    if prescription_row:
+        _assert_equal_if_present(assertions, "prescription_id stored in Bronze", prescription.get("prescription_id"), prescription_row.get("prescription_id"))
+        _assert_equal_if_present(assertions, "prescription member_id stored in Bronze", prescription.get("member_id") or member.get("member_id"), prescription_row.get("member_id"))
+        _assert_equal_if_present(assertions, "refill eligibility stored in Bronze", prescription.get("refill_eligible"), prescription_row.get("eligible_ind"))
+        _assert_equal_if_present(assertions, "refill status stored in Bronze", prescription.get("refill_status"), prescription_row.get("refill_status"))
+
+    order_row = _first_actual(actual_by_table, "order")
+    if communication or campaign:
+        _add_assertion(assertions, "communication or campaign row exists", bool(order_row), "order row", "found" if order_row else "missing")
+    if order_row:
+        _assert_equal_if_present(assertions, "communication member_id stored in Bronze", communication.get("member_id") or member.get("member_id"), order_row.get("member_id"))
+        _assert_equal_if_present(assertions, "primary channel stored in Bronze", communication.get("primary_channel"), order_row.get("primary_channel"))
+        _assert_equal_if_present(assertions, "SMS status stored in Bronze", communication.get("sms_delivery_status"), order_row.get("sms_delivery_status"))
+        _assert_equal_if_present(assertions, "phone fallback flag stored in Bronze", communication.get("phone_call_required"), order_row.get("phone_call_required"))
+        _assert_equal_if_present(assertions, "campaign_id stored in Bronze", campaign.get("campaign_id"), order_row.get("campaign_id"))
+        _assert_equal_if_present(assertions, "suppression flag stored in Bronze", campaign.get("suppress_communication"), order_row.get("suppress_communication"))
+        if expected_outcome.get("should_send_sms") is not None:
+            _add_assertion(assertions, "SMS expectation matches setup", (order_row.get("primary_channel") == "SMS") == bool(expected_outcome.get("should_send_sms")), expected_outcome.get("should_send_sms"), order_row.get("primary_channel") == "SMS")
+        if expected_outcome.get("should_trigger_phone_call") is not None:
+            _add_assertion(assertions, "phone fallback expectation matches setup", bool(order_row.get("phone_call_required")) == bool(expected_outcome.get("should_trigger_phone_call")), expected_outcome.get("should_trigger_phone_call"), bool(order_row.get("phone_call_required")))
+        if expected_outcome.get("should_suppress_communication") is not None and order_row.get("suppress_communication") is not None:
+            _add_assertion(assertions, "suppression expectation matches setup", bool(order_row.get("suppress_communication")) == bool(expected_outcome.get("should_suppress_communication")), expected_outcome.get("should_suppress_communication"), bool(order_row.get("suppress_communication")))
+
+def _execute_case_against_bronze(conn, run_id: str, generation_id: str, test_case_id: str, started_at: str):
+    rows = conn.execute(
+        "SELECT * FROM test_data_record WHERE generation_id=%s AND test_case_id=%s AND status='saved' ORDER BY entity_name,record_id",
+        (generation_id, test_case_id),
+    ).fetchall()
+    assertions = []
+    expected_records = []
+    actual_records = []
+    all_refs = []
+    if not rows:
+        _add_assertion(assertions, "saved test data exists", False, "saved test data", "none")
+    for row in rows:
+        payload = json.loads(row["payload_json"])
+        refs = _bronze_refs_for_record(conn, row)
+        serializable_refs = [{key: ref[key] for key in ("bronze_ref_id", "record_id", "bronze_schema", "bronze_table", "bronze_id", "bronze_load_id", "created_at") if key in ref} for ref in refs]
+        all_refs.extend(serializable_refs)
+        _add_assertion(assertions, f"{row['record_id']} has Bronze reference", bool(refs), "at least one Bronze reference", f"{len(refs)} reference(s)")
+        actual_by_table = {}
+        for ref in refs:
+            bronze_row = _fetch_bronze_domain_row(conn, ref["bronze_table"], ref["bronze_id"])
+            _add_assertion(assertions, f"{ref['bronze_table']}:{ref['bronze_id']} exists", bool(bronze_row), "Bronze row", "found" if bronze_row else "missing")
+            if bronze_row:
+                actual_item = {
+                    "record_id": row["record_id"],
+                    "bronze_table": ref["bronze_table"],
+                    "bronze_id": ref["bronze_id"],
+                    "load_id": bronze_row.get("load_id"),
+                    "data": bronze_row.get("data") or {},
+                }
+                actual_records.append(actual_item)
+                actual_by_table.setdefault(ref["bronze_table"], []).append(actual_item)
+        _evaluate_record_payload(payload, actual_by_table, assertions)
+        expected_records.append({
+            "record_id": row["record_id"],
+            "entity_name": row["entity_name"],
+            "payload": payload,
+            "pre_steps": json.loads(row["pre_steps_json"] or "[]"),
+        })
+    completed_at = now()
+    failed = [item for item in assertions if item["status"] == "failed"]
+    status = "failed" if failed else "passed"
+    error = "; ".join(item["name"] for item in failed[:5]) if failed else None
+    result_id = "xres_" + hashlib.sha256(f"{run_id}:{test_case_id}".encode("utf-8")).hexdigest()[:24]
+    conn.execute(
+        "INSERT INTO test_execution_result (result_id,run_id,generation_id,test_case_id,status,expected_json,actual_json,assertions_json,bronze_refs_json,started_at,completed_at,error) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+        "ON CONFLICT (run_id, test_case_id) DO UPDATE SET status=EXCLUDED.status,expected_json=EXCLUDED.expected_json,actual_json=EXCLUDED.actual_json,assertions_json=EXCLUDED.assertions_json,bronze_refs_json=EXCLUDED.bronze_refs_json,started_at=EXCLUDED.started_at,completed_at=EXCLUDED.completed_at,error=EXCLUDED.error",
+        (result_id, run_id, generation_id, test_case_id, status, json.dumps({"records": expected_records}, sort_keys=True), json.dumps({"bronze_rows": actual_records}, sort_keys=True), json.dumps(assertions, sort_keys=True), json.dumps(all_refs, sort_keys=True), started_at, completed_at, error),
+    )
+    return status
+
 @app.post("/api/v1/test-case-generations/{generation_id}/test-data/save")
 def save_test_data_to_bronze(generation_id: str):
     if not DATABASE_URL:
@@ -3641,6 +3900,7 @@ def save_test_data_to_bronze(generation_id: str):
             try:
                 load_id = f"testiq-{generation_id}"
                 bronze_refs = [_insert_bronze_domain_row(conn, table, load_id, data) for table, data in bronze_rows]
+                _record_bronze_refs(conn, row, bronze_refs, load_id)
             except Exception as exc:
                 raise HTTPException(503, f"Could not insert into {BRONZE_SCHEMA} Bronze tables: {exc}") from exc
             bronze_ref_text = ",".join(f"{item['table']}:{item['id']}" for item in bronze_refs)
