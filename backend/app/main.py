@@ -5,7 +5,7 @@ from pathlib import Path
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
-from .config import DATABASE_URL, EXTRACTION_CONFIG_VERSION, EXTRACTION_PROMPT_VERSION, LOCAL_EXTRACTOR_VERSION, MAX_UPLOAD_BYTES, OPENAI_MODEL, OPENAI_TIMEOUT_SECONDS, REQUIRED_BRD_SECTIONS, REQUIREMENTS_ANALYSIS_PROMPT_VERSION, SUPPORTED_EXTENSIONS, TEST_CASE_GENERATION_PROMPT_VERSION, UPLOAD_DIR
+from .config import BRONZE_SCHEMA, DATABASE_URL, EXTRACTION_CONFIG_VERSION, EXTRACTION_PROMPT_VERSION, LOCAL_EXTRACTOR_VERSION, MAX_UPLOAD_BYTES, OPENAI_MODEL, OPENAI_TIMEOUT_SECONDS, REQUIRED_BRD_SECTIONS, REQUIREMENTS_ANALYSIS_PROMPT_VERSION, SUPPORTED_EXTENSIONS, TEST_CASE_GENERATION_PROMPT_VERSION, UPLOAD_DIR
 from .db import connection, init_db
 from .extractors import extract_local, extract_openai, extraction_prompt_hash, missing_sections
 from .validation import validate_file_content
@@ -3134,6 +3134,18 @@ def _required_test_data_sections(test_case):
         sections.add("communication")
     return sections
 
+def _primary_test_data_entity(required_sections, test_case):
+    text = _test_case_text(test_case).lower()
+    if "communication" in required_sections and any(term in text for term in ("sms", "phone", "call", "message", "communication", "delivery")):
+        return "communication"
+    if "eligibility_decision" in required_sections:
+        return "eligibility_decision"
+    if "prescription" in required_sections:
+        return "prescription"
+    if "campaign" in required_sections:
+        return "campaign"
+    return "member"
+
 def _scenario_test_data_payload(test_case, rag_context):
     profile = _scenario_profile_for_case(test_case)
     sections = _required_test_data_sections(test_case)
@@ -3259,7 +3271,7 @@ def _expand_test_data_templates_for_cases(case_ids, cases, templates_by_case, ra
         expanded[case_id] = [{
             "template_id": f"kb_case_dataset_{safe_case_id}",
             "template_name": "Knowledge Base Test Data",
-            "entity_name": "test_data",
+            "entity_name": _primary_test_data_entity(required_sections, case),
             "payload_json": json.dumps(payload, sort_keys=True),
         }]
     return expanded
@@ -3498,10 +3510,121 @@ def review_test_data(generation_id: str, request: TestDataReviewRequest):
         saved_rows = conn.execute("SELECT r.* FROM test_data_record r WHERE r.generation_id=%s ORDER BY r.test_case_id,r.entity_name", (generation_id,)).fetchall()
         return [_test_data_record_response(row) for row in saved_rows]
 
+_BRONZE_TABLES = {"membership", "prescription", "order", "claim", "benefit", "drug", "medical_claim", "product"}
+
+def _bronze_trace_fields(row):
+    return {
+        "source_event_id": f"testiq-{row['record_id']}",
+        "source_correlation_id": f"testiq-{row['generation_id']}-{row['test_case_id']}",
+        "testiq_record_id": row["record_id"],
+        "testiq_generation_id": row["generation_id"],
+        "testiq_test_case_id": row["test_case_id"],
+    }
+
+def _bronze_member_data(payload, row):
+    member = payload.get("member") or payload.get("membership") or {}
+    decision = payload.get("eligibility_decision") or {}
+    communication = payload.get("communication") or {}
+    member_id = member.get("member_id") or decision.get("member_id") or communication.get("member_id")
+    phone_number = member.get("phone_number") or member.get("phone") or communication.get("phone_number")
+    sms_enabled = member.get("sms_opt_in")
+    if sms_enabled is None:
+        sms_enabled = communication.get("primary_channel") == "SMS"
+    data = {
+        **_bronze_trace_fields(row),
+        "member_id": member_id,
+        "subscriber_id": member.get("subscriber_id") or member_id,
+        "first_name": member.get("first_name"),
+        "last_name": member.get("last_name"),
+        "status": member.get("member_status") or member.get("status") or decision.get("eligibility_status"),
+        "preferred_language": member.get("preferred_language"),
+        "eligibility_status": member.get("eligibility_status") or decision.get("eligibility_status"),
+        "eligibility_decision": decision or None,
+        "phones": [{"phone_type": "MOBILE", "phone_number": phone_number, "is_primary": True}] if phone_number else [],
+        "emails": [],
+        "addresses": [],
+        "payment_methods": [],
+        "communication_preferences": [{
+            "channel": "SMS",
+            "value": phone_number,
+            "enabled": bool(sms_enabled),
+            "language": member.get("preferred_language"),
+            "preference_type": "PRIMARY",
+            "address_reference": None,
+        }] if phone_number else [],
+    }
+    return {key: value for key, value in data.items() if value is not None}
+
+def _bronze_prescription_data(payload, row):
+    prescription = payload.get("prescription") or {}
+    data = {
+        **_bronze_trace_fields(row),
+        "prescription_id": prescription.get("prescription_id"),
+        "rx_number": prescription.get("rx_number") or prescription.get("prescription_id"),
+        "member_id": prescription.get("member_id") or (payload.get("member") or {}).get("member_id"),
+        "status": prescription.get("prescription_status") or prescription.get("status"),
+        "refill_status": prescription.get("refill_status"),
+        "next_refill_date": prescription.get("refill_due_date") or prescription.get("next_refill_date"),
+        "days_until_refill": prescription.get("days_until_refill"),
+        "eligible_ind": prescription.get("refill_eligible"),
+        "refills_remaining": prescription.get("refills_remaining"),
+        "refills_allowed": prescription.get("refills_allowed"),
+        "fill_method": prescription.get("fill_method") or "MANUAL",
+        "autofill_enrolled_ind": prescription.get("autofill_enrolled_ind", False),
+    }
+    return {key: value for key, value in data.items() if value is not None}
+
+def _bronze_order_data(payload, row):
+    communication = payload.get("communication") or {}
+    campaign = payload.get("campaign") or {}
+    member = payload.get("member") or {}
+    prescription = payload.get("prescription") or {}
+    data = {
+        **_bronze_trace_fields(row),
+        "order_id": communication.get("communication_id") or campaign.get("campaign_id") or f"ORDER-{row['record_id']}",
+        "member_id": communication.get("member_id") or member.get("member_id"),
+        "prescription_id": prescription.get("prescription_id"),
+        "campaign_id": campaign.get("campaign_id"),
+        "campaign_name": campaign.get("campaign_name"),
+        "trigger_reason": campaign.get("trigger_reason"),
+        "suppress_communication": campaign.get("suppress_communication"),
+        "primary_channel": communication.get("primary_channel"),
+        "message_template": communication.get("message_template"),
+        "sms_delivery_status": communication.get("sms_delivery_status"),
+        "phone_call_required": communication.get("phone_call_required"),
+        "phone_call_status": communication.get("phone_call_status"),
+        "status": communication.get("sms_delivery_status") or "PENDING",
+    }
+    return {key: value for key, value in data.items() if value is not None}
+
+def _bronze_rows_for_payload(payload, row):
+    rows = []
+    if payload.get("member") or payload.get("membership") or payload.get("eligibility_decision"):
+        rows.append(("membership", _bronze_member_data(payload, row)))
+    if payload.get("prescription"):
+        rows.append(("prescription", _bronze_prescription_data(payload, row)))
+    if payload.get("communication") or payload.get("campaign") or payload.get("order"):
+        rows.append(("order", _bronze_order_data(payload, row)))
+    entity_name = str(row["entity_name"] or "").lower()
+    if not rows and entity_name in _BRONZE_TABLES:
+        rows.append((entity_name, {**_bronze_trace_fields(row), **payload}))
+    return [(table, data) for table, data in rows if table in _BRONZE_TABLES and data]
+
+def _insert_bronze_domain_row(conn, table, load_id, data):
+    from psycopg import sql
+    from psycopg.types.json import Jsonb
+    sequence_name = f"{BRONZE_SCHEMA}.{table}_id_seq"
+    statement = sql.SQL("INSERT INTO {} (id, load_id, data) VALUES (nextval({}::regclass), %s, %s) RETURNING id").format(
+        sql.Identifier(BRONZE_SCHEMA, table),
+        sql.Literal(sequence_name),
+    )
+    bronze_row = conn.execute(statement, (load_id, Jsonb(data))).fetchone()
+    return {"table": table, "id": str(bronze_row["id"])}
+
 @app.post("/api/v1/test-case-generations/{generation_id}/test-data/save")
 def save_test_data_to_bronze(generation_id: str):
     if not DATABASE_URL:
-        raise HTTPException(503, "Bronze insertion requires the PostgreSQL DATABASE_URL and bronzebox.raw_file table")
+        raise HTTPException(503, f"Bronze insertion requires PostgreSQL and the {BRONZE_SCHEMA} schema")
     saved = []
     with connection() as conn:
         rows = conn.execute("SELECT * FROM test_data_record WHERE generation_id=%s ORDER BY test_case_id,entity_name", (generation_id,)).fetchall()
@@ -3512,17 +3635,16 @@ def save_test_data_to_bronze(generation_id: str):
                 saved.append(_test_data_record_response(row))
                 continue
             payload = json.loads(row["payload_json"])
-            raw_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-            digest = hashlib.sha256(raw_bytes).hexdigest()
-            filename = f"{row['test_case_id']}_{row['entity_name']}_{row['record_id']}.json"
-            source_uri = f"testiq://test-data/{row['record_id']}.json"
+            bronze_rows = _bronze_rows_for_payload(payload, row)
+            if not bronze_rows:
+                raise HTTPException(422, f"No supported Bronze records could be derived for {row['test_case_id']} / {row['entity_name']}")
             try:
-                from psycopg.types.json import Jsonb
-                bronze = conn.execute("INSERT INTO bronzebox.raw_file (source_uri,source_path,original_filename,file_size_bytes,sha256,raw_bytes,payload,status) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (sha256) DO UPDATE SET sha256=EXCLUDED.sha256 RETURNING raw_file_id", (source_uri, source_uri, filename, len(raw_bytes), digest, raw_bytes, Jsonb(payload), "BRONZE_LOADED")).fetchone()
+                load_id = f"testiq-{generation_id}"
+                bronze_refs = [_insert_bronze_domain_row(conn, table, load_id, data) for table, data in bronze_rows]
             except Exception as exc:
-                raise HTTPException(503, f"Could not insert into bronzebox.raw_file: {exc}") from exc
-            raw_file_id = str(bronze["raw_file_id"])
-            conn.execute("UPDATE test_data_record SET status='saved',bronze_raw_file_id=%s,updated_at=%s WHERE record_id=%s", (raw_file_id, now(), row["record_id"]))
+                raise HTTPException(503, f"Could not insert into {BRONZE_SCHEMA} Bronze tables: {exc}") from exc
+            bronze_ref_text = ",".join(f"{item['table']}:{item['id']}" for item in bronze_refs)
+            conn.execute("UPDATE test_data_record SET status='saved',bronze_raw_file_id=%s,updated_at=%s WHERE record_id=%s", (bronze_ref_text, now(), row["record_id"]))
             row = conn.execute("SELECT r.* FROM test_data_record r WHERE r.record_id=%s", (row["record_id"],)).fetchone()
             saved.append(_test_data_record_response(row))
         return {"generation_id": generation_id, "saved_count": len(saved), "records": saved}

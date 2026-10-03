@@ -1,11 +1,27 @@
 from pathlib import Path
 import os
+from urllib.parse import quote
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.getenv("TESTIQ_DATA_DIR", BASE_DIR / "data"))
 UPLOAD_DIR = DATA_DIR / "uploads"
 DB_PATH = Path(os.getenv("TESTIQ_DB_PATH", DATA_DIR / "testiq.db"))
-DATABASE_URL = os.getenv("DATABASE_URL")
+
+def _postgres_url_from_parts() -> str | None:
+    host = os.getenv("TESTIQ_POSTGRES_HOST")
+    if not host:
+        return None
+    user = quote(os.getenv("TESTIQ_POSTGRES_USER", "testiq"), safe="")
+    password = os.getenv("TESTIQ_POSTGRES_PASSWORD")
+    password_part = f":{quote(password, safe='')}" if password is not None else ""
+    port = os.getenv("TESTIQ_POSTGRES_PORT", "5432")
+    database = quote(os.getenv("TESTIQ_POSTGRES_DATABASE", "testiq"), safe="")
+    sslmode = os.getenv("TESTIQ_POSTGRES_SSLMODE")
+    query = f"?sslmode={quote(sslmode, safe='')}" if sslmode else ""
+    return f"postgresql://{user}{password_part}@{host}:{port}/{database}{query}"
+
+DATABASE_URL = os.getenv("DATABASE_URL") or _postgres_url_from_parts()
+BRONZE_SCHEMA = os.getenv("BRONZE_SCHEMA", "bronzebox")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_TIMEOUT_SECONDS = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "30"))
 OPENAI_EMBEDDING_DIMENSIONS = int(os.getenv("OPENAI_EMBEDDING_DIMENSIONS", "1536"))

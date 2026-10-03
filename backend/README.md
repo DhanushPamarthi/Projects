@@ -44,7 +44,13 @@ pip install -r requirements.txt
 Copy `.env.example` to `.env` and adjust the values:
 
 ```env
-DATABASE_URL=postgresql://testiq:testiq@127.0.0.1:5432/testiq
+# Shared PostgreSQL server.
+TESTIQ_POSTGRES_HOST=10.73.1.56
+TESTIQ_POSTGRES_PORT=5432
+TESTIQ_POSTGRES_DATABASE=testiq
+TESTIQ_POSTGRES_USER=testiqdev
+TESTIQ_POSTGRES_PASSWORD=
+# DATABASE_URL=postgresql://testiqdev:<password>@10.73.1.56:5432/testiq
 TESTIQ_DATA_DIR=./data
 TESTIQ_DB_PATH=./data/testiq.db
 OPENAI_API_KEY=
@@ -54,13 +60,12 @@ MAX_UPLOAD_BYTES=26214400
 # REQUIRED_BRD_SECTIONS=Scope,Requirements,Acceptance Criteria
 ```
 
-If `DATABASE_URL` is empty, the service uses local SQLite at `TESTIQ_DB_PATH`. The application creates the schema and tables at startup. Original uploads are stored under `TESTIQ_DATA_DIR/uploads`.
+`DATABASE_URL` overrides the individual `TESTIQ_POSTGRES_*` values. If neither `DATABASE_URL` nor `TESTIQ_POSTGRES_HOST` is set, the service uses local SQLite at `TESTIQ_DB_PATH`. The application creates the `testiq` schema tables at startup. Original uploads are stored under `TESTIQ_DATA_DIR/uploads`.
 
-For PostgreSQL, create the role and database once:
+The shared database already has the `testiq` database and `testiq` schema. To create or update the TestIQ control-plane tables in that schema without starting the API, run:
 
-```sql
-CREATE ROLE testiq LOGIN PASSWORD 'testiq';
-CREATE DATABASE testiq OWNER testiq;
+```powershell
+uv run python scripts/init_testiq_schema.py
 ```
 
 ## Run
@@ -80,7 +85,7 @@ Endpoints:
 Expected health response:
 
 ```json
-{"status":"ok","service":"source-package"}
+{ "status": "ok", "service": "source-package" }
 ```
 
 ## User workflow
@@ -96,28 +101,28 @@ Expected health response:
 
 ## API endpoints
 
-| Method | Endpoint | Purpose |
-|---|---|---|
-| GET | `/health` | Service health |
-| POST | `/api/v1/projects` | Create a project |
-| GET | `/api/v1/projects` | List projects |
-| GET | `/api/v1/projects/{project_id}` | Get project details |
-| POST | `/api/v1/projects/{project_id}/sources` | Upload a BRD or supporting source |
-| GET | `/api/v1/projects/{project_id}/sources` | List sources and extraction status |
-| GET | `/api/v1/revisions/{revision_id}` | Read extraction and fragments |
-| GET | `/api/v1/sources/{source_id}/revisions` | List all revisions for a logical source |
-| GET | `/api/v1/revisions/{revision_id}/compare/{other_revision_id}` | Compare two revisions with a unified diff |
-| POST | `/api/v1/sources/{source_id}/active-revision` | Select a successfully extracted active revision |
-| GET | `/api/v1/sources/{source_id}/parent-brd` | Find a supporting source's parent BRD |
-| POST | `/api/v1/projects/{project_id}/manifests` | Create an immutable source package |
-| GET | `/api/v1/projects/{project_id}/manifests` | List package versions |
-| GET | `/api/v1/manifests/{package_id}` | Read exact package revisions |
-| POST | `/api/v1/packages/{package_id}/requirements/analyze` | Generate a Requirements Analysis version |
-| GET | `/api/v1/packages/{package_id}/requirements` | List analysis versions |
-| GET | `/api/v1/requirement-analyses/{analysis_id}` | Read an analysis contract |
-| POST | `/api/v1/requirement-analyses/{analysis_id}/review` | Record approval/rejection and review metadata |
-| POST | `/api/v1/manifests/{package_id}/lifecycle` | Move a package to ready, invalidated, or published |
-| GET | `/api/v1/ingestion-runs/{run_id}` | Read run configuration and provenance |
+| Method | Endpoint                                                      | Purpose                                            |
+| ------ | ------------------------------------------------------------- | -------------------------------------------------- |
+| GET    | `/health`                                                     | Service health                                     |
+| POST   | `/api/v1/projects`                                            | Create a project                                   |
+| GET    | `/api/v1/projects`                                            | List projects                                      |
+| GET    | `/api/v1/projects/{project_id}`                               | Get project details                                |
+| POST   | `/api/v1/projects/{project_id}/sources`                       | Upload a BRD or supporting source                  |
+| GET    | `/api/v1/projects/{project_id}/sources`                       | List sources and extraction status                 |
+| GET    | `/api/v1/revisions/{revision_id}`                             | Read extraction and fragments                      |
+| GET    | `/api/v1/sources/{source_id}/revisions`                       | List all revisions for a logical source            |
+| GET    | `/api/v1/revisions/{revision_id}/compare/{other_revision_id}` | Compare two revisions with a unified diff          |
+| POST   | `/api/v1/sources/{source_id}/active-revision`                 | Select a successfully extracted active revision    |
+| GET    | `/api/v1/sources/{source_id}/parent-brd`                      | Find a supporting source's parent BRD              |
+| POST   | `/api/v1/projects/{project_id}/manifests`                     | Create an immutable source package                 |
+| GET    | `/api/v1/projects/{project_id}/manifests`                     | List package versions                              |
+| GET    | `/api/v1/manifests/{package_id}`                              | Read exact package revisions                       |
+| POST   | `/api/v1/packages/{package_id}/requirements/analyze`          | Generate a Requirements Analysis version           |
+| GET    | `/api/v1/packages/{package_id}/requirements`                  | List analysis versions                             |
+| GET    | `/api/v1/requirement-analyses/{analysis_id}`                  | Read an analysis contract                          |
+| POST   | `/api/v1/requirement-analyses/{analysis_id}/review`           | Record approval/rejection and review metadata      |
+| POST   | `/api/v1/manifests/{package_id}/lifecycle`                    | Move a package to ready, invalidated, or published |
+| GET    | `/api/v1/ingestion-runs/{run_id}`                             | Read run configuration and provenance              |
 
 ## Upload example
 
@@ -157,7 +162,7 @@ The PBM refill-reminder POC splits the BRD into functional requirements such as 
 
 Approved cases can use project-scoped JSON templates for entities such as members and prescriptions. Save a template with `POST /api/v1/test-data-templates`, list templates with `GET /api/v1/projects/{project_id}/test-data-templates`, and generate case-specific drafts with `POST /api/v1/test-case-generations/{generation_id}/test-data`. Pass per-case `assignments`, where each item contains a `test_case_id` and only the `template_ids` needed by that case. The frontend suggests assignments from each case's scenario, data needs, and pre-steps, and lets the reviewer adjust them before generation.
 
-Generation uses the configured OpenAI model to create scenario-specific synthetic values that follow each selected template's exact JSON shape and value types. It batches up to ten cases per template request, then assigns unique IDs and links prescription `member_id` values to generated members. If the LLM is unavailable or fails, deterministic synthetic values are generated from the template and case, and the response identifies that fallback for the reviewer. The frontend lets the reviewer edit the generated JSON before `POST /api/v1/test-case-generations/{generation_id}/test-data/save` writes the reviewed records to `bronzebox.raw_file`. Bronze saving needs PostgreSQL and the `bronzebox.raw_file` table from `pbm_ingestion/db/init.sql`.
+Generation uses the configured OpenAI model to create scenario-specific synthetic values that follow each selected template's exact JSON shape and value types. It batches up to ten cases per template request, then assigns unique IDs and links prescription `member_id` values to generated members. If the LLM is unavailable or fails, deterministic synthetic values are generated from the template and case, and the response identifies that fallback for the reviewer. The frontend lets the reviewer edit the generated JSON before `POST /api/v1/test-case-generations/{generation_id}/test-data/save` writes reviewed setup data to the Bronze domain tables in `bronzebox`: member data goes to `membership`, prescription data goes to `prescription`, and campaign or communication setup goes to `order`. The saved TestIQ row stores Bronze references such as `membership:1026,prescription:1026`.
 
 ## Test
 

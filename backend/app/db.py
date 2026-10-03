@@ -1,11 +1,8 @@
 """Database access for the TestIQ PostgreSQL control plane."""
-import os
 import sqlite3
 import threading
 from contextlib import contextmanager
-from .config import DB_PATH, DATA_DIR, PGVECTOR_DIMENSIONS, UPLOAD_DIR
-
-DATABASE_URL = os.getenv("DATABASE_URL")
+from .config import DATABASE_URL, DB_PATH, DATA_DIR, PGVECTOR_DIMENSIONS, UPLOAD_DIR
 PGVECTOR_AVAILABLE = False
 _INIT_DONE = False
 _INIT_LOCK = threading.Lock()
