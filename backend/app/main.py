@@ -122,7 +122,7 @@ def _is_context_length_error(exc: Exception) -> bool:
     return "context_length_exceeded" in message or "exceeds the context window" in message or "context window" in message
 
 def _try_retrieve_package_context(package_id: str, requested_by: str):
-    timeout_seconds = float(os.getenv("RAG_RETRIEVAL_TIMEOUT_SECONDS", "4"))
+    timeout_seconds = float(os.getenv("RAG_RETRIEVAL_TIMEOUT_SECONDS", "30"))
     if timeout_seconds <= 0:
         return None
     result, failure = [], []
