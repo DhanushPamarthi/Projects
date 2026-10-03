@@ -201,7 +201,9 @@ CREATE TABLE IF NOT EXISTS testiq.knowledge_index (
   graph_model TEXT NOT NULL, dimensions INTEGER NOT NULL, status TEXT NOT NULL,
   configuration_json TEXT NOT NULL, chunker_version TEXT NOT NULL, graph_prompt_version TEXT NOT NULL,
   graph_prompt_hash TEXT NOT NULL, chunk_count INTEGER NOT NULL DEFAULT 0, node_count INTEGER NOT NULL DEFAULT 0,
-  edge_count INTEGER NOT NULL DEFAULT 0, error TEXT, created_at TEXT NOT NULL, UNIQUE(package_id, config_hash)
+  edge_count INTEGER NOT NULL DEFAULT 0, progress_percent INTEGER NOT NULL DEFAULT 0,
+  progress_stage TEXT NOT NULL DEFAULT 'pending', progress_message TEXT,
+  error TEXT, created_at TEXT NOT NULL, UNIQUE(package_id, config_hash)
 );
 CREATE TABLE IF NOT EXISTS testiq.knowledge_chunk (
   chunk_id TEXT PRIMARY KEY, index_id TEXT NOT NULL REFERENCES testiq.knowledge_index(index_id),
@@ -304,6 +306,9 @@ MIGRATIONS = [
     "ALTER TABLE source_fragment ADD COLUMN provenance_mode TEXT",
     "ALTER TABLE test_case_review_audit ADD COLUMN reviewed_contract_json TEXT",
     "ALTER TABLE test_case_review_audit ADD COLUMN reviewed_items_json TEXT",
+    "ALTER TABLE knowledge_index ADD COLUMN progress_percent INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE knowledge_index ADD COLUMN progress_stage TEXT NOT NULL DEFAULT 'pending'",
+    "ALTER TABLE knowledge_index ADD COLUMN progress_message TEXT",
 ]
 
 class _SQLiteConnection:

@@ -76,6 +76,19 @@ def _dict(row):
     return dict(row) if row else None
 
 
+def _update_build_progress(index_id, percent, stage, message, **extra_fields):
+    percent = max(0, min(100, int(percent or 0)))
+    allowed_extras = {key: value for key, value in extra_fields.items() if key in {"status", "chunk_count", "node_count", "edge_count", "error"}}
+    assignments = ["progress_percent=%s", "progress_stage=%s", "progress_message=%s"]
+    values = [percent, str(stage or "building"), str(message or "")]
+    for key, value in allowed_extras.items():
+        assignments.append(f"{key}=%s")
+        values.append(value)
+    values.append(index_id)
+    with connection() as conn:
+        conn.execute(f"UPDATE knowledge_index SET {','.join(assignments)} WHERE index_id=%s", tuple(values))
+
+
 def _chunks(fragment):
     """Split a large fragment at sentence or space boundaries and retain offsets."""
     original = str(fragment["fragment_text"] or "")
@@ -245,7 +258,7 @@ def _request_graph_payloads(client, model, schema, batch):
     return [], [f"OpenAI graph augmentation was skipped for {chunk_id}: {type(failure).__name__}: {failure}"]
 
 
-def _extract_graph(client, index_id, package_id, chunks, model):
+def _extract_graph(client, index_id, package_id, chunks, model, progress_callback=None):
     entity_types = ["actor", "business_rule", "scenario", "entity", "api", "table", "column", "constraint",
         "requirement", "outcome", "message_template", "brd", "section", "database_schema", "test_case", "recipe", "evidence"]
     schema = {"type": "object", "additionalProperties": False, "properties": {
@@ -264,7 +277,8 @@ def _extract_graph(client, index_id, package_id, chunks, model):
     # augmentation to narrative business sources to avoid redundant, oversized
     # structured output for large technical catalogs.
     llm_chunks = [item for item in chunks if item["source_type"] not in {"database_schema", "api_spec"}]
-    for offset in range(0, len(llm_chunks), GRAPH_BATCH_SIZE):
+    total_batches = max(1, math.ceil(len(llm_chunks) / GRAPH_BATCH_SIZE))
+    for batch_number, offset in enumerate(range(0, len(llm_chunks), GRAPH_BATCH_SIZE), 1):
         batch = llm_chunks[offset:offset + GRAPH_BATCH_SIZE]
         payloads, batch_warnings = _request_graph_payloads(client, model, schema, batch)
         warnings.extend(batch_warnings)
@@ -278,6 +292,8 @@ def _extract_graph(client, index_id, package_id, chunks, model):
                 confidence = float(draft.get("confidence", -1))
                 if evidence in valid_chunks and 0 <= confidence <= 1:
                     _merge_edge(edges, nodes, draft.get("source"), draft.get("target"), draft.get("type"), evidence, confidence)
+        if progress_callback:
+            progress_callback(batch_number, total_batches, len(nodes), len(edges))
     with connection() as conn:
         for item in nodes.values():
             conn.execute("INSERT INTO knowledge_node (node_id,index_id,package_id,canonical_id,label,entity_type,aliases_json,evidence_chunk_ids_json) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
@@ -301,8 +317,18 @@ def _serialize_index(index):
     value["warnings"] = value.get("error", "").splitlines() if value.get("status") == "ready" and value.get("error") else []
     if value.get("status") == "ready":
         value["error"] = None
-    for key in ("node_count", "edge_count", "chunk_count", "dimensions"):
+    for key in ("node_count", "edge_count", "chunk_count", "dimensions", "progress_percent"):
         value[key] = int(value[key] or 0)
+    if value.get("status") == "ready":
+        value["progress_percent"] = 100
+        value["progress_stage"] = value.get("progress_stage") or "ready"
+        value["progress_message"] = value.get("progress_message") or "Knowledge Base is ready."
+    elif value.get("status") == "failed":
+        value["progress_stage"] = value.get("progress_stage") or "failed"
+        value["progress_message"] = value.get("progress_message") or value.get("error") or "Knowledge Base build failed."
+    else:
+        value["progress_stage"] = value.get("progress_stage") or value.get("status") or "pending"
+        value["progress_message"] = value.get("progress_message") or "Knowledge Base build is waiting to start."
     return value
 
 
@@ -375,6 +401,16 @@ def _assert_approved(conn, index):
     if review["object_hash"] != _current_object_hash(conn, index["index_id"]):
         raise HTTPException(409, "The Knowledge Base index changed and must be rebuilt")
     return review
+
+
+def _latest_ready_index(conn, indexes):
+    for index in indexes:
+        if index["status"] != "ready":
+            continue
+        _ensure_system_approval(conn, index["index_id"])
+        _assert_approved(conn, index)
+        return index
+    return None
 
 
 def _cosine(left, right):
@@ -690,10 +726,11 @@ def retrieve_package_context(package_id, requested_by="Requirements Analysis"):
         indexes = conn.execute("SELECT * FROM knowledge_index WHERE package_id=%s ORDER BY created_at DESC", (package_id,)).fetchall()
         if not indexes:
             raise HTTPException(409, "Build the Knowledge Base before requesting package context")
-        if indexes[0]["status"] != "ready":
-            raise HTTPException(409, "The latest Knowledge Base index is not ready")
-        approval = _assert_approved(conn, indexes[0])
-        selected = _dict(indexes[0])
+        selected_index = _latest_ready_index(conn, indexes)
+        if not selected_index:
+            raise HTTPException(409, "No ready Knowledge Base index is available for this package")
+        approval = _assert_approved(conn, selected_index)
+        selected = _dict(selected_index)
         approved_rules = [dict(row) for row in conn.execute(
             "SELECT rule_id,statement,source_fragment_id,source_reference,impact_if_missing FROM package_business_rule WHERE package_id=%s AND status='approved' ORDER BY ordinal",
             (package_id,),
@@ -706,17 +743,18 @@ def retrieve_package_context(package_id, requested_by="Requirements Analysis"):
         ("Campaign requirements, business rules, eligibility, exclusions, conditions, and expected outcomes", ["brd"]),
         ("Acceptance criteria, observable outcomes, alternate flows, failures, fallback, and retry behavior", ["brd"]),
     ]
-    technical_source_types = sorted(available_source_types & {"database_schema", "api_spec"})
+    technical_source_types = sorted(available_source_types & {"database_schema", "api_spec", "message_template", "campaign_rules", "ui_description"})
     if technical_source_types:
         query_specs.append((
-            "Database tables, fields, relationships, API operations, request contracts, and implementation gaps",
+            "Database tables, fields, relationships, API operations, request contracts, message templates, data templates, and implementation gaps",
             technical_source_types,
         ))
     retrievals, unique_hits = [], {}
     for query, source_types in query_specs:
-        result = retrieve_knowledge(selected["index_id"], RetrievalRequest(query=query, top_k=12, candidate_k=50, graph_depth=1,
+        result = retrieve_knowledge(selected["index_id"], RetrievalRequest(query=query, top_k=10, candidate_k=30, graph_depth=1,
             source_types=source_types, max_context_characters=16_000, requested_by=requested_by,
-            purpose=str(requested_by).strip().lower().replace(" ", "_"), require_approved=True), client=client)
+            purpose=str(requested_by).strip().lower().replace(" ", "_"), require_approved=True,
+            use_reranker=False), client=client)
         retrievals.append(result)
         for hit in result["hits"]:
             unique_hits.setdefault(hit["chunk_id"], hit)
@@ -752,7 +790,7 @@ def retrieve_package_context(package_id, requested_by="Requirements Analysis"):
         "context_hash": rag_metadata["context_hash"], "rag_metadata": rag_metadata,
         "approved_rules": approved_rules,
         "brd_fragments": [item for item in fragments if item["source_type"] == "brd"],
-        "technical_fragments": [item for item in fragments if item["source_type"] in {"database_schema", "api_spec"}]}
+        "technical_fragments": [item for item in fragments if item["source_type"] in {"database_schema", "api_spec", "message_template", "campaign_rules", "ui_description"}]}
 
 
 @router.post("/api/v1/packages/{package_id}/knowledge-index", status_code=201)
@@ -799,13 +837,15 @@ def build_knowledge_index(package_id: str, request: BuildIndexRequest):
             conn.execute("DELETE FROM knowledge_edge WHERE index_id=%s", (index_id,))
             conn.execute("DELETE FROM knowledge_node WHERE index_id=%s", (index_id,))
             conn.execute("DELETE FROM knowledge_chunk WHERE index_id=%s", (index_id,))
-            conn.execute("UPDATE knowledge_index SET status=%s,error=NULL,chunk_count=0,node_count=0,edge_count=0,created_at=%s WHERE index_id=%s", ("building", _now(), index_id))
+            conn.execute("UPDATE knowledge_index SET status=%s,error=NULL,chunk_count=0,node_count=0,edge_count=0,progress_percent=%s,progress_stage=%s,progress_message=%s,created_at=%s WHERE index_id=%s",
+                ("building", 5, "preparing", "Preparing package evidence.", _now(), index_id))
         else:
             index_id = _uid("kidx")
-            conn.execute("INSERT INTO knowledge_index (index_id,package_id,project_id,manifest_hash,config_hash,provider,embedding_model,graph_model,dimensions,status,configuration_json,chunker_version,graph_prompt_version,graph_prompt_hash,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            conn.execute("INSERT INTO knowledge_index (index_id,package_id,project_id,manifest_hash,config_hash,provider,embedding_model,graph_model,dimensions,status,configuration_json,chunker_version,graph_prompt_version,graph_prompt_hash,progress_percent,progress_stage,progress_message,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (index_id, package_id, package["project_id"], package["manifest_hash"], config_hash, request.provider,
                  request.embedding_model, request.graph_model, OPENAI_EMBEDDING_DIMENSIONS,
-                 "building", configuration_json, CHUNKER_VERSION, GRAPH_PROMPT_VERSION, configuration["graph_prompt_hash"], _now()))
+                 "building", configuration_json, CHUNKER_VERSION, GRAPH_PROMPT_VERSION, configuration["graph_prompt_hash"],
+                 5, "preparing", "Preparing package evidence.", _now()))
         chunk_rows = []
         for fragment in fragments:
             for part, (body, start, end) in enumerate(_chunks(fragment), 1):
@@ -828,20 +868,27 @@ def build_knowledge_index(package_id: str, request: BuildIndexRequest):
             chunk_limit = f"{MAX_INDEX_CHUNKS:,}" if MAX_INDEX_CHUNKS else "unlimited"
             character_limit = f"{MAX_INDEX_CHARACTERS:,}" if MAX_INDEX_CHARACTERS else "unlimited"
             raise HTTPException(413, f"This package produced {len(chunk_rows):,} chunks and {character_count:,} characters. The configured build limits are {chunk_limit} chunks and {character_limit} characters.")
+        conn.execute("UPDATE knowledge_index SET progress_percent=%s,progress_stage=%s,progress_message=%s WHERE index_id=%s",
+            (15, "chunking", f"Prepared {len(chunk_rows):,} evidence chunks from {len(fragments):,} source fragments.", index_id))
     _ACTIVE_KNOWLEDGE_BUILDS.add(package_id)
     try:
         client = _create_client()
         vectors = []
-        for start in range(0, len(chunk_rows), EMBEDDING_BATCH_SIZE):
+        embedding_batches = max(1, math.ceil(len(chunk_rows) / EMBEDDING_BATCH_SIZE))
+        _update_build_progress(index_id, 20, "embedding", f"Embedding {len(chunk_rows):,} evidence chunks.")
+        for batch_number, start in enumerate(range(0, len(chunk_rows), EMBEDDING_BATCH_SIZE), 1):
             batch = chunk_rows[start:start + EMBEDDING_BATCH_SIZE]
             response = client.embeddings.create(model=request.embedding_model, input=[item["text"] for item in batch],
                 encoding_format="float", dimensions=OPENAI_EMBEDDING_DIMENSIONS)
             vectors.extend([item.embedding for item in sorted(response.data, key=lambda item: item.index)])
+            embedding_progress = 20 + round((batch_number / embedding_batches) * 45)
+            _update_build_progress(index_id, embedding_progress, "embedding", f"Embedded {min(len(vectors), len(chunk_rows)):,} of {len(chunk_rows):,} evidence chunks.")
         if len(vectors) != len(chunk_rows):
             raise ValueError("Embedding response count did not match the submitted chunk count")
         dimensions = len(vectors[0])
         if not dimensions or any(len(vector) != dimensions for vector in vectors):
             raise ValueError("Embedding model returned inconsistent vector dimensions")
+        _update_build_progress(index_id, 70, "saving", "Saving embedded evidence chunks.")
         with connection() as conn:
             conn.execute("UPDATE knowledge_index SET dimensions=%s WHERE index_id=%s", (dimensions, index_id))
             for item, vector in zip(chunk_rows, vectors):
@@ -854,22 +901,29 @@ def build_knowledge_index(package_id: str, request: BuildIndexRequest):
                         raise ValueError(f"Embedding dimensions {dimensions} do not match PGVECTOR_DIMENSIONS={PGVECTOR_DIMENSIONS}")
                     conn.execute("UPDATE knowledge_chunk SET embedding_vector=%s::vector WHERE chunk_id=%s",
                         (_vector_literal(vector), item["chunk_id"]))
-        node_count, edge_count, graph_warnings = _extract_graph(client, index_id, package_id, chunk_rows, request.graph_model)
+        _update_build_progress(index_id, 75, "saving", f"Saved {len(chunk_rows):,} embedded chunks.", chunk_count=len(chunk_rows))
+        _update_build_progress(index_id, 80, "graphing", "Building the knowledge graph from indexed evidence.")
+        def graph_progress(done, total, nodes, edges):
+            graph_percent = 80 + round((done / max(1, total)) * 16)
+            _update_build_progress(index_id, graph_percent, "graphing", f"Built graph batch {done:,} of {total:,}.", node_count=nodes, edge_count=edges)
+        node_count, edge_count, graph_warnings = _extract_graph(client, index_id, package_id, chunk_rows, request.graph_model, graph_progress)
+        _update_build_progress(index_id, 98, "finalizing", "Finalizing the Knowledge Base index.", chunk_count=len(chunk_rows), node_count=node_count, edge_count=edge_count)
         warning_text = "\n".join(graph_warnings)[:2000] if graph_warnings else None
         with connection() as conn:
-            conn.execute("UPDATE knowledge_index SET status=%s,chunk_count=%s,node_count=%s,edge_count=%s,error=%s WHERE index_id=%s", ("ready", len(chunk_rows), node_count, edge_count, warning_text, index_id))
+            conn.execute("UPDATE knowledge_index SET status=%s,chunk_count=%s,node_count=%s,edge_count=%s,progress_percent=%s,progress_stage=%s,progress_message=%s,error=%s WHERE index_id=%s",
+                ("ready", len(chunk_rows), node_count, edge_count, 100, "ready", "Knowledge Base is ready.", warning_text, index_id))
             _ensure_system_approval(conn, index_id)
             row = conn.execute("SELECT * FROM knowledge_index WHERE index_id=%s", (index_id,)).fetchone()
             return {**_serialize_index(row), "reused": False}
     except HTTPException as exc:
         message = str(exc.detail) if isinstance(exc.detail, str) else json.dumps(exc.detail, ensure_ascii=False)
         with connection() as conn:
-            conn.execute("UPDATE knowledge_index SET status=%s,error=%s WHERE index_id=%s", ("failed", message[:2000], index_id))
+            conn.execute("UPDATE knowledge_index SET status=%s,progress_stage=%s,progress_message=%s,error=%s WHERE index_id=%s", ("failed", "failed", message[:2000], message[:2000], index_id))
         raise
     except Exception as exc:
         message = f"Knowledge Base build failed: {type(exc).__name__}: {exc}"
         with connection() as conn:
-            conn.execute("UPDATE knowledge_index SET status=%s,error=%s WHERE index_id=%s", ("failed", message[:2000], index_id))
+            conn.execute("UPDATE knowledge_index SET status=%s,progress_stage=%s,progress_message=%s,error=%s WHERE index_id=%s", ("failed", "failed", message[:2000], message[:2000], index_id))
         raise HTTPException(502, message) from exc
     finally:
         _ACTIVE_KNOWLEDGE_BUILDS.discard(package_id)
@@ -892,14 +946,26 @@ def get_rag_readiness(package_id: str):
         if not indexes:
             return {"package_id": package_id, "status": "missing", "ready": False, "message": "Knowledge Base has not been built for this source package yet."}
         latest = indexes[0]
-        if latest["status"] == "ready":
-            _ensure_system_approval(conn, latest["index_id"])
+        ready_index = _latest_ready_index(conn, indexes)
+        if ready_index:
+            review = _latest_review(conn, ready_index["index_id"])
+            message = "Knowledge Base is ready."
+            if latest["index_id"] != ready_index["index_id"] and latest["status"] in {"building", "failed"}:
+                message = f"Knowledge Base is ready from the latest successful index. Newest build is {latest['status']}."
+            return {"package_id": package_id, "index_id": ready_index["index_id"], "status": "approved", "ready": True,
+                "index_status": ready_index["status"], "review": _dict(review),
+                "progress_percent": 100,
+                "progress_stage": ready_index["progress_stage"] or "ready",
+                "progress_message": ready_index["progress_message"] or "Knowledge Base is ready.",
+                "message": message}
         review = _latest_review(conn, latest["index_id"])
-        approved = bool(review and review["decision"] == "approved" and review["object_hash"] == _current_object_hash(conn, latest["index_id"]))
-        status = "approved" if latest["status"] == "ready" and approved else (review["decision"] if latest["status"] == "ready" and review else latest["status"])
-        return {"package_id": package_id, "index_id": latest["index_id"], "status": status, "ready": approved,
+        status = review["decision"] if latest["status"] == "ready" and review else latest["status"]
+        return {"package_id": package_id, "index_id": latest["index_id"], "status": status, "ready": False,
             "index_status": latest["status"], "review": _dict(review),
-            "message": "Knowledge Base is ready." if approved else f"Knowledge Base is {latest['status']}."}
+            "progress_percent": int(latest["progress_percent"] or 0),
+            "progress_stage": latest["progress_stage"] or latest["status"],
+            "progress_message": latest["progress_message"],
+            "message": f"Knowledge Base is {latest['status']}."}
 
 
 @router.get("/api/v1/knowledge-indexes/{index_id}")
