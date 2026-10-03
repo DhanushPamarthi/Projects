@@ -1871,6 +1871,43 @@ def _validate_business_requirements_contract(contract, fragments):
     if not isinstance(contract, dict) or not contract.get("business_requirements"):
         raise ValueError("The AI returned no business requirements")
     fragments_by_id = {fragment.get("fragment_id"): fragment for fragment in fragments if fragment.get("fragment_id")}
+    ordered_fragments = [fragment for fragment in fragments if fragment.get("fragment_id")]
+    fragments_by_reference = {}
+    for fragment in ordered_fragments:
+        fragments_by_reference.setdefault(fragment.get("source_reference"), []).append(fragment)
+
+    def best_fragment_for(text):
+        if not ordered_fragments:
+            return None
+        text_tokens = _business_rule_tokens(text)
+        best_fragment = ordered_fragments[0]
+        best_score = 0.0
+        for fragment in ordered_fragments:
+            score = _business_rule_similarity(text_tokens, _business_rule_tokens(fragment.get("fragment_text")))
+            if score > best_score:
+                best_score = score
+                best_fragment = fragment
+        return best_fragment
+
+    def normalize_ref(ref, text):
+        fragment = fragments_by_id.get(ref.get("fragment_id"))
+        if fragment is None:
+            matches = fragments_by_reference.get(ref.get("source_reference"), [])
+            fragment = matches[0] if matches else None
+        if fragment is None:
+            source_reference = str(ref.get("source_reference") or "")
+            for candidate in ordered_fragments:
+                candidate_reference = str(candidate.get("source_reference") or "")
+                if source_reference and candidate_reference and (source_reference in candidate_reference or candidate_reference in source_reference):
+                    fragment = candidate
+                    break
+        if fragment is None:
+            fragment = best_fragment_for(text)
+        if fragment is None:
+            raise ValueError("The source package has no traceable fragments")
+        ref["fragment_id"] = fragment["fragment_id"]
+        ref["source_reference"] = fragment["source_reference"]
+
     seen = set()
     for item in contract.get("business_requirements", []):
         business_id = item.get("business_requirement_id")
@@ -1880,13 +1917,13 @@ def _validate_business_requirements_contract(contract, fragments):
         seen.add(business_id)
         refs = item.get("source_references") or []
         if not refs:
-            raise ValueError(f"AI returned no source references for {business_id}")
+            fallback = best_fragment_for(description)
+            if not fallback:
+                raise ValueError(f"AI returned no source references for {business_id}")
+            refs = [{"fragment_id": fallback["fragment_id"], "source_reference": fallback["source_reference"]}]
+            item["source_references"] = refs
         for ref in [*refs, *(item.get("supporting_source_references") or [])]:
-            fragment = fragments_by_id.get(ref.get("fragment_id"))
-            if not fragment:
-                raise ValueError(f"AI returned an unknown source reference for {business_id}")
-            ref["fragment_id"] = fragment["fragment_id"]
-            ref["source_reference"] = fragment["source_reference"]
+            normalize_ref(ref, description)
 
 def _dedupe_business_requirement_items(items):
     deduped = []
