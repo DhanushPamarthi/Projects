@@ -1,10 +1,14 @@
 """Database access for the TestIQ PostgreSQL control plane."""
 import os
 import sqlite3
+import threading
 from contextlib import contextmanager
-from .config import DB_PATH, DATA_DIR, UPLOAD_DIR
+from .config import DB_PATH, DATA_DIR, PGVECTOR_DIMENSIONS, UPLOAD_DIR
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+PGVECTOR_AVAILABLE = False
+_INIT_DONE = False
+_INIT_LOCK = threading.Lock()
 
 SCHEMA = """
 CREATE SCHEMA IF NOT EXISTS testiq;
@@ -43,8 +47,27 @@ CREATE TABLE IF NOT EXISTS testiq.source_extraction (
 );
 CREATE TABLE IF NOT EXISTS testiq.source_package_manifest (
   package_id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES testiq.project(project_id), package_version INTEGER NOT NULL,
-  package_name TEXT, scope TEXT, manifest_hash TEXT, lifecycle_status TEXT NOT NULL DEFAULT 'draft', run_id TEXT, created_at TEXT NOT NULL, UNIQUE(project_id, package_version)
+  package_name TEXT, scope TEXT, manifest_hash TEXT, lifecycle_status TEXT NOT NULL DEFAULT 'draft',
+  rule_review_status TEXT NOT NULL DEFAULT 'pending', rule_set_hash TEXT, rules_reviewed_at TEXT,
+  run_id TEXT, created_at TEXT NOT NULL, UNIQUE(project_id, package_version)
 );
+CREATE TABLE IF NOT EXISTS testiq.package_business_rule (
+  rule_id TEXT PRIMARY KEY,
+  package_id TEXT NOT NULL REFERENCES testiq.source_package_manifest(package_id),
+  ordinal INTEGER NOT NULL,
+  statement TEXT NOT NULL,
+  source_fragment_id TEXT REFERENCES testiq.source_fragment(fragment_id),
+  source_reference TEXT,
+  impact_if_missing TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')),
+  reviewer TEXT,
+  review_comment TEXT,
+  reviewed_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(package_id, ordinal)
+);
+CREATE INDEX IF NOT EXISTS testiq_package_business_rule_scope_idx ON testiq.package_business_rule(package_id, status, ordinal);
 CREATE TABLE IF NOT EXISTS testiq.source_package_item (
   package_id TEXT NOT NULL REFERENCES testiq.source_package_manifest(package_id),
   source_id TEXT NOT NULL REFERENCES testiq.source_document(source_id),
@@ -171,6 +194,56 @@ CREATE TABLE IF NOT EXISTS testiq.test_data_record (
   updated_at TEXT NOT NULL,
   UNIQUE(generation_id, test_case_id, template_id)
 );
+CREATE TABLE IF NOT EXISTS testiq.knowledge_index (
+  index_id TEXT PRIMARY KEY, package_id TEXT NOT NULL REFERENCES testiq.source_package_manifest(package_id),
+  project_id TEXT NOT NULL REFERENCES testiq.project(project_id), manifest_hash TEXT NOT NULL,
+  config_hash TEXT NOT NULL, provider TEXT NOT NULL, embedding_model TEXT NOT NULL,
+  graph_model TEXT NOT NULL, dimensions INTEGER NOT NULL, status TEXT NOT NULL,
+  configuration_json TEXT NOT NULL, chunker_version TEXT NOT NULL, graph_prompt_version TEXT NOT NULL,
+  graph_prompt_hash TEXT NOT NULL, chunk_count INTEGER NOT NULL DEFAULT 0, node_count INTEGER NOT NULL DEFAULT 0,
+  edge_count INTEGER NOT NULL DEFAULT 0, error TEXT, created_at TEXT NOT NULL, UNIQUE(package_id, config_hash)
+);
+CREATE TABLE IF NOT EXISTS testiq.knowledge_chunk (
+  chunk_id TEXT PRIMARY KEY, index_id TEXT NOT NULL REFERENCES testiq.knowledge_index(index_id),
+  package_id TEXT NOT NULL REFERENCES testiq.source_package_manifest(package_id),
+  source_id TEXT NOT NULL REFERENCES testiq.source_document(source_id),
+  revision_id TEXT NOT NULL REFERENCES testiq.source_revision(revision_id),
+  fragment_id TEXT NOT NULL REFERENCES testiq.source_fragment(fragment_id), source_type TEXT NOT NULL,
+  source_reference TEXT NOT NULL, heading_path TEXT, chunk_text TEXT NOT NULL, content_hash TEXT NOT NULL,
+  embedding_json TEXT NOT NULL, metadata_json TEXT NOT NULL, UNIQUE(index_id, fragment_id, chunk_id)
+);
+CREATE INDEX IF NOT EXISTS testiq_knowledge_chunk_scope_idx ON testiq.knowledge_chunk(package_id,index_id,source_type);
+CREATE TABLE IF NOT EXISTS testiq.knowledge_node (
+  node_id TEXT PRIMARY KEY, index_id TEXT NOT NULL REFERENCES testiq.knowledge_index(index_id),
+  package_id TEXT NOT NULL REFERENCES testiq.source_package_manifest(package_id), canonical_id TEXT NOT NULL,
+  label TEXT NOT NULL, entity_type TEXT NOT NULL, aliases_json TEXT NOT NULL, evidence_chunk_ids_json TEXT NOT NULL,
+  UNIQUE(index_id,canonical_id)
+);
+CREATE TABLE IF NOT EXISTS testiq.knowledge_edge (
+  edge_id TEXT PRIMARY KEY, index_id TEXT NOT NULL REFERENCES testiq.knowledge_index(index_id),
+  package_id TEXT NOT NULL REFERENCES testiq.source_package_manifest(package_id),
+  source_node_id TEXT NOT NULL REFERENCES testiq.knowledge_node(node_id),
+  target_node_id TEXT NOT NULL REFERENCES testiq.knowledge_node(node_id), relationship_type TEXT NOT NULL,
+  evidence_chunk_ids_json TEXT NOT NULL, confidence REAL NOT NULL,
+  UNIQUE(index_id,source_node_id,target_node_id,relationship_type)
+);
+CREATE TABLE IF NOT EXISTS testiq.knowledge_index_review (
+  review_id TEXT PRIMARY KEY, index_id TEXT NOT NULL REFERENCES testiq.knowledge_index(index_id),
+  reviewer TEXT NOT NULL, decision TEXT NOT NULL CHECK(decision IN ('approved','needs_changes','rejected')),
+  comments TEXT, object_hash TEXT NOT NULL, reviewed_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS testiq.knowledge_retrieval_run (
+  retrieval_id TEXT PRIMARY KEY, index_id TEXT NOT NULL REFERENCES testiq.knowledge_index(index_id),
+  package_id TEXT NOT NULL REFERENCES testiq.source_package_manifest(package_id), query_text TEXT NOT NULL,
+  query_hash TEXT NOT NULL, requested_by TEXT NOT NULL, purpose TEXT NOT NULL,
+  retrieval_config_json TEXT NOT NULL, result_json TEXT NOT NULL, context_hash TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS testiq_knowledge_retrieval_scope_idx ON testiq.knowledge_retrieval_run(package_id,index_id,created_at);
+CREATE TABLE IF NOT EXISTS testiq.knowledge_evaluation_run (
+  evaluation_id TEXT PRIMARY KEY, index_id TEXT NOT NULL REFERENCES testiq.knowledge_index(index_id),
+  package_id TEXT NOT NULL REFERENCES testiq.source_package_manifest(package_id), requested_by TEXT NOT NULL,
+  questions_json TEXT NOT NULL, result_json TEXT NOT NULL, passed INTEGER NOT NULL, created_at TEXT NOT NULL
+);
 """
 SQLITE_SCHEMA = SCHEMA.replace("CREATE SCHEMA IF NOT EXISTS testiq;\n", "").replace("testiq.", "")
 
@@ -213,6 +286,9 @@ MIGRATIONS = [
     "ALTER TABLE source_extraction ADD COLUMN config_hash TEXT",
     "ALTER TABLE source_package_manifest ADD COLUMN manifest_hash TEXT",
     "ALTER TABLE source_package_manifest ADD COLUMN lifecycle_status TEXT NOT NULL DEFAULT 'draft'",
+    "ALTER TABLE source_package_manifest ADD COLUMN rule_review_status TEXT NOT NULL DEFAULT 'pending'",
+    "ALTER TABLE source_package_manifest ADD COLUMN rule_set_hash TEXT",
+    "ALTER TABLE source_package_manifest ADD COLUMN rules_reviewed_at TEXT",
     "ALTER TABLE source_package_manifest ADD COLUMN run_id TEXT",
     "ALTER TABLE source_package_item ADD COLUMN extractor_version TEXT",
     "ALTER TABLE source_package_item ADD COLUMN prompt_hash TEXT",
@@ -239,6 +315,17 @@ class _SQLiteConnection:
     def close(self): self._conn.close()
 
 def init_db():
+    global _INIT_DONE
+    if _INIT_DONE:
+        return
+    with _INIT_LOCK:
+        if _INIT_DONE:
+            return
+        _init_db_uncached()
+        _INIT_DONE = True
+
+
+def _init_db_uncached():
     # Original source files remain on the application filesystem even when
     # PostgreSQL is used for the control-plane metadata.
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -246,8 +333,22 @@ def init_db():
     if DATABASE_URL:
         import psycopg
         with psycopg.connect(DATABASE_URL) as conn:
+            global PGVECTOR_AVAILABLE
             for statement in SCHEMA.split(";"):
                 if statement.strip(): conn.execute(statement)
+            try:
+                conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                conn.execute(f"ALTER TABLE testiq.knowledge_chunk ADD COLUMN IF NOT EXISTS embedding_vector vector({PGVECTOR_DIMENSIONS})")
+                conn.execute("CREATE INDEX IF NOT EXISTS testiq_knowledge_chunk_embedding_hnsw_idx ON testiq.knowledge_chunk USING hnsw (embedding_vector vector_cosine_ops) WITH (m=16,ef_construction=64)")
+                PGVECTOR_AVAILABLE = True
+            except Exception:
+                PGVECTOR_AVAILABLE = False
+                conn.rollback()
+                for statement in SCHEMA.split(";"):
+                    if statement.strip(): conn.execute(statement)
+            if PGVECTOR_AVAILABLE:
+                conn.execute(f"ALTER TABLE testiq.knowledge_chunk ADD COLUMN IF NOT EXISTS embedding_vector vector({PGVECTOR_DIMENSIONS})")
+                conn.execute("CREATE INDEX IF NOT EXISTS testiq_knowledge_chunk_embedding_hnsw_idx ON testiq.knowledge_chunk USING hnsw (embedding_vector vector_cosine_ops) WITH (m=16,ef_construction=64)")
             conn.execute("SET search_path TO testiq")
             for index, statement in enumerate(MIGRATIONS):
                 savepoint = f"migration_{index}"
