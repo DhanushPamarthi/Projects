@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
-import { FileCheck2, LoaderCircle } from "lucide-react";
-import { getProject, listGeneratedTestCases, listManifests, listProjects, listRequirementAnalyses, listExecutionRuns } from "../api/client.js";
+import { CheckCircle2, FileCheck2, LoaderCircle, PlayCircle, XCircle } from "lucide-react";
+import { executeExecutionRun, getProject, listGeneratedTestCases, listManifests, listProjects, listRequirementAnalyses, listExecutionRuns } from "../api/client.js";
 
 function readStoredJson(key) {
   try {
@@ -32,11 +32,25 @@ function runStatus(run) {
 }
 
 function testResultStatus(run) {
+  const summaryStatus = run?.execution_summary?.status;
+  if (summaryStatus === "pass") return "Pass";
+  if (summaryStatus === "fail") return "Fail";
   const state = runStatus(run);
+  if (state === "running") return "In progress";
   if (state === "cancelled") return "Cancelled";
   if (state === "failed") return "Baseline failed";
   if (state === "completed") return "No results recorded";
   return "Not executed";
+}
+
+function statusClass(status) {
+  return status.toLowerCase().replaceAll(" ", "-");
+}
+
+function resultIcon(status) {
+  if (status === "passed") return <CheckCircle2 size={16} />;
+  if (status === "failed") return <XCircle size={16} />;
+  return <FileCheck2 size={16} />;
 }
 
 export function TestResultsPage() {
@@ -46,6 +60,7 @@ export function TestResultsPage() {
   const [packageId, setPackageId] = useState(() => readStoredJson("testiq_current_package")?.package_id || "");
   const [runs, setRuns] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [executingRunId, setExecutingRunId] = useState("");
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -142,21 +157,38 @@ export function TestResultsPage() {
     if (selectedPackage) localStorage.setItem("testiq_current_package", JSON.stringify(selectedPackage));
   }
 
+  async function executeRun(run) {
+    setExecutingRunId(run.run_id);
+    setError("");
+    try {
+      const updated = await executeExecutionRun(run.run_id, { reviewer: "Product Owner" });
+      setRuns((items) => items.map((item) => item.run_id === run.run_id ? { ...updated, generation: item.generation } : item));
+    } catch (err) {
+      setError(err.message || "Unable to execute this baseline.");
+    } finally {
+      setExecutingRunId("");
+    }
+  }
+
   const summary = useMemo(() => {
     const passed = runs.filter((run) => testResultStatus(run) === "Pass").length;
     const failed = runs.filter((run) => testResultStatus(run) === "Fail").length;
-    return { passed, failed };
+    const executed = passed + failed;
+    return { passed, failed, executed };
   }, [runs]);
 
+  const runsWithResults = runs.filter((run) => run.execution_results?.length);
+
   return <div className="requirements-page">
-    <div className="page-heading"><div><div className="eyebrow">EXECUTION BASELINES</div><h1>Test Results</h1><p>Review frozen baselines here. A baseline records selected cases; it does not execute them.</p></div></div>
+    <div className="page-heading"><div><div className="eyebrow">TEST EXECUTION</div><h1>Test Results</h1><p>Execute frozen baselines and review the saved Bronze validation result for every selected test case.</p></div></div>
     <div className="requirements-toolbar"><div><label>Project</label><select value={project?.project_id || ""} onChange={(event) => selectProject(event.target.value)}><option value="">Select project</option>{projects.map((item) => <option key={item.project_id} value={item.project_id}>{item.project_name}</option>)}</select></div><div><label>Source package</label><select value={packageId} onChange={(event) => selectPackage(event.target.value)} disabled={!packages.length}><option value="">Select package</option>{packages.map((item) => <option key={item.package_id} value={item.package_id}>{item.package_name || item.scope || "Source package"} - v{item.package_version || "?"}</option>)}</select></div></div>
     {error && <div className="error-message">{error}</div>}
     {loading ? <section className="requirements-panel"><LoaderCircle className="spin" size={18} /> Loading execution baselines...</section>
-      : !runs.length ? <section className="requirements-empty"><div className="empty-state-icon"><FileCheck2 size={25} /></div><h2>No execution baselines yet</h2><p>Freeze approved test cases to create a baseline. Execution outcomes will appear when test execution is connected.</p></section>
+      : !runs.length ? <section className="requirements-empty"><div className="empty-state-icon"><FileCheck2 size={25} /></div><h2>No execution baselines yet</h2><p>Freeze approved test cases after saving their test data to Bronze. Then execute the baseline here.</p></section>
         : <>
-          <div className="requirements-summary-grid"><div><span>Total baselines</span><strong>{runs.length}</strong></div><div><span>Passed outcomes</span><strong>{summary.passed}</strong></div><div><span>Failed outcomes</span><strong>{summary.failed}</strong></div><div><span>Selected cases</span><strong>{runs.reduce((total, run) => total + (run.selected_test_case_ids?.length || 0), 0)}</strong></div></div>
-          <section className="requirements-panel"><div className="panel-title-row"><div><h2>Execution baselines</h2><p className="panel-helper">Each row records a frozen selection. Status shows whether the baseline was executed or has a recorded outcome.</p></div><span>{runs.length} baseline{runs.length === 1 ? "" : "s"}</span></div><div className="business-requirements-table-wrap"><table className="business-requirements-table test-results-table"><thead><tr><th>Baseline ID</th><th>Project Name</th><th>Selected cases</th><th>Status</th><th>Created On</th></tr></thead><tbody>{runs.map((run) => { const status = testResultStatus(run); return <tr key={run.run_id}><td>{runDateLabel(run)}</td><td>{project?.project_name || "-"}</td><td>{run.selected_test_case_ids?.length || 0}</td><td><span className={`execution-run-status ${status.toLowerCase().replaceAll(" ", "-")}`}>{status}</span></td><td>{formatDate(run.created_at)}</td></tr>; })}</tbody></table></div></section>
+          <div className="requirements-summary-grid"><div><span>Total baselines</span><strong>{runs.length}</strong></div><div><span>Executed</span><strong>{summary.executed}</strong></div><div><span>Passed</span><strong>{summary.passed}</strong></div><div><span>Failed</span><strong>{summary.failed}</strong></div></div>
+          <section className="requirements-panel"><div className="panel-title-row"><div><h2>Execution baselines</h2><p className="panel-helper">Run a baseline after its test data is saved to Bronze. Results are stored per test case with Bronze row evidence.</p></div><span>{runs.length} baseline{runs.length === 1 ? "" : "s"}</span></div><div className="business-requirements-table-wrap"><table className="business-requirements-table test-results-table"><thead><tr><th>Baseline ID</th><th>Project Name</th><th>Selected cases</th><th>Status</th><th>Created On</th><th>Action</th></tr></thead><tbody>{runs.map((run) => { const status = testResultStatus(run); const state = runStatus(run); const blocked = state === "cancelled" || executingRunId === run.run_id; return <tr key={run.run_id}><td>{runDateLabel(run)}</td><td>{project?.project_name || "-"}</td><td>{run.selected_test_case_ids?.length || 0}</td><td><span className={`execution-run-status ${statusClass(status)}`}>{status}</span></td><td>{formatDate(run.created_at)}</td><td><button type="button" className="secondary-button compact-button" disabled={blocked} onClick={() => executeRun(run)}>{executingRunId === run.run_id ? <><LoaderCircle className="spin" size={14} /> Running...</> : <><PlayCircle size={14} /> {run.execution_results?.length ? "Re-run" : "Execute"}</>}</button></td></tr>; })}</tbody></table></div></section>
+          {runsWithResults.length > 0 && <section className="requirements-panel"><div className="panel-title-row"><div><h2>Execution evidence</h2><p className="panel-helper">Each result shows the generated setup data compared with the Bronze rows inserted for that test case.</p></div><span>{runsWithResults.length} run{runsWithResults.length === 1 ? "" : "s"} with results</span></div><div className="execution-result-list">{runsWithResults.map((run) => <article key={run.run_id} className="execution-result-run"><div className="execution-result-run-head"><div><strong>{runDateLabel(run)}</strong><span>{run.execution_summary?.passed || 0} passed / {run.execution_summary?.failed || 0} failed</span></div><span className={`execution-run-status ${statusClass(testResultStatus(run))}`}>{testResultStatus(run)}</span></div><div className="execution-result-cases">{run.execution_results.map((result) => { const failedAssertions = (result.assertions || []).filter((item) => item.status === "failed"); return <details key={result.result_id} className={`execution-result-case ${result.status}`}><summary>{resultIcon(result.status)} <strong>{result.test_case_id}</strong><span>{result.status}</span>{failedAssertions.length ? <em>{failedAssertions.length} failed assertion{failedAssertions.length === 1 ? "" : "s"}</em> : <em>{(result.assertions || []).length} assertion{(result.assertions || []).length === 1 ? "" : "s"} passed</em>}</summary><div className="execution-assertion-list">{(result.assertions || []).map((assertion, index) => <div key={`${result.result_id}-${index}`} className={`execution-assertion ${assertion.status}`}><span>{assertion.status === "passed" ? <CheckCircle2 size={14} /> : <XCircle size={14} />}</span><div><strong>{assertion.name}</strong><small>{assertion.message}</small>{assertion.status === "failed" && <code>Expected: {JSON.stringify(assertion.expected)} | Actual: {JSON.stringify(assertion.actual)}</code>}</div></div>)}</div><div className="execution-bronze-refs"><strong>Bronze refs</strong><span>{(result.bronze_refs || []).map((ref) => `${ref.bronze_table}:${ref.bronze_id}`).join(", ") || "No Bronze refs"}</span></div></details>; })}</div></article>)}</div></section>}
         </>}
   </div>;
 }
