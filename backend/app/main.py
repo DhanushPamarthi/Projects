@@ -117,6 +117,10 @@ def safe_llm_error_message(exc: Exception) -> str:
         return "OpenAI rejected the configured API key."
     return message
 
+def _is_context_length_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "context_length_exceeded" in message or "exceeds the context window" in message or "context window" in message
+
 def _try_retrieve_package_context(package_id: str, requested_by: str):
     timeout_seconds = float(os.getenv("RAG_RETRIEVAL_TIMEOUT_SECONDS", "4"))
     if timeout_seconds <= 0:
@@ -147,11 +151,18 @@ def _try_retrieve_package_context(package_id: str, requested_by: str):
 def _rag_metadata_or_none(rag):
     return rag.get("rag_metadata") if rag else None
 
-def _rag_context_for_prompt(rag, max_evidence: int = 24, max_fragment_characters: int = 900):
+def _rag_context_for_prompt(rag, max_evidence: int = 8, max_fragment_characters: int = 500, max_rules: int = 8, max_rule_characters: int = 260):
     if not rag:
         return {}
     fragments = rag.get("brd_fragments", []) + rag.get("technical_fragments", [])
-    return {"index_id": rag.get("index_id"), "context_hash": rag.get("context_hash"), "approved_business_rules": rag.get("approved_rules", []), "evidence": [
+    approved_rules = []
+    for rule in (rag.get("approved_rules") or [])[:max_rules]:
+        approved_rules.append({
+            "rule_id": rule.get("rule_id"),
+            "statement": str(rule.get("statement") or "")[:max_rule_characters],
+            "source_reference": rule.get("source_reference"),
+        })
+    return {"index_id": rag.get("index_id"), "context_hash": rag.get("context_hash"), "approved_business_rules": approved_rules, "evidence": [
         {"source_type": item.get("source_type"), "source_reference": item.get("source_reference"),
          "fragment_id": item.get("original_fragment_id") or item.get("fragment_id"),
          "text": str(item.get("fragment_text") or "")[:max_fragment_characters]} for item in fragments[:max_evidence]
@@ -1823,13 +1834,13 @@ def _business_requirements_schema():
         "global_assumptions": {"type": "array", "items": {"type": "string"}},
     }, "required": ["business_requirements", "global_gaps", "global_assumptions"]}
 
-def _business_requirement_prompt_payload(package, items, fragments):
+def _business_requirement_prompt_payload(package, items, fragments, brd_text_limit: int = 6_000, supporting_text_limit: int = 1_200, citation_anchor_limit: int = 80):
     item_by_source = {item.get("source_id"): item for item in items}
     source_documents = []
     for item in items:
         source_type = item.get("source_type")
         full_text = " ".join(str(item.get("extracted_text") or "").split())
-        text_limit = 12_000 if source_type == "brd" else 2_500
+        text_limit = brd_text_limit if source_type == "brd" else supporting_text_limit
         source_documents.append({
             "source_id": item.get("source_id"),
             "revision_id": item.get("revision_id"),
@@ -1852,7 +1863,7 @@ def _business_requirement_prompt_payload(package, items, fragments):
                 "source_type": item_by_source.get(fragment.get("source_id"), {}).get("source_type"),
                 "heading": fragment.get("heading"),
             }
-            for fragment in fragments[:160] if fragment.get("fragment_id")
+            for fragment in fragments[:citation_anchor_limit] if fragment.get("fragment_id")
         ],
     }
 
@@ -1966,33 +1977,54 @@ def _business_requirements_with_openai(package, items, fragments, rag_context=No
     if not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY is not configured for Business Requirements generation")
     from openai import OpenAI
-    payload = _business_requirement_prompt_payload(package, items, fragments)
-    payload["retrieved_knowledge_evidence"] = _rag_context_for_prompt(rag_context, max_evidence=12, max_fragment_characters=700)
-    prompt = (
-        "Generate a flat list of distinct business requirements from the source package. "
-        "Use source_documents[].full_text as the primary input. The BRD full_text is the authority for business scope. "
-        "Use database schema, API, campaign rules, and templates full_text only to clarify entities, data dependencies, eligibility checks, and implementation context. "
-        "Use retrieved_knowledge_evidence as the ranked, package-scoped evidence context. It may guide consolidation and technical interpretation, but BRD evidence remains authoritative for business scope. Cite only source fragment IDs listed in citation_anchors. "
-        "Do not derive requirements by enumerating citation_anchors; citation_anchors exist only so you can return traceable source IDs. "
-        "Do not generate Functional Requirements, acceptance criteria, flow steps, UI behavior, or test cases. "
-        "Merge duplicates and near duplicates across BRD tables, repeated headings, and supporting sources. "
-        "Each item must be a meaningful end-to-end business use case or business decision, not a copied sentence fragment. "
-        "Prefer 5 to 12 consolidated requirements for a small BRD; create more only when the BRD has truly separate business outcomes. "
-        "Use Must have/Should have/Could have priority. Cite BRD anchors in source_references and put supporting schema/API/template anchors in supporting_source_references. "
-        "If a precise anchor is not obvious, choose the nearest anchor from the same source document and heading.\n\nINPUT JSON:\n"
-        + json.dumps(payload, ensure_ascii=False)
-    )
-    response = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=OPENAI_TIMEOUT_SECONDS).responses.create(
-        model=OPENAI_MODEL,
-        input=prompt,
-        store=False,
-        text={"format": {"type": "json_schema", "name": "business_requirements_contract", "strict": True, "schema": _business_requirements_schema()}},
-    )
-    if not response.output_text:
-        raise ValueError("OpenAI returned no Business Requirements")
-    contract = json.loads(response.output_text)
-    _validate_business_requirements_contract(contract, fragments)
-    return contract["business_requirements"]
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=OPENAI_TIMEOUT_SECONDS)
+
+    def run_with_limits(brd_limit, supporting_limit, anchor_limit, evidence_limit, evidence_characters, rule_limit, rule_characters):
+        payload = _business_requirement_prompt_payload(
+            package, items, fragments,
+            brd_text_limit=brd_limit,
+            supporting_text_limit=supporting_limit,
+            citation_anchor_limit=anchor_limit,
+        )
+        payload["retrieved_knowledge_evidence"] = _rag_context_for_prompt(
+            rag_context,
+            max_evidence=evidence_limit,
+            max_fragment_characters=evidence_characters,
+            max_rules=rule_limit,
+            max_rule_characters=rule_characters,
+        )
+        prompt = (
+            "Generate a flat list of distinct business requirements from the source package. "
+            "Use source_documents[].full_text as the primary input. The BRD full_text is the authority for business scope. "
+            "Use database schema, API, campaign rules, and templates full_text only to clarify entities, data dependencies, eligibility checks, and implementation context. "
+            "Use retrieved_knowledge_evidence as ranked package context. It may guide consolidation and technical interpretation, but BRD evidence remains authoritative for business scope. Cite only source fragment IDs listed in citation_anchors. "
+            "Do not derive requirements by enumerating citation_anchors; citation_anchors exist only so you can return traceable source IDs. "
+            "Do not generate Functional Requirements, acceptance criteria, flow steps, UI behavior, or test cases. "
+            "Merge duplicates and near duplicates across BRD tables, repeated headings, and supporting sources. "
+            "Each item must be a meaningful end-to-end business use case or business decision, not a copied sentence fragment. "
+            "Prefer 5 to 12 consolidated requirements for a small BRD; create more only when the BRD has truly separate business outcomes. "
+            "Use Must have/Should have/Could have priority. Cite BRD anchors in source_references and put supporting schema/API/template anchors in supporting_source_references. "
+            "If a precise anchor is not obvious, choose the nearest anchor from the same source document and heading.\n\nINPUT JSON:\n"
+            + json.dumps(payload, ensure_ascii=False)
+        )
+        response = client.responses.create(
+            model=OPENAI_MODEL,
+            input=prompt,
+            store=False,
+            text={"format": {"type": "json_schema", "name": "business_requirements_contract", "strict": True, "schema": _business_requirements_schema()}},
+        )
+        if not response.output_text:
+            raise ValueError("OpenAI returned no Business Requirements")
+        contract = json.loads(response.output_text)
+        _validate_business_requirements_contract(contract, fragments)
+        return contract["business_requirements"]
+
+    try:
+        return run_with_limits(6_000, 1_200, 80, 8, 450, 8, 260)
+    except Exception as exc:
+        if not _is_context_length_error(exc):
+            raise
+        return run_with_limits(3_000, 600, 50, 4, 300, 4, 180)
 
 def _business_requirements_with_timeout(package, items, fragments, rag_context=None):
     result, failure = [], []
