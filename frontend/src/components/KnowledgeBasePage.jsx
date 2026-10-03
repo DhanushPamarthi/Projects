@@ -18,6 +18,16 @@ export function KnowledgeBasePage({ onContinueToBusinessRequirements }) {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
 
+  function clearSelectedPackage() {
+    setPackageId("");
+    setIndexes([]);
+    setReadiness(null);
+    setSelectedIndex(null);
+    setRetrieval(null);
+    setEvaluation(null);
+    localStorage.removeItem("testiq_current_package");
+  }
+
   async function loadPackage(id = packageId) {
     if (!id) {
       setIndexes([]);
@@ -37,7 +47,12 @@ export function KnowledgeBasePage({ onContinueToBusinessRequirements }) {
       setRetrieval(null);
       setEvaluation(null);
     } catch (err) {
-      setError(err.message);
+      if (err.status === 404) {
+        clearSelectedPackage();
+        setError("Selected source package was not found. Choose an available source package or create a new one.");
+      } else {
+        setError(err.message);
+      }
     } finally {
       setWorking("");
     }
@@ -61,9 +76,8 @@ export function KnowledgeBasePage({ onContinueToBusinessRequirements }) {
         setProject(chosenProject);
         if (!chosenProject) {
           setPackages([]);
-          setPackageId("");
+          clearSelectedPackage();
           localStorage.removeItem("testiq_current_project");
-          localStorage.removeItem("testiq_current_package");
           return;
         }
         localStorage.setItem("testiq_current_project", JSON.stringify(chosenProject));
@@ -78,7 +92,7 @@ export function KnowledgeBasePage({ onContinueToBusinessRequirements }) {
         if (chosenPackage) {
           localStorage.setItem("testiq_current_package", JSON.stringify(chosenPackage));
         } else {
-          localStorage.removeItem("testiq_current_package");
+          clearSelectedPackage();
         }
       } catch (err) {
         if (active) setError(err.message);
@@ -104,25 +118,22 @@ export function KnowledgeBasePage({ onContinueToBusinessRequirements }) {
     setWorking("projects");
     setError("");
     const chosen = projects.find((item) => item.project_id === id);
+    const storedPackage = JSON.parse(localStorage.getItem("testiq_current_package") || "null");
     setProject(chosen || null);
     setPackages([]);
-    setPackageId("");
-    setIndexes([]);
-    setReadiness(null);
-    setSelectedIndex(null);
+    clearSelectedPackage();
     try {
       if (chosen) {
         localStorage.setItem("testiq_current_project", JSON.stringify(chosen));
         const rows = await listManifests(id);
         setPackages(rows);
-        const storedPackage = JSON.parse(localStorage.getItem("testiq_current_package") || "null");
         const chosenPackage = rows.find((item) => item.package_id === storedPackage?.package_id) || rows[0] || null;
         setPackageId(chosenPackage?.package_id || "");
         if (chosenPackage) localStorage.setItem("testiq_current_package", JSON.stringify(chosenPackage));
-        else localStorage.removeItem("testiq_current_package");
+        else clearSelectedPackage();
       } else {
         localStorage.removeItem("testiq_current_project");
-        localStorage.removeItem("testiq_current_package");
+        clearSelectedPackage();
       }
     } catch (err) {
       setError(err.message);
@@ -204,7 +215,7 @@ export function KnowledgeBasePage({ onContinueToBusinessRequirements }) {
           const chosen = packages.find((item) => item.package_id === id);
           setPackageId(id);
           if (chosen) localStorage.setItem("testiq_current_package", JSON.stringify(chosen));
-          else localStorage.removeItem("testiq_current_package");
+          else clearSelectedPackage();
         }} disabled={!packages.length || isLoadingWorkspace}>
           <option value="">Choose source package</option>
           {packages.map((item) => <option key={item.package_id} value={item.package_id}>v{item.package_version} · {item.package_name || item.scope || "Source package"}</option>)}
