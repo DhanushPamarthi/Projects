@@ -158,11 +158,11 @@ The analysis input is the exact package selected by `package_id`, including its 
 
 The PBM refill-reminder POC splits the BRD into functional requirements such as member identification, prescription eligibility, SMS communication, phone fallback, communication outcomes, and eligibility revalidation.
 
-## Test data templates and Bronze records
+## Test data and Bronze records
 
-Approved cases can use project-scoped JSON templates for entities such as members and prescriptions. Save a template with `POST /api/v1/test-data-templates`, list templates with `GET /api/v1/projects/{project_id}/test-data-templates`, and generate case-specific drafts with `POST /api/v1/test-case-generations/{generation_id}/test-data`. Pass per-case `assignments`, where each item contains a `test_case_id` and only the `template_ids` needed by that case. The frontend suggests assignments from each case's scenario, data needs, and pre-steps, and lets the reviewer adjust them before generation.
+Approved cases derive their test data shape from the selected package Knowledge Base, the approved test case, and the case pre-step setup. `POST /api/v1/test-case-generations/{generation_id}/test-data` creates case-specific drafts without storing reusable templates in the database.
 
-Generation uses the configured OpenAI model to create scenario-specific synthetic values that follow each selected template's exact JSON shape and value types. It batches up to ten cases per template request, then assigns unique IDs and links prescription `member_id` values to generated members. If the LLM is unavailable or fails, deterministic synthetic values are generated from the template and case, and the response identifies that fallback for the reviewer. The frontend lets the reviewer edit the generated JSON before `POST /api/v1/test-case-generations/{generation_id}/test-data/save` writes reviewed setup data to the Bronze domain tables in `bronzebox`: member data goes to `membership`, prescription data goes to `prescription`, and campaign or communication setup goes to `order`. The saved TestIQ row stores Bronze references such as `membership:1026,prescription:1026`.
+Generation uses the configured OpenAI model to create scenario-specific synthetic values from the Knowledge Base evidence. If the LLM is unavailable or fails, deterministic synthetic values are generated from the case context and the response identifies that fallback for the reviewer. The frontend lets the reviewer edit the generated JSON before `POST /api/v1/test-case-generations/{generation_id}/test-data/save` writes reviewed setup data to the Bronze domain tables in `bronzebox`: member data goes to `membership`, prescription data goes to `prescription`, and campaign or communication setup goes to `order`. The saved TestIQ row keeps the legacy Bronze reference text, and `testiq.test_data_bronze_ref` stores normalized Bronze references for execution and traceability.
 
 ## Test
 
