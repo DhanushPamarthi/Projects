@@ -2879,6 +2879,77 @@ button {
   color: #8997a5;
   font-size: 11px;
 }
+.knowledge-page .knowledge-progress-card {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+  padding: 14px 16px;
+  border: 1px solid #dbe7f4;
+  border-radius: 10px;
+  background: linear-gradient(180deg, #f8fbff 0%, #ffffff 100%);
+}
+.knowledge-page .knowledge-progress-card.ready {
+  border-color: #c8ead8;
+  background: linear-gradient(180deg, #f7fffb 0%, #ffffff 100%);
+}
+.knowledge-page .knowledge-progress-card.pending {
+  border-color: #f0ddb0;
+  background: linear-gradient(180deg, #fffaf0 0%, #ffffff 100%);
+}
+.knowledge-page .knowledge-progress-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+.knowledge-page .knowledge-progress-head strong,
+.knowledge-page .knowledge-progress-head span {
+  display: block;
+}
+.knowledge-page .knowledge-progress-head strong {
+  color: #25364a;
+  font-size: 13px;
+}
+.knowledge-page .knowledge-progress-head span {
+  margin-top: 3px;
+  color: #718096;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+}
+.knowledge-page .knowledge-progress-head b {
+  color: var(--orange);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+.knowledge-page .knowledge-progress-card.ready .knowledge-progress-head b {
+  color: #218c61;
+}
+.knowledge-page .knowledge-progress-track {
+  position: relative;
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #dce7f3;
+}
+.knowledge-page .knowledge-progress-track span {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--orange), #ffad9e);
+  transition: width 350ms ease;
+}
+.knowledge-page .knowledge-progress-card.ready .knowledge-progress-track span {
+  background: linear-gradient(90deg, #22a06b, #8ee1b1);
+}
+.knowledge-page .knowledge-progress-card p {
+  margin: 0;
+  color: #66758a;
+  font-size: 11px;
+  line-height: 1.45;
+}
 .knowledge-page .knowledge-results .source-list-card {
   background: white;
 }

@@ -22,7 +22,7 @@ const GENERATION_ANALYSIS_KEY = "testiq_generation_analysis";
 const VALID_NAV_ITEMS = new Set(["overview", "sources", "packages", "business-requirements", "requirements", "test-cases", "test-data", "test-results", "activity", "traceability", "knowledge-base"]);
 const NAV_ITEMS = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
-  { id: "sources", label: "Source Package", icon: FileStack, badge: "1", badgeLabel: "1 source issue" },
+  { id: "sources", label: "Source Package", icon: FileStack },
   { id: "packages", label: "Packages", icon: PackageOpen },
   { id: "business-requirements", label: "Business Use Cases", icon: ListChecks },
   { id: "requirements", label: "Functional Requirements", icon: ListChecks },

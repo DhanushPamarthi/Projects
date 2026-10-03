@@ -28,33 +28,38 @@ export function KnowledgeBasePage({ onContinueToBusinessRequirements }) {
     localStorage.removeItem("testiq_current_package");
   }
 
-  async function loadPackage(id = packageId) {
+  async function loadPackage(id = packageId, options = {}) {
+    const silent = Boolean(options.silent);
     if (!id) {
       setIndexes([]);
       setReadiness(null);
       setSelectedIndex(null);
-      setWorking("");
+      if (!silent) setWorking("");
       return;
     }
-    setWorking("load");
-    setError("");
+    if (!silent) {
+      setWorking("load");
+      setError("");
+    }
     try {
       const [nextIndexes, nextReadiness] = await Promise.all([listKnowledgeIndexes(id), getRagReadiness(id)]);
       const list = Array.isArray(nextIndexes) ? nextIndexes : nextIndexes?.indexes || [];
       setIndexes(list);
       setReadiness(nextReadiness);
-      setSelectedIndex(list[0] || null);
-      setRetrieval(null);
-      setEvaluation(null);
+      setSelectedIndex((current) => list.find((item) => item.index_id === current?.index_id) || list[0] || null);
+      if (!silent) {
+        setRetrieval(null);
+        setEvaluation(null);
+      }
     } catch (err) {
       if (err.status === 404) {
         clearSelectedPackage();
         setError("Selected source package was not found. Choose an available source package or create a new one.");
-      } else {
+      } else if (!silent) {
         setError(err.message);
       }
     } finally {
-      setWorking("");
+      if (!silent) setWorking("");
     }
   }
 
@@ -111,8 +116,21 @@ export function KnowledgeBasePage({ onContinueToBusinessRequirements }) {
   const chosenPackage = useMemo(() => packages.find((item) => item.package_id === packageId), [packages, packageId]);
   const statusLabel = readiness?.ready ? "Ready" : selectedIndex?.status || readiness?.status || "Not built";
   const hasReadyIndex = selectedIndex?.status === "ready" && readiness?.ready !== false;
+  const latestIndex = useMemo(() => indexes.find((item) => item.index_id === readiness?.index_id) || indexes[0] || null, [indexes, readiness?.index_id]);
+  const progressIndex = latestIndex || selectedIndex;
+  const storedProgress = Number(readiness?.progress_percent ?? progressIndex?.progress_percent ?? 0);
+  const knowledgeProgress = Math.max(0, Math.min(100, working === "build" ? Math.max(5, storedProgress) : storedProgress));
+  const knowledgeStage = readiness?.progress_stage || progressIndex?.progress_stage || progressIndex?.status || statusLabel;
+  const knowledgeMessage = readiness?.progress_message || progressIndex?.progress_message || readiness?.message || "Knowledge Base status is checked from the latest package index.";
+  const isKnowledgeBuilding = working === "build" || readiness?.index_status === "building" || readiness?.status === "building" || progressIndex?.status === "building";
   const isLoadingWorkspace = working === "projects";
   const isLoadingKnowledge = working === "load" && Boolean(chosenPackage);
+
+  useEffect(() => {
+    if (!packageId || !isKnowledgeBuilding) return undefined;
+    const timer = window.setInterval(() => loadPackage(packageId, { silent: true }), 2500);
+    return () => window.clearInterval(timer);
+  }, [packageId, isKnowledgeBuilding]);
 
   async function selectProject(id) {
     setWorking("projects");
@@ -150,7 +168,7 @@ export function KnowledgeBasePage({ onContinueToBusinessRequirements }) {
     try {
       const built = await buildKnowledgeIndex(packageId);
       setNotice(built.reused ? "Knowledge Base is already ready for this package." : "Knowledge Base is ready for this package.");
-      await loadPackage(packageId);
+      await loadPackage(packageId, { silent: true });
       if (built.index_id) setSelectedIndex(built);
     } catch (err) {
       setError(err.message);
@@ -244,6 +262,19 @@ export function KnowledgeBasePage({ onContinueToBusinessRequirements }) {
           <span> · v{chosenPackage.package_version} · {chosenPackage.source_count || chosenPackage.items?.length || 0} source(s)</span>
           <p>{readiness?.message || "Knowledge Base status is checked from the latest package index."}</p>
         </div>
+        {(progressIndex || readiness) && <div className={`knowledge-progress-card ${isKnowledgeBuilding ? "building" : hasReadyIndex ? "ready" : "pending"}`}>
+          <div className="knowledge-progress-head">
+            <div>
+              <strong>{isKnowledgeBuilding ? "Building Knowledge Base" : hasReadyIndex ? "Knowledge Base ready" : "Knowledge Base status"}</strong>
+              <span>{knowledgeStage}</span>
+            </div>
+            <b>{knowledgeProgress}%</b>
+          </div>
+          <div className="knowledge-progress-track" role="progressbar" aria-label="Knowledge Base build progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow={knowledgeProgress}>
+            <span style={{ width: `${knowledgeProgress}%` }} />
+          </div>
+          <p>{knowledgeMessage}</p>
+        </div>}
         <div className="review-actions">
           <label className="package-selector">
             <span>Index version</span>
