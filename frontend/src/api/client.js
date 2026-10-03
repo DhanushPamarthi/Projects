@@ -215,6 +215,14 @@ export async function updateExecutionRunLifecycle(runId, payload) {
   });
 }
 
+export async function executeExecutionRun(runId, payload = {}) {
+  return request(`/api/v1/execution-runs/${encodeURIComponent(runId)}/execute`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
 export async function generateTestData(generationId, payload) {
   return request(`/api/v1/test-case-generations/${encodeURIComponent(generationId)}/test-data`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
 }

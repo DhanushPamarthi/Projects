@@ -145,6 +145,55 @@ export function UploadStep({ onContinueToBusinessUseCases }) {
     setBrdSourceId(brds[0]?.source_id || "");
   }
 
+  function optimisticSourceFromUpload(uploaded, selectedFile, selectedSourceType) {
+    const revision = {
+      revision_id: uploaded.revision_id,
+      revision: uploaded.revision || 1,
+      filename: selectedFile.name,
+      size_bytes: selectedFile.size,
+      validation_messages: uploaded.validation_messages || [],
+    };
+    return {
+      source_id: uploaded.source_id,
+      source_type: selectedSourceType,
+      logical_name: selectedFile.name,
+      active_revision: revision,
+      latest_revision: revision,
+      status: uploaded.status === "duplicate" ? "uploaded" : "pending",
+      validation_messages: uploaded.validation_messages || [],
+      extraction: uploaded.extraction || { status: "pending" },
+    };
+  }
+
+  function mergeSource(nextSource) {
+    setSources((items) => {
+      const existing = items.filter((item) => item.source_id !== nextSource.source_id);
+      return [...existing, nextSource];
+    });
+  }
+
+  function updateSourceFromRevision(sourceId, revision) {
+    setSources((items) => items.map((item) => {
+      if (item.source_id !== sourceId) return item;
+      const latestRevision = {
+        ...(item.latest_revision || {}),
+        revision_id: revision.revision_id,
+        revision: revision.revision,
+        filename: revision.filename,
+        size_bytes: revision.size_bytes,
+        validation_messages: revision.validation_messages || [],
+      };
+      return {
+        ...item,
+        active_revision: latestRevision,
+        latest_revision: latestRevision,
+        status: revision.status,
+        validation_messages: revision.validation_messages || [],
+        extraction: revision.extraction || item.extraction,
+      };
+    }));
+  }
+
   async function handleUpload() {
     if (!file) return;
     if (sourceType === "brd" && !project && !projectName.trim()) {
@@ -155,12 +204,19 @@ export function UploadStep({ onContinueToBusinessUseCases }) {
     setError("");
     try {
       if (sourceType !== "brd" && !activeBrdSourceId) throw new Error("Upload a BRD before adding supporting sources.");
+      const selectedFile = file;
+      const selectedSourceType = sourceType;
       const activeProject = project || await createProject(projectName.trim());
       setProject(activeProject);
       setProjectName(activeProject.project_name);
       localStorage.setItem("testiq_current_project", JSON.stringify(activeProject));
-      const uploaded = await uploadSource(activeProject.project_id, file, sourceType, activeBrdSourceId, requiredSections);
-      const isBrdUpload = sourceType === "brd";
+      const uploaded = await uploadSource(activeProject.project_id, selectedFile, selectedSourceType, activeBrdSourceId, requiredSections);
+      const isBrdUpload = selectedSourceType === "brd";
+      mergeSource(optimisticSourceFromUpload(uploaded, selectedFile, selectedSourceType));
+      setSelectedPackageSourceIds((current) => {
+        const withoutOtherBrds = selectedSourceType === "brd" ? current.filter((sourceId) => !brds.some((item) => item.source_id === sourceId)) : current;
+        return [...new Set([...withoutOtherBrds, uploaded.source_id])];
+      });
       const successMessage = uploaded.status === "duplicate"
         ? "Duplicate retained for traceability."
         : isBrdUpload
@@ -176,15 +232,9 @@ export function UploadStep({ onContinueToBusinessUseCases }) {
         setPackageName("");
       }
       setFile(null);
-      try {
-        await refreshSources(activeProject.project_id);
-        setSelectedPackageSourceIds((current) => {
-          const withoutOtherBrds = sourceType === "brd" ? current.filter((sourceId) => !brds.some((item) => item.source_id === sourceId)) : current;
-          return [...new Set([...withoutOtherBrds, uploaded.source_id])];
-        });
-      } catch {
+      refreshSources(activeProject.project_id).catch(() => {
         setError("Upload succeeded, but the source list could not refresh. Reload the page to see the uploaded file.");
-      }
+      });
       listProjects().then(setProjects).catch(() => {});
       if (uploaded.extraction?.status === "pending") pollExtraction(uploaded, activeProject.project_id, isBrdUpload);
     } catch (err) {
@@ -203,6 +253,7 @@ export function UploadStep({ onContinueToBusinessUseCases }) {
         const revision = await getRevision(uploaded.revision_id);
         completedRevision = revision;
         finalStatus = revision.extraction?.status || "pending";
+        updateSourceFromRevision(uploaded.source_id, revision);
         if (["succeeded", "failed", "skipped"].includes(finalStatus)) break;
       } catch {
         finalStatus = "failed";
@@ -321,7 +372,7 @@ export function UploadStep({ onContinueToBusinessUseCases }) {
         {file && <div className="selected-file"><span className="file-type"><FileText size={17} /></span><div><strong>{file.name}</strong><span>{(file.size / 1024).toFixed(1)} KB - Ready to upload</span></div><button onClick={() => setFile(null)}><X size={17} /></button></div>}
         <div className="panel-footer"><span className="secure-note"><ShieldCheck size={15} /> Original files are preserved securely</span><div className="panel-actions"><button className="primary-button" disabled={!file || busy || (sourceType === "brd" && !project && !projectName.trim()) || (sourceType !== "brd" && !activeBrdSourceId)} onClick={handleUpload}>{busy ? <LoadingSpinner variant="inline" label="Uploading" /> : <><CloudUpload size={16} /> {currentStep === 1 ? (brds.length ? "Upload updated BRD" : "Upload BRD") : "Add source"}</>}</button>{currentStep === 1 && brds.length > 0 && <button className="secondary-button" disabled={busy} onClick={async () => { await refreshSources(project?.project_id); continueToSources(); setSourceType("api_spec"); setBrdSourceId(brds[0].source_id); }}>Continue to sources <ChevronRight size={15} /></button>}</div></div>
       </section>
-      <aside className="side-panel"><div className="side-panel-head"><span className="side-icon"><Sparkles size={17} /></span><div><h3>Smart processing</h3><p>What happens next</p></div></div><div className="info-list"><div><b>01</b><span>We preserve the original file and create a versioned revision.</span></div><div><b>02</b><span>AI extraction runs automatically with local fallback.</span></div><div><b>03</b><span>Every section stays traceable to its source and page.</span></div></div><div className="privacy-note"><ShieldCheck size={16} /><span>Your API key stays on the backend. It is never sent from this screen.</span></div></aside>
+      <aside className="side-panel"><div className="side-panel-head"><span className="side-icon"><Sparkles size={17} /></span><div><h3>Smart processing</h3><p>What happens next</p></div></div><div className="info-list"><div><b>01</b><span>We preserve the original file and create a versioned revision.</span></div><div><b>02</b><span>Extraction prepares traceable source evidence in the background.</span></div><div><b>03</b><span>Every section stays traceable to its source and page.</span></div></div><div className="privacy-note"><ShieldCheck size={16} /><span>Your API key stays on the backend. It is never sent from this screen.</span></div></aside>
     </div>}
 
     {currentStep === 2 && !manifest && <section className="source-list-card"><div className="list-card-header"><div><h2>Package sources</h2><p>All supporting sources and the active BRD are included in this package.</p></div><span className="health-badge"><span /> {packagePending ? "Processing" : "Sources ready"}</span></div>{packagePending && <LoadingSpinner variant="section" label="Processing package sources" detail="Extracting content and preparing traceable source evidence." />}<div className="package-source-selection">{sources.filter((source) => selectedPackageSourceIds.includes(source.source_id)).map((source) => <div className="package-source-option" key={source.source_id}><SourceRow source={source} compact /></div>)}</div><div className="list-card-actions"><button className="secondary-button" onClick={() => { setStep(1); setSourceType("brd"); setBrdSourceId(""); }}><ChevronLeft size={15} /> Back to BRD</button><button className="secondary-button" disabled={!packageReady} onClick={() => setStep(3)}><PackageCheck size={16} /> {packagePending ? "Waiting for extraction" : packageRejected ? "Fix selected sources" : selectedBrds.length !== 1 ? "Select one BRD" : "Review package"} <ChevronRight size={15} /></button></div></section>}
