@@ -151,6 +151,34 @@ def _try_retrieve_package_context(package_id: str, requested_by: str):
 def _rag_metadata_or_none(rag):
     return rag.get("rag_metadata") if rag else None
 
+def _rag_status(rag, *, required: bool = False):
+    metadata = _rag_metadata_or_none(rag)
+    if metadata:
+        return {
+            "used": True,
+            "required": required,
+            "index_id": metadata.get("index_id"),
+            "context_hash": metadata.get("context_hash"),
+            "retrieval_ids": metadata.get("retrieval_ids", []),
+            "message": "Knowledge Base used for this run.",
+        }
+    return {
+        "used": False,
+        "required": required,
+        "index_id": None,
+        "context_hash": None,
+        "retrieval_ids": [],
+        "message": "Knowledge Base was not ready or could not be retrieved for this run.",
+    }
+
+def _require_package_context(package_id: str, requested_by: str):
+    try:
+        return retrieve_package_context(package_id, requested_by=requested_by)
+    except HTTPException as exc:
+        raise exc
+    except Exception as exc:
+        raise HTTPException(502, f"Knowledge Base retrieval failed for {requested_by}: {safe_llm_error_message(exc)}") from exc
+
 def _rag_context_for_prompt(rag, max_evidence: int = 8, max_fragment_characters: int = 500, max_rules: int = 8, max_rule_characters: int = 260):
     if not rag:
         return {}
@@ -325,7 +353,7 @@ class TestDataTemplateDefinition(BaseModel):
 
 class TestDataCaseAssignment(BaseModel):
     test_case_id: str = Field(min_length=1, max_length=100)
-    template_ids: list[str] = Field(min_length=1)
+    template_ids: list[str] = Field(default_factory=list)
 
 class TestDataGenerationRequest(BaseModel):
     reviewer: str | None = Field(default=None, max_length=200)
@@ -2237,7 +2265,7 @@ def generate_functional_requirements(package_id: str):
         item_rows = [row_dict(item) for item in source_items]
         fragment_rows = [row_dict(fragment) for fragment in fragments]
         contexts = _discovery_contexts_for_package(conn, row_dict(package))
-        rag = _try_retrieve_package_context(package_id, requested_by="Functional Requirements")
+        rag = _require_package_context(package_id, requested_by="Functional Requirements")
         try:
             contract = _generate_functional_contract(row_dict(package), item_rows, fragment_rows, approved, contexts, rag)
         except HTTPException:
@@ -2247,6 +2275,7 @@ def generate_functional_requirements(package_id: str):
             contract["generation_note"] = f"LLM Functional Requirements generation failed; local fallback was used: {safe_llm_error_message(exc)}"
             contract.setdefault("global_gaps", []).append("LLM Functional Requirements generation was unavailable, so the local fallback was used.")
         contract["rag_metadata"] = _rag_metadata_or_none(rag)
+        contract["rag_status"] = _rag_status(rag, required=True)
         version = conn.execute("SELECT COALESCE(MAX(analysis_version),0)+1 AS v FROM requirement_analysis WHERE package_id=%s", (package_id,)).fetchone()["v"]
         analysis_id, timestamp = uid("req"), now()
         conn.execute("INSERT INTO requirement_analysis (analysis_id,package_id,project_id,analysis_version,status,contract_json,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", (analysis_id, package_id, package["project_id"], version, "needs_review", json.dumps(contract), timestamp, timestamp))
@@ -2279,6 +2308,7 @@ def generate_business_requirements(package_id: str):
             raise HTTPException(502, f"LLM Business Requirements generation failed: {safe_llm_error_message(exc)}")
         contract = _business_requirements_to_review_contract(row_dict(package), item_rows, business_items, "openai", OPENAI_MODEL)
         contract["rag_metadata"] = _rag_metadata_or_none(rag)
+        contract["rag_status"] = _rag_status(rag, required=False)
         version = conn.execute("SELECT COALESCE(MAX(analysis_version),0)+1 AS v FROM requirement_analysis WHERE package_id=%s", (package_id,)).fetchone()["v"]
         analysis_id, timestamp = uid("req"), now()
         conn.execute("INSERT INTO requirement_analysis (analysis_id,package_id,project_id,analysis_version,status,contract_json,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", (analysis_id, package_id, package["project_id"], version, "needs_review", json.dumps(contract), timestamp, timestamp))
@@ -2312,6 +2342,7 @@ def analyze_requirements(package_id: str):
             contract = _requirement_contract(row_dict(package), item_rows, fragment_rows)
             contract["generation_note"] = "LLM Requirements Analysis was not run because OPENAI_API_KEY is not configured."
         contract["rag_metadata"] = _rag_metadata_or_none(rag)
+        contract["rag_status"] = _rag_status(rag, required=False)
         version = conn.execute("SELECT COALESCE(MAX(analysis_version),0)+1 AS v FROM requirement_analysis WHERE package_id=%s", (package_id,)).fetchone()["v"]
         analysis_id, timestamp = uid("req"), now()
         conn.execute("INSERT INTO requirement_analysis (analysis_id,package_id,project_id,analysis_version,status,contract_json,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", (analysis_id, package_id, package["project_id"], version, "needs_review", json.dumps(contract), timestamp, timestamp))
@@ -2413,7 +2444,7 @@ def generate_test_cases_from_analysis(analysis_id: str, request: TestCaseGenerat
         package_row = row_dict(package)
         discovery_contexts = []
         requested_count = request.count
-        rag = _try_retrieve_package_context(package_row["package_id"], requested_by="Test Case Generation")
+        rag = _require_package_context(package_row["package_id"], requested_by="Test Case Generation")
         try:
             if os.getenv("OPENAI_API_KEY"):
                 generated = _test_cases_with_openai(approved_requirements, package_row, requested_count, discovery_contexts, rag)
@@ -2428,7 +2459,7 @@ def generate_test_cases_from_analysis(analysis_id: str, request: TestCaseGenerat
         _validate_test_case_contract(generated, approved_requirements, requested_count, discovery_contexts, rag)
         generation_id, timestamp = uid("tcg"), now()
         requirement_contract_hash = hashlib.sha256(json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-        generated.update({"contract_version": "1.0", "generation_id": generation_id, "analysis_id": analysis_id, "analysis_version": analysis["analysis_version"], "project_id": analysis["project_id"], "requirement_contract_hash": requirement_contract_hash, "package_id": package["package_id"], "package_version": package["package_version"], "source_package_run_id": package["run_id"], "requested_test_case_count": len(generated.get("test_cases", [])), "count_strategy": "derived_from_approved_functional_requirements_acceptance_criteria_and_business_rules" if requested_count is None else "user_requested", "generation_mode": mode, "generation_model": OPENAI_MODEL if mode == "openai" else LOCAL_EXTRACTOR_VERSION, "generation_prompt_version": TEST_CASE_GENERATION_PROMPT_VERSION, "generation_prompt_hash": test_case_generation_prompt_hash(), "generated_at": timestamp, "approved_requirement_ids": [item["requirement_id"] for item in approved_requirements], "source_package_items": contract.get("source_package_items", []), "discovery_contexts": discovery_contexts, "discovery_context_ids": [context["context_id"] for context in discovery_contexts], "rag_metadata": _rag_metadata_or_none(rag)})
+        generated.update({"contract_version": "1.0", "generation_id": generation_id, "analysis_id": analysis_id, "analysis_version": analysis["analysis_version"], "project_id": analysis["project_id"], "requirement_contract_hash": requirement_contract_hash, "package_id": package["package_id"], "package_version": package["package_version"], "source_package_run_id": package["run_id"], "requested_test_case_count": len(generated.get("test_cases", [])), "count_strategy": "derived_from_approved_functional_requirements_acceptance_criteria_and_business_rules" if requested_count is None else "user_requested", "generation_mode": mode, "generation_model": OPENAI_MODEL if mode == "openai" else LOCAL_EXTRACTOR_VERSION, "generation_prompt_version": TEST_CASE_GENERATION_PROMPT_VERSION, "generation_prompt_hash": test_case_generation_prompt_hash(), "generated_at": timestamp, "approved_requirement_ids": [item["requirement_id"] for item in approved_requirements], "source_package_items": contract.get("source_package_items", []), "discovery_contexts": discovery_contexts, "discovery_context_ids": [context["context_id"] for context in discovery_contexts], "rag_metadata": _rag_metadata_or_none(rag), "rag_status": _rag_status(rag, required=True)})
         for test_case in generated.get("test_cases", []):
             test_case["review_status"] = "pending"
             test_case["approved"] = False
@@ -2526,7 +2557,7 @@ def regenerate_test_cases(generation_id: str, request: TestCaseRegenerationReque
             raise HTTPException(404, "Source package not found")
         package_row = row_dict(package)
         discovery_contexts = []
-        rag = _try_retrieve_package_context(package["package_id"], requested_by="Test Case Regeneration")
+        rag = _require_package_context(package["package_id"], requested_by="Test Case Regeneration")
         try:
             if os.getenv("OPENAI_API_KEY"):
                 generated = _test_cases_with_openai(approved_requirements, package_row, requested_count, discovery_contexts, rag)
@@ -2564,6 +2595,7 @@ def regenerate_test_cases(generation_id: str, request: TestCaseRegenerationReque
             "discovery_contexts": discovery_contexts,
             "discovery_context_ids": [context["context_id"] for context in discovery_contexts],
             "rag_metadata": _rag_metadata_or_none(rag),
+            "rag_status": _rag_status(rag, required=True),
             "parent_generation_id": generation_id,
             "generation_version": generation_version,
             "regeneration_request": {
@@ -2701,7 +2733,7 @@ def update_execution_run_lifecycle(run_id: str, request: ExecutionRunLifecycleRe
 def _unique_test_value(key, template_id, test_case_id, ordinal=0):
     suffix = hashlib.sha256(f"{template_id}:{test_case_id}:{ordinal}".encode("utf-8")).hexdigest()[:10].upper()
     normalized = str(key).lower()
-    if normalized in {"member_id", "subscriber_id", "prescription_id", "claim_id", "payment_method_id"}:
+    if normalized in {"member_id", "subscriber_id", "prescription_id", "claim_id", "payment_method_id", "campaign_id", "communication_id"}:
         return f"QA-{normalized.upper()}-{suffix}"
     if normalized == "token":
         return f"tok_mock_{suffix.lower()}"
@@ -2720,7 +2752,7 @@ def _set_unique_template_values(value, template_id, test_case_id):
                 ordinal = counters.get(normalized, 0)
                 counters[normalized] = ordinal + 1
                 generated = _unique_test_value(key, template_id, test_case_id, ordinal)
-                if generated is not None and (item is None or item == "" or normalized in {"member_id", "subscriber_id", "prescription_id", "claim_id", "payment_method_id", "email_address", "phone_number", "token"}):
+                if generated is not None and (item is None or item == "" or normalized in {"member_id", "subscriber_id", "prescription_id", "claim_id", "payment_method_id", "campaign_id", "communication_id", "email_address", "phone_number", "token"}):
                     current[key] = generated
                 else:
                     visit(item)
@@ -2777,6 +2809,522 @@ def _matches_test_data_template_shape(value, template):
     if isinstance(template, float):
         return isinstance(value, (int, float)) and not isinstance(value, bool)
     return isinstance(value, str)
+
+def _test_data_template_plan_schema(case_ids):
+    assignment_properties = {
+        case_id: {"type": "array", "items": {"type": "string"}, "minItems": 1}
+        for case_id in case_ids
+    }
+    return {
+        "type": "object",
+        "properties": {
+            "templates": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 12,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "template_id": {"type": "string"},
+                        "template_name": {"type": "string"},
+                        "entity_name": {"type": "string"},
+                        "fields": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 40,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "path": {"type": "string"},
+                                    "field_type": {"type": "string", "enum": ["string", "integer", "number", "boolean", "null"]},
+                                    "sample_value": {"type": "string"},
+                                    "required": {"type": "boolean"},
+                                },
+                                "required": ["path", "field_type", "sample_value", "required"],
+                                "additionalProperties": False,
+                            },
+                        },
+                    },
+                    "required": ["template_id", "template_name", "entity_name", "fields"],
+                    "additionalProperties": False,
+                },
+            },
+            "assignments": {
+                "type": "object",
+                "properties": assignment_properties,
+                "required": list(assignment_properties),
+                "additionalProperties": False,
+            },
+        },
+        "required": ["templates", "assignments"],
+        "additionalProperties": False,
+    }
+
+def _template_value_from_sample(field_type, sample_value):
+    value = "" if sample_value is None else str(sample_value)
+    if field_type == "integer":
+        try:
+            return int(value)
+        except Exception:
+            return 0
+    if field_type == "number":
+        try:
+            return float(value)
+        except Exception:
+            return 0.0
+    if field_type == "boolean":
+        return value.strip().lower() in {"true", "1", "yes", "y"}
+    if field_type == "null":
+        return None
+    return value
+
+def _payload_from_template_fields(fields):
+    payload = {}
+    for field in fields or []:
+        raw_path = str(field.get("path") or "").strip()
+        # Keep template shape simple and JSON-object based. Arrays can still be
+        # generated as values later, but the field source itself must come from
+        # Knowledge Base paths/columns.
+        clean_path = re.sub(r"\[[^\]]*\]", "", raw_path)
+        clean_path = re.sub(r"[^A-Za-z0-9_.]", "_", clean_path).strip("._")
+        parts = [part for part in clean_path.split(".") if part]
+        if not parts:
+            continue
+        current = payload
+        for part in parts[:-1]:
+            next_value = current.setdefault(part, {})
+            if not isinstance(next_value, dict):
+                next_value = {}
+                current[part] = next_value
+            current = next_value
+        current[parts[-1]] = _template_value_from_sample(field.get("field_type"), field.get("sample_value"))
+    return payload
+
+def _normalize_test_data_templates(plan, case_ids):
+    templates = []
+    by_raw_id = {}
+    used_ids = set()
+    for index, item in enumerate(plan.get("templates") or [], 1):
+        entity = re.sub(r"[^a-z0-9_]+", "_", str(item.get("entity_name") or f"record_{index}").lower()).strip("_") or f"record_{index}"
+        raw_id = str(item.get("template_id") or entity).strip()
+        template_id = re.sub(r"[^a-zA-Z0-9_:-]+", "_", raw_id).strip("_") or f"kb_{entity}"
+        if not template_id.startswith("kb_"):
+            template_id = f"kb_{template_id}"
+        base_id, suffix = template_id, 2
+        while template_id in used_ids:
+            template_id = f"{base_id}_{suffix}"
+            suffix += 1
+        payload = _payload_from_template_fields(item.get("fields") or [])
+        if not payload:
+            continue
+        normalized = {
+            "template_id": template_id,
+            "template_name": str(item.get("template_name") or entity.replace("_", " ").title()).strip() or entity,
+            "entity_name": entity,
+            "payload_json": json.dumps(payload, sort_keys=True),
+        }
+        used_ids.add(template_id)
+        templates.append(normalized)
+        by_raw_id[raw_id] = normalized
+        by_raw_id[item.get("template_id")] = normalized
+        by_raw_id[template_id] = normalized
+    if not templates:
+        raise ValueError("Knowledge Base did not provide any usable test data templates")
+    assignments = {}
+    default_template = templates[0]
+    for case_id in case_ids:
+        assigned = []
+        for raw_template_id in (plan.get("assignments") or {}).get(case_id, []):
+            template = by_raw_id.get(raw_template_id)
+            if template and template["template_id"] not in {item["template_id"] for item in assigned}:
+                assigned.append(template)
+        assignments[case_id] = assigned or [default_template]
+    return assignments
+
+def _derive_test_data_templates_with_openai(case_ids, cases, rag_context):
+    if not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError("OPENAI_API_KEY is not configured for Knowledge Base template derivation")
+    from openai import OpenAI
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=OPENAI_TIMEOUT_SECONDS)
+    selected_cases = [
+        {key: cases[case_id].get(key) for key in ("test_case_id", "title", "description", "scenario", "preconditions", "test_data_setup", "data_needs", "steps", "expected_results", "deterministic_inputs") if cases[case_id].get(key) is not None}
+        for case_id in case_ids
+    ]
+    prompt = {
+        "instructions": (
+            "Derive test data templates only from the selected package Knowledge Base evidence. "
+            "Use database columns, API request fields, message template variables, and BRD data terms found in retrieved_knowledge_evidence. "
+            "Do not use built-in or assumed application templates. Do not invent large unrelated record shapes. "
+            "Return compact templates with fields needed to create the pre-step data for the approved test cases. "
+            "Use dot-separated object paths such as member.member_id or prescription.status; do not use array paths. "
+            "Assign at least one returned template to every approved test case."
+        ),
+        "approved_test_cases": selected_cases,
+        "retrieved_knowledge_evidence": _rag_context_for_prompt(rag_context, max_evidence=18, max_fragment_characters=1100, max_rules=10, max_rule_characters=320),
+    }
+    response = client.responses.create(
+        model=OPENAI_MODEL,
+        input="Derive Knowledge Base test data templates as JSON.\n" + json.dumps(prompt, ensure_ascii=False),
+        store=False,
+        text={"format": {"type": "json_schema", "name": "knowledge_base_test_data_templates", "strict": True, "schema": _test_data_template_plan_schema(case_ids)}},
+    )
+    if not response.output_text:
+        raise ValueError("OpenAI returned no Knowledge Base test data templates")
+    return _normalize_test_data_templates(json.loads(response.output_text), case_ids)
+
+_TEST_DATA_FIELD_STOPWORDS = {
+    "select", "from", "where", "table", "column", "string", "integer", "number", "boolean", "object", "array",
+    "description", "required", "optional", "status", "request", "response", "schema", "properties", "example",
+    "business", "requirement", "criteria", "should", "shall", "must", "with", "without", "source", "package",
+}
+
+def _knowledge_field_names(rag_context):
+    text = "\n".join(str(item.get("fragment_text") or "") for item in (rag_context or {}).get("brd_fragments", []) + (rag_context or {}).get("technical_fragments", []))
+    names = []
+    for value in re.findall(r'"([A-Za-z][A-Za-z0-9_]{1,60})"\s*:', text):
+        names.append(value)
+    for value in re.findall(r"\b[A-Za-z][A-Za-z0-9_]{2,60}\b", text):
+        names.append(value)
+    cleaned = []
+    for name in names:
+        normalized = re.sub(r"[^A-Za-z0-9_]+", "_", name).strip("_")
+        lowered = normalized.lower()
+        if not lowered or lowered in _TEST_DATA_FIELD_STOPWORDS:
+            continue
+        if "_" not in lowered and not any(term in lowered for term in ("id", "date", "phone", "email", "name", "status", "type", "code")):
+            continue
+        if lowered not in cleaned:
+            cleaned.append(lowered)
+    return cleaned[:120]
+
+def _derive_test_data_templates_locally(case_ids, cases, rag_context):
+    knowledge_fields = _knowledge_field_names(rag_context)
+    if not knowledge_fields:
+        raise ValueError("Knowledge Base did not include recognizable data fields")
+    prefix_counts = {}
+    for field in knowledge_fields:
+        prefix = field.split("_", 1)[0]
+        if len(prefix) > 2:
+            prefix_counts[prefix] = prefix_counts.get(prefix, 0) + 1
+    default_entity = max(prefix_counts, key=prefix_counts.get) if prefix_counts else "knowledge_record"
+    templates = {}
+    assignments = {}
+    for case_id in case_ids:
+        case = cases[case_id]
+        setup_names = []
+        for item in case.get("test_data_setup") or []:
+            if isinstance(item, dict) and item.get("name"):
+                setup_names.append(re.sub(r"[^A-Za-z0-9_]+", "_", str(item["name"]).lower()).strip("_"))
+        case_text = json.dumps(case, ensure_ascii=False).lower()
+        entity_candidates = [name.split("_", 1)[0] for name in setup_names if "_" in name]
+        entity_candidates.extend(prefix for prefix in prefix_counts if prefix in case_text)
+        entity = next((item for item in entity_candidates if item), default_entity)
+        fields = [field for field in knowledge_fields if field.startswith(f"{entity}_")]
+        fields.extend(name for name in setup_names if name and name not in fields)
+        if not fields:
+            fields = knowledge_fields[: min(10, len(knowledge_fields))]
+        fields = list(dict.fromkeys(fields))[:20]
+        template_id = f"kb_{entity}"
+        if template_id not in templates:
+            payload = {field: "" for field in fields}
+            templates[template_id] = {
+                "template_id": template_id,
+                "template_name": f"{entity.replace('_', ' ').title()} Knowledge Template",
+                "entity_name": entity,
+                "payload_json": json.dumps(payload, sort_keys=True),
+            }
+        assignments[case_id] = [templates[template_id]]
+    return assignments
+
+_TEST_DATA_DOMAIN_ENTITIES = ("member", "prescription", "refill", "communication", "campaign", "eligibility", "eligibility_decision", "pharmacy")
+
+def _test_case_text(test_case):
+    parts = []
+    for key in ("test_case_id", "title", "description", "scenario", "preconditions", "test_data_setup", "data_needs", "steps", "expected_results", "deterministic_inputs"):
+        value = test_case.get(key)
+        if value is not None:
+            parts.append(json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value))
+    return "\n".join(parts)
+
+def _scenario_profile_for_case(test_case):
+    text = _test_case_text(test_case).lower()
+    ineligible = any(term in text for term in ("ineligible", "inactive", "terminated", "excluded", "not eligible", "suppress", "no communication"))
+    sms_failure = any(term in text for term in ("sms fail", "sms fails", "delivery fail", "delivery fails", "undelivered", "fallback", "phone call", "phone-call"))
+    phone_expected = sms_failure or any(term in text for term in ("phone", "call fallback", "alternate channel"))
+    not_due = any(term in text for term in ("not due", "no refill", "not refill", "no prescription"))
+    should_send_sms = not ineligible
+    should_trigger_phone = bool(should_send_sms and phone_expected)
+    return {
+        "ineligible": ineligible,
+        "sms_failure": sms_failure,
+        "phone_expected": phone_expected,
+        "not_due": not_due,
+        "member_status": "INACTIVE" if ineligible else "ACTIVE",
+        "eligibility_status": "INELIGIBLE" if ineligible else "ELIGIBLE",
+        "prescription_status": "INACTIVE" if ineligible or not_due else "ACTIVE",
+        "refill_status": "NOT_DUE" if not_due else "DUE",
+        "sms_delivery_status": "SUPPRESSED" if ineligible else ("FAILED" if sms_failure else "PENDING"),
+        "phone_call_status": "PENDING" if should_trigger_phone else "NOT_REQUIRED",
+        "should_send_sms": should_send_sms,
+        "should_trigger_phone": should_trigger_phone,
+        "should_suppress_communication": ineligible,
+    }
+
+def _case_expected_text(test_case):
+    expected = test_case.get("expected_results")
+    if isinstance(expected, list):
+        return "; ".join(str(item.get("text") if isinstance(item, dict) else item) for item in expected if item)
+    return str(expected or test_case.get("description") or "")
+
+def _knowledge_case_field_values(test_case, rag_context):
+    fields = _knowledge_field_names(rag_context)
+    if not fields:
+        return {}
+    text = _test_case_text(test_case).lower()
+    terms = {term for term in re.findall(r"[a-z][a-z0-9_]{2,}", text)}
+    priority_terms = {"member", "prescription", "refill", "communication", "sms", "phone", "campaign", "eligibility", "status", "date", "channel", "outcome"}
+    selected = []
+    for field in fields:
+        parts = set(field.lower().split("_"))
+        if parts & priority_terms or parts & terms:
+            selected.append(field)
+        if len(selected) >= 16:
+            break
+    return {field: "" for field in selected}
+
+_TEST_DATA_SECTION_TERMS = {
+    "member": ("member", "subscriber", "patient", "customer", "eligib", "active", "inactive", "contactable", "phone", "sms", "communication", "prescription", "refill", "campaign"),
+    "prescription": ("prescription", "refill", "rx", "medication", "drug", "due", "not due"),
+    "campaign": ("campaign", "reminder", "trigger", "rule", "suppress", "suppression"),
+    "communication": ("communication", "sms", "message", "phone", "call", "delivery", "contactable", "channel"),
+    "eligibility_decision": ("eligibility decision", "decision", "capture", "store", "stored", "validation", "validate", "qualify", "qualification"),
+}
+
+_TEST_DATA_FIELD_SECTION_HINTS = {
+    "member": ("member", "subscriber", "patient", "customer", "first_name", "last_name", "phone", "email", "language", "opt_in"),
+    "prescription": ("prescription", "refill", "rx", "medication", "drug", "due_date"),
+    "campaign": ("campaign", "reminder", "trigger", "rule", "template", "suppression", "suppress"),
+    "communication": ("communication", "sms", "message", "phone_call", "call", "delivery", "channel"),
+    "eligibility_decision": ("eligibility", "decision", "qualification", "validation"),
+}
+
+_TEST_DATA_TEMPLATE_METADATA_FIELDS = {
+    "column_name", "table_name", "schema_name", "type", "mapping_type", "source", "target",
+    "mapping_validation_api_v1_mappings_validate_post",
+}
+
+def _required_test_data_sections(test_case):
+    text = _test_case_text(test_case).lower()
+    sections = {"expected_outcome"}
+    for section, terms in _TEST_DATA_SECTION_TERMS.items():
+        if any(term in text for term in terms):
+            sections.add(section)
+    for item in test_case.get("test_data_setup") or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").lower()
+        for section, terms in _TEST_DATA_SECTION_TERMS.items():
+            if section in name or any(term in name for term in terms):
+                sections.add(section)
+    if len(sections) == 1:
+        sections.add("member")
+    if {"prescription", "communication", "campaign", "eligibility_decision"} & sections:
+        sections.add("member")
+    if "campaign" in sections and "reminder" in text:
+        sections.add("communication")
+    return sections
+
+def _scenario_test_data_payload(test_case, rag_context):
+    profile = _scenario_profile_for_case(test_case)
+    sections = _required_test_data_sections(test_case)
+    payload = {}
+    if "member" in sections:
+        payload["member"] = {
+            "member_id": "",
+            "member_status": profile["member_status"],
+            "eligibility_status": profile["eligibility_status"],
+        }
+        if "communication" in sections:
+            payload["member"].update({
+                "phone_number": "",
+                "sms_opt_in": bool(profile["should_send_sms"]),
+                "preferred_language": "EN",
+            })
+    if "prescription" in sections:
+        payload["prescription"] = {
+            "prescription_id": "",
+            "member_id": "",
+            "prescription_status": profile["prescription_status"],
+            "refill_status": profile["refill_status"],
+            "refill_due_date": "2026-01-01",
+            "days_until_refill": 0,
+            "refill_eligible": bool(not profile["ineligible"] and not profile["not_due"]),
+        }
+    if "campaign" in sections:
+        payload["campaign"] = {
+            "campaign_id": "",
+            "campaign_name": "Refill Reminder",
+            "eligibility_status": profile["eligibility_status"],
+            "trigger_reason": "Prescription refill due",
+            "suppress_communication": bool(profile["should_suppress_communication"]),
+        }
+    if "communication" in sections:
+        payload["communication"] = {
+            "communication_id": "",
+            "member_id": "",
+            "primary_channel": "SMS",
+            "sms_delivery_status": profile["sms_delivery_status"],
+            "phone_call_required": bool(profile["should_trigger_phone"]),
+            "phone_call_status": profile["phone_call_status"],
+            "message_template": "refill reminder",
+        }
+    if "eligibility_decision" in sections:
+        payload["eligibility_decision"] = {
+            "member_id": "",
+            "eligibility_status": profile["eligibility_status"],
+            "decision_reason": "Prescription refill due" if "prescription" in sections else "Requirement validation",
+            "decision_stored": True,
+        }
+    expected = {"expected_result": _case_expected_text(test_case)}
+    if "member" in sections:
+        expected["should_identify_member"] = bool(not profile["ineligible"])
+    if "communication" in sections:
+        expected["should_send_sms"] = bool(profile["should_send_sms"])
+        expected["should_trigger_phone_call"] = bool(profile["should_trigger_phone"])
+    if "communication" in sections or "campaign" in sections:
+        expected["should_suppress_communication"] = bool(profile["should_suppress_communication"])
+    if "eligibility_decision" in sections:
+        expected["should_store_eligibility_decision"] = True
+    payload["expected_outcome"] = expected
+    return payload
+
+def _section_for_template_field(field_name, required_sections):
+    field = str(field_name or "").lower()
+    if field in _TEST_DATA_TEMPLATE_METADATA_FIELDS or field.startswith("mapping_validation_"):
+        return None
+    for section, terms in _TEST_DATA_FIELD_SECTION_HINTS.items():
+        if section in required_sections and any(term in field for term in terms):
+            return section
+    return None
+
+def _merge_relevant_template_payload(payload, source, required_sections):
+    if not isinstance(payload, dict) or not isinstance(source, dict):
+        return payload
+    for key, value in source.items():
+        normalized_key = str(key or "").lower()
+        if normalized_key in _TEST_DATA_TEMPLATE_METADATA_FIELDS or normalized_key.startswith("mapping_validation_"):
+            continue
+        if normalized_key in required_sections and isinstance(value, dict):
+            _merge_missing(payload.setdefault(normalized_key, {}), value)
+            continue
+        if normalized_key in required_sections:
+            payload.setdefault(normalized_key, value)
+            continue
+        target_section = _section_for_template_field(normalized_key, required_sections)
+        if target_section and target_section in payload:
+            if isinstance(value, dict):
+                _merge_missing(payload[target_section], value)
+            elif normalized_key not in payload[target_section]:
+                payload[target_section][normalized_key] = value
+    return payload
+
+def _merge_missing(target, source):
+    if not isinstance(target, dict) or not isinstance(source, dict):
+        return target
+    for key, value in source.items():
+        if key in target and isinstance(target[key], dict) and isinstance(value, dict):
+            _merge_missing(target[key], value)
+        elif key not in target:
+            target[key] = value
+    return target
+
+def _domain_payload_from_template(template):
+    payload = json.loads(template.get("payload_json") or "{}")
+    if not isinstance(payload, dict):
+        return {}
+    entity = str(template.get("entity_name") or "").lower()
+    if entity in _TEST_DATA_DOMAIN_ENTITIES and entity not in payload:
+        return {entity: payload}
+    return payload
+
+def _expand_test_data_templates_for_cases(case_ids, cases, templates_by_case, rag_context):
+    expanded = {}
+    for case_id in case_ids:
+        case = cases[case_id]
+        required_sections = _required_test_data_sections(case)
+        payload = _scenario_test_data_payload(case, rag_context)
+        for template in templates_by_case.get(case_id, []):
+            _merge_relevant_template_payload(payload, _domain_payload_from_template(template), required_sections)
+        safe_case_id = re.sub(r"[^A-Za-z0-9_:-]+", "_", case_id).strip("_").lower()
+        expanded[case_id] = [{
+            "template_id": f"kb_case_dataset_{safe_case_id}",
+            "template_name": "Knowledge Base Test Data",
+            "entity_name": "test_data",
+            "payload_json": json.dumps(payload, sort_keys=True),
+        }]
+    return expanded
+
+def _derive_test_data_templates_from_knowledge(case_ids, cases, rag_context):
+    if not rag_context:
+        raise HTTPException(409, "Knowledge Base is required to derive test data templates.")
+    try:
+        templates = _derive_test_data_templates_with_openai(case_ids, cases, rag_context)
+    except Exception as exc:
+        try:
+            templates = _derive_test_data_templates_locally(case_ids, cases, rag_context)
+        except Exception as fallback_exc:
+            raise HTTPException(
+                422,
+                f"Could not derive test data templates from the Knowledge Base: {safe_llm_error_message(exc)}; local derivation failed: {safe_llm_error_message(fallback_exc)}",
+            )
+    return _expand_test_data_templates_for_cases(case_ids, cases, templates, rag_context)
+
+def _first_nested_value(payload, path):
+    current = payload
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current if current not in ("", None) else None
+
+def _set_all_matching_keys(payload, key_name, value):
+    if isinstance(payload, dict):
+        for key, item in payload.items():
+            if key.lower() == key_name.lower():
+                payload[key] = value
+            else:
+                _set_all_matching_keys(item, key_name, value)
+    elif isinstance(payload, list):
+        for item in payload:
+            _set_all_matching_keys(item, key_name, value)
+    return payload
+
+def _normalize_test_data_relationships(payload):
+    if not isinstance(payload, dict):
+        return payload
+    member_id = _first_nested_value(payload, ("member", "member_id"))
+    if not member_id:
+        def find_member_id(value):
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if key.lower() == "member_id" and item not in ("", None):
+                        return item
+                    found = find_member_id(item)
+                    if found:
+                        return found
+            elif isinstance(value, list):
+                for item in value:
+                    found = find_member_id(item)
+                    if found:
+                        return found
+            return None
+        member_id = find_member_id(payload)
+    if member_id:
+        _set_all_matching_keys(payload, "member_id", member_id)
+    prescription_id = _first_nested_value(payload, ("prescription", "prescription_id"))
+    if prescription_id:
+        _set_all_matching_keys(payload, "prescription_id", prescription_id)
+    return payload
 
 def _generate_test_data_with_openai(templates, rag_context=None):
     key = os.getenv("OPENAI_API_KEY")
@@ -2868,10 +3416,8 @@ def generate_test_data(generation_id: str, request: TestDataGenerationRequest):
         if not assignments:
             raise HTTPException(422, "Assign at least one template to each selected test case")
         assignment_case_ids = [item.test_case_id for item in assignments]
-        if len(set(assignment_case_ids)) != len(assignment_case_ids) or any(len(set(item.template_ids)) != len(item.template_ids) for item in assignments):
-            raise HTTPException(422, "Each test case and each case-template assignment must be unique")
-        template_ids = list(dict.fromkeys(template_id for item in assignments for template_id in item.template_ids))
-        templates_by_case = {item.test_case_id: item.template_ids for item in assignments}
+        if len(set(assignment_case_ids)) != len(assignment_case_ids):
+            raise HTTPException(422, "Each test case assignment must be unique")
         cases = {case.get("test_case_id"): case for case in contract.get("test_cases", [])}
         unknown = sorted(set(assignment_case_ids) - set(cases))
         if unknown:
@@ -2879,31 +3425,14 @@ def generate_test_data(generation_id: str, request: TestDataGenerationRequest):
         unapproved = [case_id for case_id in assignment_case_ids if _review_status(cases[case_id]) != "approved"]
         if unapproved:
             raise HTTPException(422, {"message": "Test data can only be generated for approved test cases", "not_approved": unapproved})
-        by_template_id = {
-            item.template_id: {
-                "template_id": item.template_id,
-                "template_name": item.template_name,
-                "entity_name": item.entity_name,
-                "payload_json": json.dumps(item.payload, sort_keys=True),
-            }
-            for item in request.template_definitions
-        }
-        if len(by_template_id) != len(request.template_definitions):
-            raise HTTPException(422, "Template definitions must have unique IDs")
-        missing = sorted(set(template_ids) - set(by_template_id))
-        if missing:
-            raise HTTPException(422, {"unknown_template_ids": missing})
-        for case_id, case_template_ids in templates_by_case.items():
-            if not case_template_ids:
-                raise HTTPException(422, {"message": "Assign at least one template to each selected case", "test_case_id": case_id})
-        selected_templates_by_case = {case_id: sorted([by_template_id[template_id] for template_id in case_template_ids], key=lambda row: (0 if row["entity_name"].lower() == "member" else 1, row["entity_name"].lower())) for case_id, case_template_ids in templates_by_case.items()}
         existing_rows = conn.execute("SELECT status FROM test_data_record WHERE generation_id=%s", (generation_id,)).fetchall()
         if existing_rows:
             if not request.replace_existing_drafts:
                 raise HTTPException(409, "Test data already exists for this generation. Use regenerate for draft records or create a new test-case generation.")
             if any(item["status"] == "saved" for item in existing_rows):
                 raise HTTPException(409, "Saved Bronze records are immutable. Create a new test-case generation to produce another dataset.")
-        rag = _try_retrieve_package_context(generation["package_id"], requested_by="Test Data Generation")
+        rag = _require_package_context(generation["package_id"], requested_by="Test Data Generation")
+        selected_templates_by_case = _derive_test_data_templates_from_knowledge(assignment_case_ids, cases, rag)
         generation_mode = "openai"
         generation_warning = None
         try:
@@ -2930,8 +3459,10 @@ def generate_test_data(generation_id: str, request: TestDataGenerationRequest):
             for template in selected_templates_by_case[case_id]:
                 payload = generated_payloads[(case_id, template["template_id"])]
                 payload = _set_unique_template_values(payload, template["template_id"], case_id)
+                payload = _normalize_test_data_relationships(payload)
                 if template["entity_name"].lower() != "member":
                     _link_member_identities(payload, identities)
+                    payload = _normalize_test_data_relationships(payload)
                 if template["entity_name"].lower() == "member":
                     member_id = payload.get("member_id") if isinstance(payload, dict) else None
                     if member_id:
@@ -2943,7 +3474,7 @@ def generate_test_data(generation_id: str, request: TestDataGenerationRequest):
                 schema_context = [{"source_type": item.get("source_type"), "source_reference": item.get("source_reference"), "fragment_id": item.get("original_fragment_id") or item.get("fragment_id"), "text": item.get("fragment_text")} for item in (rag or {}).get("technical_fragments", [])]
                 conn.execute("INSERT INTO test_data_record (record_id,generation_id,test_case_id,template_id,template_name,entity_name,payload_json,pre_steps_json,schema_context_json,status,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (record_id, generation_id, case_id, template["template_id"], template["template_name"], template["entity_name"], json.dumps(payload, sort_keys=True), json.dumps(pre_steps), json.dumps(schema_context), "draft", timestamp, timestamp))
                 created.append({"record_id": record_id, "generation_id": generation_id, "test_case_id": case_id, "template_id": template["template_id"], "template_name": template["template_name"], "entity_name": template["entity_name"], "payload": payload, "pre_steps": pre_steps, "schema_context": schema_context, "status": "draft", "created_at": timestamp})
-        return {"generation_id": generation_id, "generation_mode": generation_mode, "generation_model": OPENAI_MODEL if generation_mode == "openai" else None, "generation_warning": generation_warning, "rag_metadata": _rag_metadata_or_none(rag), "records": created}
+        return {"generation_id": generation_id, "generation_mode": generation_mode, "generation_model": OPENAI_MODEL if generation_mode == "openai" else None, "generation_warning": generation_warning, "rag_metadata": _rag_metadata_or_none(rag), "rag_status": _rag_status(rag, required=True), "records": created}
 
 @app.get("/api/v1/test-case-generations/{generation_id}/test-data")
 def list_test_data(generation_id: str):
