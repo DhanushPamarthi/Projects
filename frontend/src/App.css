@@ -161,13 +161,15 @@
 .all-requirements-panel, .all-business-rules-panel { display: none; }
 .requirement-group { margin-top: .65rem; border: 1px solid #e1e7ef; border-radius: 12px; background: #fff; overflow: hidden; transition: border-color .15s, box-shadow .15s; }
 .requirement-group:hover { border-color: #cbd5e1; }
-.requirement-group[open] { border-color: #f3b3a7; box-shadow: 0 5px 18px #1720330d; }
+.requirement-group.open { border-color: #f3b3a7; box-shadow: 0 5px 18px #1720330d; }
+.requirement-group-row { display: flex; align-items: flex-start; gap: .65rem; padding: .45rem .7rem; }
+.requirement-group-select { width: 16px; height: 16px; flex: 0 0 16px; margin: 1.05rem 0 0 .2rem; accent-color: var(--orange); cursor: pointer; }
+.requirement-group-disclosure { flex: 1; min-width: 0; }
 .requirement-group summary { padding: 0; cursor: pointer; list-style: none; }
 .requirement-group summary::-webkit-details-marker { display: none; }
-.requirement-group-summary { position: relative; display: flex; align-items: flex-start; gap: .75rem; padding: .9rem 1rem; }
-.requirement-group-summary input { width: 16px; height: 16px; flex: 0 0 16px; margin-top: .1rem; accent-color: var(--orange); cursor: pointer; }
+.requirement-group-summary { display: flex; align-items: flex-start; gap: .75rem; padding: .45rem .25rem .8rem; }
 .requirement-group-summary span { flex: 1; min-width: 0; }
-.requirement-group-summary > span:not(.requirement-review-actions) { padding-right: 8.5rem; }
+.requirement-group-summary > span:not(.requirement-review-actions) { padding-right: 0; }
 .requirement-group-summary b, .requirement-group-summary small { display: block; }
 .requirement-title-row { display: flex; align-items: baseline; flex-wrap: wrap; gap: .45rem .6rem; }
 .requirement-group-summary b { color: #26364d; font-size: .88rem; letter-spacing: -.01em; }
@@ -184,7 +186,7 @@
 .requirement-warning { color: #a26c00 !important; }
 .requirement-assumption { color: #536a9a !important; }
 .requirement-group-summary em { color: #8993a4; font-size: .72rem; font-style: normal; white-space: nowrap; }
-.requirement-review-actions { position: absolute; top: 1rem; right: 1rem; display: flex; align-items: center; gap: .4rem; flex: 0 0 auto; }
+.requirement-review-actions { display: flex; align-items: flex-start; gap: .4rem; flex: 0 0 auto; padding-top: .55rem; }
 .requirement-group-body { padding: .15rem 1rem 1rem; border-top: 1px solid #edf0f4; background: #fbfcfe; }
 .requirement-group-grid { display: grid; grid-template-columns: 1fr; gap: 1rem; }
 .requirement-rules { margin-top: 1rem; padding-top: .8rem; border-top: 1px solid #edf0f4; }
