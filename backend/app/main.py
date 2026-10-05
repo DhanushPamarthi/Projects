@@ -2297,7 +2297,10 @@ def generate_functional_requirements(package_id: str):
         item_rows = [row_dict(item) for item in source_items]
         fragment_rows = [row_dict(fragment) for fragment in fragments]
         contexts = _discovery_contexts_for_package(conn, row_dict(package))
-        rag = _require_package_context(package_id, requested_by="Functional Requirements")
+        # Knowledge Base retrieval enriches Functional Requirements, but it must
+        # not block generation from approved business requirements and source
+        # fragments while the package index is still building or unavailable.
+        rag = _try_retrieve_package_context(package_id, requested_by="Functional Requirements")
         try:
             contract = _generate_functional_contract(row_dict(package), item_rows, fragment_rows, approved, contexts, rag)
         except HTTPException:
@@ -2307,7 +2310,7 @@ def generate_functional_requirements(package_id: str):
             contract["generation_note"] = f"LLM Functional Requirements generation failed; local fallback was used: {safe_llm_error_message(exc)}"
             contract.setdefault("global_gaps", []).append("LLM Functional Requirements generation was unavailable, so the local fallback was used.")
         contract["rag_metadata"] = _rag_metadata_or_none(rag)
-        contract["rag_status"] = _rag_status(rag, required=True)
+        contract["rag_status"] = _rag_status(rag)
         version = conn.execute("SELECT COALESCE(MAX(analysis_version),0)+1 AS v FROM requirement_analysis WHERE package_id=%s", (package_id,)).fetchone()["v"]
         analysis_id, timestamp = uid("req"), now()
         conn.execute("INSERT INTO requirement_analysis (analysis_id,package_id,project_id,analysis_version,status,contract_json,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", (analysis_id, package_id, package["project_id"], version, "needs_review", json.dumps(contract), timestamp, timestamp))
@@ -2476,7 +2479,7 @@ def generate_test_cases_from_analysis(analysis_id: str, request: TestCaseGenerat
         package_row = row_dict(package)
         discovery_contexts = []
         requested_count = request.count
-        rag = _require_package_context(package_row["package_id"], requested_by="Test Case Generation")
+        rag = _try_retrieve_package_context(package_row["package_id"], requested_by="Test Case Generation")
         try:
             if os.getenv("OPENAI_API_KEY"):
                 generated = _test_cases_with_openai(approved_requirements, package_row, requested_count, discovery_contexts, rag)
@@ -2491,7 +2494,7 @@ def generate_test_cases_from_analysis(analysis_id: str, request: TestCaseGenerat
         _validate_test_case_contract(generated, approved_requirements, requested_count, discovery_contexts, rag)
         generation_id, timestamp = uid("tcg"), now()
         requirement_contract_hash = hashlib.sha256(json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-        generated.update({"contract_version": "1.0", "generation_id": generation_id, "analysis_id": analysis_id, "analysis_version": analysis["analysis_version"], "project_id": analysis["project_id"], "requirement_contract_hash": requirement_contract_hash, "package_id": package["package_id"], "package_version": package["package_version"], "source_package_run_id": package["run_id"], "requested_test_case_count": len(generated.get("test_cases", [])), "count_strategy": "derived_from_approved_functional_requirements_acceptance_criteria_and_business_rules" if requested_count is None else "user_requested", "generation_mode": mode, "generation_model": OPENAI_MODEL if mode == "openai" else LOCAL_EXTRACTOR_VERSION, "generation_prompt_version": TEST_CASE_GENERATION_PROMPT_VERSION, "generation_prompt_hash": test_case_generation_prompt_hash(), "generated_at": timestamp, "approved_requirement_ids": [item["requirement_id"] for item in approved_requirements], "source_package_items": contract.get("source_package_items", []), "discovery_contexts": discovery_contexts, "discovery_context_ids": [context["context_id"] for context in discovery_contexts], "rag_metadata": _rag_metadata_or_none(rag), "rag_status": _rag_status(rag, required=True)})
+        generated.update({"contract_version": "1.0", "generation_id": generation_id, "analysis_id": analysis_id, "analysis_version": analysis["analysis_version"], "project_id": analysis["project_id"], "requirement_contract_hash": requirement_contract_hash, "package_id": package["package_id"], "package_version": package["package_version"], "source_package_run_id": package["run_id"], "requested_test_case_count": len(generated.get("test_cases", [])), "count_strategy": "derived_from_approved_functional_requirements_acceptance_criteria_and_business_rules" if requested_count is None else "user_requested", "generation_mode": mode, "generation_model": OPENAI_MODEL if mode == "openai" else LOCAL_EXTRACTOR_VERSION, "generation_prompt_version": TEST_CASE_GENERATION_PROMPT_VERSION, "generation_prompt_hash": test_case_generation_prompt_hash(), "generated_at": timestamp, "approved_requirement_ids": [item["requirement_id"] for item in approved_requirements], "source_package_items": contract.get("source_package_items", []), "discovery_contexts": discovery_contexts, "discovery_context_ids": [context["context_id"] for context in discovery_contexts], "rag_metadata": _rag_metadata_or_none(rag), "rag_status": _rag_status(rag)})
         for test_case in generated.get("test_cases", []):
             test_case["review_status"] = "pending"
             test_case["approved"] = False
@@ -2589,7 +2592,7 @@ def regenerate_test_cases(generation_id: str, request: TestCaseRegenerationReque
             raise HTTPException(404, "Source package not found")
         package_row = row_dict(package)
         discovery_contexts = []
-        rag = _require_package_context(package["package_id"], requested_by="Test Case Regeneration")
+        rag = _try_retrieve_package_context(package["package_id"], requested_by="Test Case Regeneration")
         try:
             if os.getenv("OPENAI_API_KEY"):
                 generated = _test_cases_with_openai(approved_requirements, package_row, requested_count, discovery_contexts, rag)
@@ -2627,7 +2630,7 @@ def regenerate_test_cases(generation_id: str, request: TestCaseRegenerationReque
             "discovery_contexts": discovery_contexts,
             "discovery_context_ids": [context["context_id"] for context in discovery_contexts],
             "rag_metadata": _rag_metadata_or_none(rag),
-            "rag_status": _rag_status(rag, required=True),
+            "rag_status": _rag_status(rag),
             "parent_generation_id": generation_id,
             "generation_version": generation_version,
             "regeneration_request": {
@@ -3360,7 +3363,20 @@ def _expand_test_data_templates_for_cases(case_ids, cases, templates_by_case, ra
 
 def _derive_test_data_templates_from_knowledge(case_ids, cases, rag_context):
     if not rag_context:
-        raise HTTPException(409, "Knowledge Base is required to derive test data templates.")
+        # Keep test-data generation available while the package index is
+        # building. The scenario payload is based on the approved case and its
+        # expected outcome; Knowledge Base evidence enriches it when available.
+        templates_by_case = {}
+        for case_id in case_ids:
+            case = cases[case_id]
+            payload = _scenario_test_data_payload(case, None)
+            templates_by_case[case_id] = [{
+                "template_id": f"scenario_case_{re.sub(r'[^A-Za-z0-9_:-]+', '_', case_id).strip('_').lower()}",
+                "template_name": "Scenario Test Data",
+                "entity_name": _primary_test_data_entity(_required_test_data_sections(case), case),
+                "payload_json": json.dumps(payload, sort_keys=True),
+            }]
+        return templates_by_case
     try:
         templates = _derive_test_data_templates_with_openai(case_ids, cases, rag_context)
     except Exception as exc:
@@ -3525,7 +3541,7 @@ def generate_test_data(generation_id: str, request: TestDataGenerationRequest):
                 raise HTTPException(409, "Test data already exists for this generation. Use regenerate for draft records or create a new test-case generation.")
             if any(item["status"] == "saved" for item in existing_rows):
                 raise HTTPException(409, "Saved Bronze records are immutable. Create a new test-case generation to produce another dataset.")
-        rag = _require_package_context(generation["package_id"], requested_by="Test Data Generation")
+        rag = _try_retrieve_package_context(generation["package_id"], requested_by="Test Data Generation")
         selected_templates_by_case = _derive_test_data_templates_from_knowledge(assignment_case_ids, cases, rag)
         generation_mode = "openai"
         generation_warning = None
@@ -3568,7 +3584,7 @@ def generate_test_data(generation_id: str, request: TestDataGenerationRequest):
                 schema_context = [{"source_type": item.get("source_type"), "source_reference": item.get("source_reference"), "fragment_id": item.get("original_fragment_id") or item.get("fragment_id"), "text": item.get("fragment_text")} for item in (rag or {}).get("technical_fragments", [])]
                 conn.execute("INSERT INTO test_data_record (record_id,generation_id,test_case_id,template_id,template_name,entity_name,payload_json,pre_steps_json,schema_context_json,status,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (record_id, generation_id, case_id, template["template_id"], template["template_name"], template["entity_name"], json.dumps(payload, sort_keys=True), json.dumps(pre_steps), json.dumps(schema_context), "draft", timestamp, timestamp))
                 created.append({"record_id": record_id, "generation_id": generation_id, "test_case_id": case_id, "template_id": template["template_id"], "template_name": template["template_name"], "entity_name": template["entity_name"], "payload": payload, "pre_steps": pre_steps, "schema_context": schema_context, "status": "draft", "created_at": timestamp})
-        return {"generation_id": generation_id, "generation_mode": generation_mode, "generation_model": OPENAI_MODEL if generation_mode == "openai" else None, "generation_warning": generation_warning, "rag_metadata": _rag_metadata_or_none(rag), "rag_status": _rag_status(rag, required=True), "records": created}
+        return {"generation_id": generation_id, "generation_mode": generation_mode, "generation_model": OPENAI_MODEL if generation_mode == "openai" else None, "generation_warning": generation_warning, "rag_metadata": _rag_metadata_or_none(rag), "rag_status": _rag_status(rag), "records": created}
 
 @app.get("/api/v1/test-case-generations/{generation_id}/test-data")
 def list_test_data(generation_id: str):
