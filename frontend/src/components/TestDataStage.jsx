@@ -111,8 +111,8 @@ export function TestDataStage({ projectId, generationId, approvedCases, reviewer
         ? `Knowledge Base used${knowledgeContext.index_id ? ` (${knowledgeContext.index_id})` : ""}.`
         : "Knowledge Base was not used for this run.";
       setMessage(result.generation_mode === "template_fallback"
-        ? `${generated} from Knowledge Base templates with the local data fallback because the LLM was unavailable. ${knowledgeMessage} Review the JSON before inserting into Bronze.`
-        : `${generated} from Knowledge Base templates with ${result.generation_model || "the configured LLM"}. ${knowledgeMessage} Review the JSON before inserting into Bronze.`);
+        ? `${generated} from scenario setup${knowledgeContext.used ? " and Knowledge Base evidence" : ""} with the local data fallback because the LLM was unavailable. ${knowledgeMessage} Review the JSON before inserting into Bronze.`
+        : `${generated} from scenario setup${knowledgeContext.used ? " and Knowledge Base evidence" : ""} with ${result.generation_model || "the configured LLM"}. ${knowledgeMessage} Review the JSON before inserting into Bronze.`);
     } catch (err) { setError(err.message); }
     finally { setBusy(false); }
   }
