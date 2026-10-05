@@ -1,4 +1,4 @@
-import hashlib, io, json, os, re
+import base64, hashlib, io, json, os, re
 from pathlib import Path
 from typing import Any
 from .config import OPENAI_MODEL, OPENAI_TIMEOUT_SECONDS
@@ -33,6 +33,76 @@ def _sections(text: str) -> list[dict[str, Any]]:
             reference = f"page {current_page}, line {line_no}" if current_page else f"line {line_no}"
             result.append({"heading": current_heading, "reference": reference, "page_number": current_page, "fragment_type": "paragraph", "paragraph_index": line_no, "table_index": None, "row_index": None, "cell_index": None, "text": line})
     return result
+
+
+def _json_fragment(heading: str, reference: str, value: Any, fragment_type: str) -> dict[str, Any]:
+    return {
+        "heading": heading,
+        "reference": reference,
+        "page_number": None,
+        "fragment_type": fragment_type,
+        "paragraph_index": None,
+        "table_index": None,
+        "row_index": None,
+        "cell_index": None,
+        "text": json.dumps(value, ensure_ascii=False, indent=2),
+    }
+
+
+def _json_sections(document: Any) -> list[dict[str, Any]]:
+    """Keep JSON coherent; split OpenAPI documents at operations and components."""
+    if not isinstance(document, dict):
+        return [_json_fragment("JSON document", "$", document, "json")]
+
+    paths = document.get("paths")
+    is_api_spec = isinstance(paths, dict) and any(key in document for key in ("openapi", "swagger", "components"))
+    if not is_api_spec:
+        return [_json_fragment("JSON document", "$", document, "json")]
+
+    sections: list[dict[str, Any]] = []
+    root_metadata = {key: value for key, value in document.items() if key not in {"paths", "components"}}
+    if root_metadata:
+        sections.append(_json_fragment("API specification metadata", "$", root_metadata, "api_metadata"))
+
+    http_methods = {"get", "put", "post", "delete", "options", "head", "patch", "trace"}
+    for path, path_item in paths.items():
+        if not isinstance(path_item, dict):
+            sections.append(_json_fragment(f"API path {path}", f"paths.{path}", path_item, "api_path"))
+            continue
+        operations = [(method, operation) for method, operation in path_item.items() if method.lower() in http_methods]
+        shared = {key: value for key, value in path_item.items() if key.lower() not in http_methods}
+        if not operations:
+            sections.append(_json_fragment(f"API path {path}", f"paths.{path}", path_item, "api_path"))
+        for method, operation in operations:
+            sections.append(_json_fragment(
+                f"API operation {method.upper()} {path}",
+                f"paths.{path}.{method.lower()}",
+                {"path": path, "method": method.upper(), "path_item_context": shared, "operation": operation},
+                "api_operation",
+            ))
+
+    components = document.get("components")
+    if isinstance(components, dict):
+        for component_type, component_items in components.items():
+            if isinstance(component_items, dict):
+                for name, component in component_items.items():
+                    sections.append(_json_fragment(
+                        f"API {component_type.rstrip('s')} {name}",
+                        f"components.{component_type}.{name}",
+                        component,
+                        f"api_{component_type.rstrip('s')}",
+                    ))
+            else:
+                sections.append(_json_fragment(
+                    f"API component group {component_type}",
+                    f"components.{component_type}",
+                    component_items,
+                    "api_component_group",
+                ))
+    elif components is not None:
+        sections.append(_json_fragment("API components", "components", components, "api_components"))
+
+    return sections or [_json_fragment("API specification", "$", document, "api_specification")]
 
 
 def _docx_sections(content: bytes) -> tuple[str, list[dict[str, Any]]]:
@@ -120,22 +190,34 @@ def extract_local(path: str, content: bytes) -> tuple[str, list[dict[str, Any]]]
         text = content.decode("utf-8", errors="replace")
     elif suffix == ".json":
         try:
-            text = json.dumps(json.loads(content.decode("utf-8-sig")), indent=2, ensure_ascii=False)
+            document = json.loads(content.decode("utf-8-sig"))
+            text = json.dumps(document, indent=2, ensure_ascii=False)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError("The uploaded JSON file is invalid or corrupted") from exc
+        sections = _json_sections(document)
     elif suffix == ".docx":
         return _docx_sections(content)
     elif suffix == ".pdf":
         from pypdf import PdfReader
         reader = PdfReader(io.BytesIO(content))
         pages = []
+        unreadable_pages = []
         for number, page in enumerate(reader.pages, 1):
-            pages.append(f"[page {number}]\n{page.extract_text() or ''}")
+            page_text = page.extract_text() or ""
+            if not page_text.strip():
+                unreadable_pages.append(number)
+            pages.append(f"[page {number}]\n{page_text}")
+        if unreadable_pages:
+            raise ValueError(
+                "PDF pages have no selectable text and require OpenAI visual extraction: "
+                + ", ".join(str(number) for number in unreadable_pages[:20])
+            )
         text = "\n".join(pages)
     else:
         raise ValueError(f"Unsupported file extension: {suffix or '[none]'}")
     text = text.replace("\x00", "").strip()
-    sections = _sections(text) if text else []
+    if suffix != ".json":
+        sections = _sections(text) if text else []
     if not text or not any(str(section.get("text") or "").strip() for section in sections):
         if suffix == ".pdf":
             raise ValueError("The PDF contains no readable text. It may be scanned or image-only.")
@@ -198,3 +280,74 @@ def extract_openai(text: str) -> tuple[str, list[dict[str, Any]]]:
         if not all(isinstance(section.get(field), str) for field in ("heading", "reference", "text")):
             raise ValueError("OpenAI returned an invalid section")
     return extracted, sections
+
+
+def extract_openai_file(content: bytes, filename: str) -> tuple[str, list[dict[str, Any]]]:
+    """Extract a supported source file directly through OpenAI's file input."""
+    key = os.getenv("OPENAI_API_KEY")
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY is not configured for source extraction")
+    from openai import OpenAI
+    # Extraction has a deterministic local fallback. Avoid the SDK's automatic
+    # retries, which can repeat a slow full-file request several times before
+    # allowing that fallback to run.
+    client = OpenAI(api_key=key, timeout=OPENAI_TIMEOUT_SECONDS, max_retries=0)
+    mime_types = {
+        ".pdf": "application/pdf",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".txt": "text/plain",
+        ".md": "text/markdown",
+        ".json": "application/json",
+        ".yaml": "application/yaml",
+        ".yml": "application/yaml",
+        ".sql": "application/sql",
+        ".csv": "text/csv",
+    }
+    suffix = Path(filename).suffix.lower()
+    mime_type = mime_types.get(suffix)
+    if not mime_type:
+        raise ValueError(f"OpenAI file extraction does not support '{suffix or '[no extension]'}'")
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"text": {"type": "string"}},
+        "required": ["text"],
+    }
+    response = client.responses.create(
+        model=OPENAI_MODEL,
+        input=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_file",
+                    "filename": Path(filename).name,
+                    "file_data": f"data:{mime_type};base64," + base64.b64encode(content).decode("ascii"),
+                },
+                {
+                    "type": "input_text",
+                    "text": (
+                        "Transcribe all readable source content from this file once in the text field. Preserve the "
+                        "source wording, values, field names, numbers, dates, rules, headings, and ordering. Do not "
+                        "summarize, normalize, or invent content. For PDFs, prefix each page with [page N]. For "
+                        "JSON or API specifications, return the complete valid JSON document without code fences."
+                    ),
+                },
+            ],
+        }],
+        store=False,
+        text={"format": {"type": "json_schema", "name": "source_file_extraction", "strict": True, "schema": schema}},
+    )
+    if not response.output_text:
+        raise ValueError("OpenAI returned no text for the PDF")
+    data = json.loads(response.output_text)
+    extracted = str(data.get("text") or "").strip()
+    if not extracted:
+        raise ValueError("OpenAI returned empty extracted text")
+    return extracted, _sections(extracted)
+
+
+def extract_openai_pdf(content: bytes, filename: str) -> tuple[str, list[dict[str, Any]]]:
+    """Backward-compatible PDF extraction entry point."""
+    if Path(filename).suffix.lower() != ".pdf":
+        raise ValueError("Expected a PDF file")
+    return extract_openai_file(content, filename)

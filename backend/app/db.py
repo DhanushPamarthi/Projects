@@ -348,6 +348,7 @@ MIGRATIONS = [
 class _SQLiteConnection:
     def __init__(self, conn): self._conn = conn
     def execute(self, sql, params=()): return self._conn.execute(sql.replace("%s", "?"), params)
+    def executemany(self, sql, params): return self._conn.executemany(sql.replace("%s", "?"), params)
     def executescript(self, sql): return self._conn.executescript(sql)
     def commit(self): self._conn.commit()
     def rollback(self): self._conn.rollback()

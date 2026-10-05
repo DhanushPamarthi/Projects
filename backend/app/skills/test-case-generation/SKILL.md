@@ -41,9 +41,15 @@ Use deterministic inputs that can be replayed. Include a seed or seed-derived pl
 
 Evidence must cite only approved requirement, acceptance criterion, business rule, supplied knowledge context, and source reference IDs.
 
+In each evidence record, use `evidence_id` only as a local record label (`EV-001`, `EV-002`, and so on). Put the actual traceable citations in `source_references`, using the exact supplied fragment IDs and source references. Each assertion's `evidence_id` must point to one of that test case's local evidence-record IDs.
+
+For every evidence `source_references` item, copy the complete `fragment_id` and `source_reference` pair exactly from the supplied approved requirement or Knowledge Base evidence. Never copy a chunk ID when the input provides its original fragment ID, and never create a new reference.
+
 When context.knowledge_contexts is present, choose surfaces from those contexts by exact name and include the matching context_id in discovery_context_ids. Do not create a surface that is not present in supplied knowledge context.
 
 Every test case must cite at least one approved requirement, acceptance criterion, and/or business rule ID when those IDs are present.
+
+Cover every acceptance criterion ID and business rule ID listed in `coverage_plan` with a test case for the matching requirement. Include the exact criterion ID in `acceptance_criteria_ids` and the exact rule ID in `business_rule_ids`. Do not omit a rule because it overlaps another case; include both IDs on the same case when one scenario validly covers both.
 
 If GraphRAG/Knowledge Fabric context or executable surface detail is missing, do not invent it. Add a clear global_gaps entry and mark surface coverage as derived from approved requirements.
 

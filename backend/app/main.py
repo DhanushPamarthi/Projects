@@ -1,4 +1,4 @@
-import copy, difflib, hashlib, json, mimetypes, os, threading, uuid
+import copy, difflib, hashlib, json, logging, mimetypes, os, threading, time, uuid
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -7,7 +7,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from .config import BRONZE_SCHEMA, DATABASE_URL, EXTRACTION_CONFIG_VERSION, EXTRACTION_PROMPT_VERSION, LOCAL_EXTRACTOR_VERSION, MAX_UPLOAD_BYTES, OPENAI_MODEL, OPENAI_TIMEOUT_SECONDS, REQUIRED_BRD_SECTIONS, REQUIREMENTS_ANALYSIS_PROMPT_VERSION, SUPPORTED_EXTENSIONS, TEST_CASE_GENERATION_PROMPT_VERSION, UPLOAD_DIR
 from .db import connection, init_db
-from .extractors import extract_local, extract_openai, extraction_prompt_hash, missing_sections
+from .extractors import _json_sections, extract_local, extract_openai_file, extraction_prompt_hash, missing_sections
 from .validation import validate_file_content
 from .knowledge_fabric import BuildIndexRequest, build_knowledge_index, router as knowledge_fabric_router
 from .knowledge_fabric import retrieve_package_context
@@ -15,6 +15,7 @@ from .knowledge_fabric import retrieve_package_context
 app = FastAPI(title="TestIQ Source Package API", version="1.0.0")
 app.include_router(knowledge_fabric_router)
 SOURCE_TYPES = {"brd", "campaign_rules", "api_spec", "database_schema", "message_template", "ui_description"}
+logger = logging.getLogger(__name__)
 
 def now(): return datetime.now(timezone.utc).isoformat()
 def uid(prefix): return f"{prefix}_{uuid.uuid4().hex}"
@@ -102,7 +103,7 @@ def extraction_config_hash() -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 REQUIREMENTS_ANALYSIS_PROMPT = f"{read_skill_instructions('requirements-analysis')}\n\nSOURCE FRAGMENTS:\n"
-TEST_CASE_GENERATION_PROMPT = f"{read_skill_instructions('test-case-generation')}\n\nUse the package-scoped retrieved_knowledge_evidence in the input to ground database setup, API behavior, and test steps. Treat approved requirements as the behavior scope and cite only approved requirement/source references. Keep each generated case concise: short title, one-sentence description, three to five steps, one or two expected results, and focused setup data only.\n\nAPPROVED REQUIREMENTS:\n"
+TEST_CASE_GENERATION_PROMPT = f"{read_skill_instructions('test-case-generation')}\n\nUse the package-scoped retrieved_knowledge_evidence in the input to ground database setup, API behavior, and test steps. Treat approved requirements as the behavior scope and cite only approved requirement/source references. For every acceptance_criteria_id and business_rule_id listed in coverage_plan, include that exact ID in the matching requirement's test case traceability fields (acceptance_criteria_ids or business_rule_ids respectively). For every evidence.source_references entry, copy an exact fragment_id and source_reference pair from the supplied approved requirements or retrieved Knowledge Base evidence; never invent or alter either value. Every test case must include at least one test_data_setup item with created_during_execution set to true; name a supported record key, explain how execution creates that record, and cite its supporting requirement or acceptance-criterion ID in source. Never supply an actual production identifier. Keep each generated case concise: short title, one-sentence description, three to five steps, one or two expected results, and focused setup data only.\n\nAPPROVED REQUIREMENTS:\n"
 TEST_CASE_GENERATION_MAX_ATTEMPTS = 2
 
 def test_case_generation_prompt_hash() -> str:
@@ -192,6 +193,19 @@ def _require_test_case_knowledge(package_id: str, requested_by: str):
         raise HTTPException(409, "The Knowledge Base is ready, but returned no usable evidence for Test Case generation. Check the package sources or rebuild the Knowledge Base, then retry.")
     return rag
 
+def _require_test_data_knowledge(package_id: str):
+    try:
+        rag = _require_package_context(package_id, requested_by="Test Data Generation")
+    except HTTPException as exc:
+        if exc.status_code in {409, 422}:
+            raise HTTPException(409, "Test data generation requires a ready Knowledge Base index for this package. Build the index or wait for its current build to finish, then retry.") from exc
+        if exc.status_code in {502, 503}:
+            raise HTTPException(503, "Knowledge Base retrieval failed for test data generation. Check the provider and package index, then retry.") from exc
+        raise
+    if not (rag.get("brd_fragments") or rag.get("technical_fragments")):
+        raise HTTPException(409, "The Knowledge Base is ready but returned no usable evidence for test data generation. Check the package sources or rebuild the index, then retry.")
+    return rag
+
 def _raise_test_case_generation_error(exc: Exception, operation: str):
     detail = safe_llm_error_message(exc)
     lowered = detail.lower()
@@ -245,54 +259,87 @@ async def read_upload_with_limit(file: UploadFile) -> bytes:
         chunks.append(chunk)
     return b"".join(chunks)
 
-def extract_openai_with_timeout(text):
-    """Run the optional remote extractor without allowing the worker to hang."""
-    result, failure = [], []
-
-    def run():
-        try:
-            result.append(extract_openai(text))
-        except Exception as exc:
-            failure.append(exc)
-
-    worker = threading.Thread(target=run, daemon=True)
-    worker.start()
-    worker.join(OPENAI_TIMEOUT_SECONDS + 5)
-    if worker.is_alive():
-        raise TimeoutError(f"OpenAI extraction timed out after {OPENAI_TIMEOUT_SECONDS + 5:g} seconds")
-    if failure:
-        raise failure[0]
-    return result[0]
-
 def process_extraction(revision_id, source_id, extraction_id, storage_path, filename, required_sections):
-    # Commit the visible processing state before doing local parsing or a network call.
-    # Otherwise the UI can only see "pending" while OpenAI is slow or unavailable.
+    # Upload extraction always uses OpenAI; keep the model call in the background.
+    started_at = time.monotonic()
     with connection() as conn:
-        conn.execute("UPDATE source_extraction SET mode=%s,status=%s WHERE extraction_id=%s", ("local", "processing", extraction_id))
+        source_row = conn.execute("SELECT source_type FROM source_document WHERE source_id=%s", (source_id,)).fetchone()
+        source_type = source_row["source_type"] if source_row else None
+        conn.execute("UPDATE source_extraction SET mode=%s,status=%s WHERE extraction_id=%s", ("openai", "processing", extraction_id))
         conn.execute("UPDATE source_revision SET status=%s WHERE revision_id=%s", ("processing", revision_id))
-    with connection() as conn:
-        try:
-            content = Path(storage_path).read_bytes()
-            local_text, local_sections = extract_local(filename, content)
-            fallback_message = None
+    mode = "openai"
+    try:
+        content = Path(storage_path).read_bytes()
+        fallback_message = None
+        if Path(filename).suffix.lower() == ".json":
+            # JSON documents already have machine-readable structure. Parse
+            # them exactly instead of paying for an LLM to transcribe the same
+            # 1:1 JSON, which can be slow and can alter source values.
+            text, sections = extract_local(filename, content)
+            mode = "local"
+            logger.info(
+                "Source extraction used exact JSON parser revision=%s source_type=%s filename=%s size_bytes=%d fragments=%d duration_seconds=%.2f",
+                revision_id, source_type, filename, len(content), len(sections), time.monotonic() - started_at,
+            )
+        else:
+            openai_started_at = time.monotonic()
             try:
-                text, sections = extract_openai_with_timeout(local_text)
-                mode = "openai"
-            except Exception as exc:
-                text, sections, mode = local_text, local_sections, "local"
-                fallback_message = f"OpenAI extraction failed; local extraction was used: {exc}"
-            messages = json.loads(conn.execute("SELECT validation_messages FROM source_revision WHERE revision_id=%s", (revision_id,)).fetchone()["validation_messages"] or "[]")
-            messages.extend([f"Missing expected section: {item}" for item in missing_sections(local_sections, required_sections)])
-            if fallback_message: messages.append(fallback_message)
+                text, sections = extract_openai_file(content, filename)
+                logger.info(
+                    "Source extraction OpenAI completed revision=%s filename=%s size_bytes=%d duration_seconds=%.2f",
+                    revision_id, filename, len(content), time.monotonic() - openai_started_at,
+                )
+            except Exception as openai_error:
+                logger.warning(
+                    "Source extraction OpenAI failed revision=%s filename=%s size_bytes=%d duration_seconds=%.2f error=%s",
+                    revision_id, filename, len(content), time.monotonic() - openai_started_at, openai_error,
+                )
+                fallback_started_at = time.monotonic()
+                try:
+                    text, sections = extract_local(filename, content)
+                    mode = "local"
+                    fallback_message = f"OpenAI extraction failed; local extraction was used: {openai_error}"
+                    logger.info(
+                        "Source extraction local fallback completed revision=%s filename=%s duration_seconds=%.2f",
+                        revision_id, filename, time.monotonic() - fallback_started_at,
+                    )
+                except Exception as local_error:
+                    raise RuntimeError(
+                        f"OpenAI extraction failed ({openai_error}); local extraction fallback failed ({local_error})"
+                    ) from local_error
+        with connection() as conn:
+            source = conn.execute("SELECT validation_messages FROM source_revision WHERE revision_id=%s", (revision_id,)).fetchone()
+            messages = json.loads(source["validation_messages"] or "[]") if source else []
+            messages.extend([f"Missing expected section: {item}" for item in missing_sections(sections, required_sections)])
+            if fallback_message:
+                messages.append(fallback_message)
             model = OPENAI_MODEL if mode == "openai" else LOCAL_EXTRACTOR_VERSION
             conn.execute("UPDATE source_extraction SET mode=%s,status=%s,extracted_text=%s,error=%s,model_name=%s,prompt_version=%s,config_version=%s,prompt_hash=%s,config_hash=%s WHERE extraction_id=%s", (mode, "succeeded", text, fallback_message, model, EXTRACTION_PROMPT_VERSION, EXTRACTION_CONFIG_VERSION, extraction_prompt_hash(), extraction_config_hash(), extraction_id))
-            for index, section in enumerate(local_sections):
+            fragment_rows = []
+            for index, section in enumerate(sections):
                 fragment_text = section.get("text", "")
                 paragraph_index = section.get("paragraph_index")
-                conn.execute("INSERT INTO source_fragment (fragment_id,revision_id,source_id,fragment_index,heading,source_reference,page_number,fragment_type,paragraph_index,table_index,row_index,cell_index,heading_path,paragraph_start,paragraph_end,character_start,character_end,content_hash,extractor_version,provenance_mode,fragment_text) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (uid("frag"), revision_id, source_id, index, section.get("heading"), section.get("reference", "unknown"), section.get("page_number"), section.get("fragment_type", "paragraph"), paragraph_index, section.get("table_index"), section.get("row_index"), section.get("cell_index"), section.get("heading"), paragraph_index, paragraph_index, None, None, hashlib.sha256(fragment_text.encode("utf-8")).hexdigest(), LOCAL_EXTRACTOR_VERSION, mode, fragment_text))
+                fragment_rows.append((uid("frag"), revision_id, source_id, index, section.get("heading"), section.get("reference", "unknown"), section.get("page_number"), section.get("fragment_type", "paragraph"), paragraph_index, section.get("table_index"), section.get("row_index"), section.get("cell_index"), section.get("heading"), paragraph_index, paragraph_index, None, None, hashlib.sha256(fragment_text.encode("utf-8")).hexdigest(), f"openai:{model}" if mode == "openai" else LOCAL_EXTRACTOR_VERSION, mode, fragment_text))
+            if fragment_rows:
+                statement = "INSERT INTO source_fragment (fragment_id,revision_id,source_id,fragment_index,heading,source_reference,page_number,fragment_type,paragraph_index,table_index,row_index,cell_index,heading_path,paragraph_start,paragraph_end,character_start,character_end,content_hash,extractor_version,provenance_mode,fragment_text) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+                if DATABASE_URL:
+                    with conn.cursor() as cursor:
+                        cursor.executemany(statement, fragment_rows)
+                else:
+                    conn.executemany(statement, fragment_rows)
             conn.execute("UPDATE source_revision SET status=%s,validation_messages=%s WHERE revision_id=%s", ("uploaded", json.dumps(messages), revision_id))
-        except Exception as exc:
-            conn.execute("UPDATE source_extraction SET mode=%s,status=%s,error=%s,model_name=%s,prompt_version=%s,config_version=%s,prompt_hash=%s,config_hash=%s WHERE extraction_id=%s", ("local", "failed", str(exc), LOCAL_EXTRACTOR_VERSION, EXTRACTION_PROMPT_VERSION, EXTRACTION_CONFIG_VERSION, extraction_prompt_hash(), extraction_config_hash(), extraction_id))
+        logger.info(
+            "Source extraction completed revision=%s filename=%s mode=%s fragments=%d total_duration_seconds=%.2f",
+            revision_id, filename, mode, len(fragment_rows), time.monotonic() - started_at,
+        )
+    except Exception as exc:
+        logger.exception(
+            "Source extraction failed revision=%s filename=%s total_duration_seconds=%.2f",
+            revision_id, filename, time.monotonic() - started_at,
+        )
+        with connection() as conn:
+            model = OPENAI_MODEL if mode == "openai" else LOCAL_EXTRACTOR_VERSION
+            conn.execute("UPDATE source_extraction SET mode=%s,status=%s,error=%s,model_name=%s,prompt_version=%s,config_version=%s,prompt_hash=%s,config_hash=%s WHERE extraction_id=%s", (mode, "failed", str(exc), model, EXTRACTION_PROMPT_VERSION, EXTRACTION_CONFIG_VERSION, extraction_prompt_hash(), extraction_config_hash(), extraction_id))
             row = conn.execute("SELECT validation_messages FROM source_revision WHERE revision_id=%s", (revision_id,)).fetchone()
             messages = json.loads(row["validation_messages"] or "[]") if row else []
             messages.append(f"Extraction failed: {exc}")
@@ -875,8 +922,8 @@ def _test_case_generation_schema():
     data_need = {"type": "object", "additionalProperties": False, "properties": {"name": {"type": "string"}, "type": {"type": "string"}, "value": {"type": "string"}, "required": {"type": "boolean"}, "source": {"type": "string"}}, "required": ["name", "type", "value", "required", "source"]}
     deterministic_input = {"type": "object", "additionalProperties": False, "properties": {"name": {"type": "string"}, "value": {"type": "string"}, "seed_strategy": {"type": "string"}}, "required": ["name", "value", "seed_strategy"]}
     action = {"type": "object", "additionalProperties": False, "properties": {"step": {"type": "integer"}, "surface": {"type": "string"}, "actor": {"type": "string"}, "action": {"type": "string"}, "data_inputs": {"type": "array", "items": {"type": "string"}}}, "required": ["step", "surface", "actor", "action", "data_inputs"]}
-    assertion = {"type": "object", "additionalProperties": False, "properties": {"assertion_id": {"type": "string"}, "text": {"type": "string"}, "assertion_type": {"type": "string"}, "evidence_id": {"type": "string"}}, "required": ["assertion_id", "text", "assertion_type", "evidence_id"]}
-    evidence = {"type": "object", "additionalProperties": False, "properties": {"evidence_id": {"type": "string"}, "evidence_type": {"type": "string"}, "requirement_id": {"type": "string", "pattern": "^FR-[0-9]{3}$"}, "summary": {"type": "string"}, "source_references": {"type": "array", "items": source_reference}}, "required": ["evidence_id", "evidence_type", "requirement_id", "summary", "source_references"]}
+    assertion = {"type": "object", "additionalProperties": False, "properties": {"assertion_id": {"type": "string"}, "text": {"type": "string"}, "assertion_type": {"type": "string"}, "evidence_id": {"type": "string", "pattern": "^EV-[0-9]{3}$", "description": "Local evidence-record ID from this test case's evidence array."}}, "required": ["assertion_id", "text", "assertion_type", "evidence_id"]}
+    evidence = {"type": "object", "additionalProperties": False, "properties": {"evidence_id": {"type": "string", "pattern": "^EV-[0-9]{3}$", "description": "Local evidence-record ID, not a source citation."}, "evidence_type": {"type": "string"}, "requirement_id": {"type": "string", "pattern": "^FR-[0-9]{3}$"}, "summary": {"type": "string"}, "source_references": {"type": "array", "minItems": 1, "items": source_reference}}, "required": ["evidence_id", "evidence_type", "requirement_id", "summary", "source_references"]}
     validation_result = {"type": "object", "additionalProperties": False, "properties": {"check": {"type": "string"}, "status": {"type": "string"}, "details": {"type": "string"}}, "required": ["check", "status", "details"]}
     cleanup_ownership = {"type": "object", "additionalProperties": False, "properties": {"owner": {"type": "string"}, "cleanup_required": {"type": "boolean"}, "cleanup_steps": {"type": "array", "items": {"type": "string"}}}, "required": ["owner", "cleanup_required", "cleanup_steps"]}
     approval = {"type": "object", "additionalProperties": False, "properties": {"status": {"type": "string"}, "reviewer": {"type": "string"}, "comments": {"type": "string"}, "reviewed_at": {"type": "string"}}, "required": ["status", "reviewer", "comments", "reviewed_at"]}
@@ -1092,6 +1139,16 @@ def _validate_test_case_contract(contract, approved_requirements, requested_coun
     approved_by_id = {item["requirement_id"]: item for item in approved_requirements}
     rag_fragment_ids = {item.get("original_fragment_id") or item.get("fragment_id") for item in (rag_context or {}).get("brd_fragments", []) + (rag_context or {}).get("technical_fragments", [])}
     rag_fragment_ids.discard(None)
+    fragment_ids_by_reference = {}
+    for requirement in approved_requirements:
+        for ref in _case_source_refs(requirement):
+            if ref.get("fragment_id") and ref.get("source_reference"):
+                fragment_ids_by_reference.setdefault(ref["source_reference"], set()).add(ref["fragment_id"])
+    for fragment in (rag_context or {}).get("brd_fragments", []) + (rag_context or {}).get("technical_fragments", []):
+        fragment_id = fragment.get("original_fragment_id") or fragment.get("fragment_id")
+        source_reference = fragment.get("source_reference")
+        if fragment_id and source_reference:
+            fragment_ids_by_reference.setdefault(source_reference, set()).add(fragment_id)
     plan, _ = _test_case_coverage_plan(approved_requirements, requested_count)
     required_categories = {item["category"] for item in plan}
     generated_categories = {case.get("category") for case in contract["test_cases"]}
@@ -1151,10 +1208,30 @@ def _validate_test_case_contract(contract, approved_requirements, requested_coun
             case_surface_names = {surface.get("name") for surface in test_case.get("surfaces", []) if surface.get("name")}
             if allowed_surface_names and not case_surface_names & allowed_surface_names:
                 raise ValueError(f"AI returned an uncited executable surface for {case_id}")
+        evidence_record_ids = set()
         for evidence in test_case.get("evidence", []):
-            evidence_id = evidence.get("evidence_id")
-            if evidence_id and evidence_id not in valid_evidence_ids:
-                raise ValueError(f"AI returned unapproved evidence id {evidence_id} for {case_id}")
+            evidence_id = str(evidence.get("evidence_id") or "")
+            if not re.fullmatch(r"EV-\d{3}", evidence_id) or evidence_id in evidence_record_ids:
+                raise ValueError(f"AI returned an invalid or duplicate evidence-record id for {case_id}")
+            evidence_record_ids.add(evidence_id)
+            if evidence.get("requirement_id") != requirement_id:
+                raise ValueError(f"AI returned evidence linked to the wrong requirement for {case_id}")
+            evidence_refs = evidence.get("source_references") or []
+            if not evidence_refs:
+                raise ValueError(f"AI returned uncited evidence for {case_id}")
+            if valid_fragments:
+                for ref in evidence_refs:
+                    fragment_id = ref.get("fragment_id")
+                    if fragment_id not in valid_fragments:
+                        matching_ids = fragment_ids_by_reference.get(ref.get("source_reference"), set())
+                        if len(matching_ids) == 1:
+                            ref["fragment_id"] = next(iter(matching_ids))
+                            fragment_id = ref["fragment_id"]
+                    if not fragment_id or fragment_id not in valid_fragments:
+                        raise ValueError(f"AI returned an unknown source fragment in evidence for {case_id}")
+        for assertion in test_case.get("assertions", []):
+            if assertion.get("evidence_id") not in evidence_record_ids:
+                raise ValueError(f"AI returned an assertion with an unknown evidence-record id for {case_id}")
         if valid_fragments:
             for ref in test_case.get("source_references", []):
                 if ref.get("fragment_id") and ref.get("fragment_id") not in valid_fragments:
@@ -1162,12 +1239,97 @@ def _validate_test_case_contract(contract, approved_requirements, requested_coun
 
 def _test_cases_with_openai(approved_requirements, package, requested_count, discovery_contexts=None, rag_context=None):
     from openai import OpenAI
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=OPENAI_TIMEOUT_SECONDS)
+    # Validation repair is controlled explicitly below; disable hidden SDK
+    # retries so a slow request cannot be repeated before our repair logic runs.
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=OPENAI_TIMEOUT_SECONDS, max_retries=0)
     payload = _test_case_generation_input(approved_requirements, package, requested_count, discovery_contexts, rag_context)
+    base_prompt = TEST_CASE_GENERATION_PROMPT + json.dumps(payload, ensure_ascii=False)
     failures = []
+    previous_invalid_output = None
     for attempt in range(1, TEST_CASE_GENERATION_MAX_ATTEMPTS + 1):
         try:
-            response = client.responses.create(model=OPENAI_MODEL, input=TEST_CASE_GENERATION_PROMPT + json.dumps(payload, ensure_ascii=False), store=False, text={"format": {"type": "json_schema", "name": "test_case_contract", "strict": True, "schema": _test_case_generation_schema()}})
+            request_prompt = base_prompt
+            if attempt > 1:
+                previous_error = failures[-1]["details"]
+                repair_guidance = (
+                    "Correct the specific validation failure while preserving supported case behavior. "
+                    "Every test case must have at least one test_data_setup item whose created_during_execution is true. "
+                    "Use a record key explicitly supported by that case's approved requirement or Knowledge Base evidence; "
+                    "describe how the execution template or pre-step creates it, do not invent a production value, and set "
+                    "source to comma-separated approved evidence IDs only. "
+                )
+                missing_case = re.search(r"test case (TC-\d{3})", previous_error, re.IGNORECASE)
+                if missing_case:
+                    case_id = missing_case.group(1)
+                    invalid_case = next((item for item in (previous_invalid_output or {}).get("test_cases", [])
+                                         if item.get("test_case_id") == case_id), None)
+                    if invalid_case:
+                        requirement = next((item for item in approved_requirements
+                                            if item.get("requirement_id") == invalid_case.get("requirement_id")), {})
+                        allowed_ids = [requirement.get("requirement_id")]
+                        allowed_ids.extend(item.get("acceptance_id") for item in requirement.get("acceptance_criteria", []) if item.get("acceptance_id"))
+                        allowed_ids.extend(item.get("rule_id") for item in requirement.get("business_rules", []) if item.get("rule_id"))
+                        allowed_ids.extend(context.get("context_id") for context in discovery_contexts or [] if context.get("context_id"))
+                        repair_guidance += f"For {case_id}, use one or more of these evidence IDs in test_data_setup.source: {', '.join(dict.fromkeys(x for x in allowed_ids if x))}. "
+                        if "unknown source fragment in evidence" in previous_error.lower():
+                            allowed_pairs = _case_source_refs(requirement)
+                            for fragment in (rag_context or {}).get("brd_fragments", []) + (rag_context or {}).get("technical_fragments", []):
+                                fragment_id = fragment.get("original_fragment_id") or fragment.get("fragment_id")
+                                source_reference = fragment.get("source_reference")
+                                if fragment_id and source_reference:
+                                    allowed_pairs.append({"fragment_id": fragment_id, "source_reference": source_reference})
+                            unique_pairs = {(pair.get("fragment_id"), pair.get("source_reference")) for pair in allowed_pairs
+                                            if pair.get("fragment_id") and pair.get("source_reference")}
+                            allowed_pairs_json = json.dumps(
+                                [{"fragment_id": fragment_id, "source_reference": source_reference}
+                                 for fragment_id, source_reference in sorted(unique_pairs)],
+                                ensure_ascii=False,
+                            )
+                            repair_guidance += (
+                                f"For evidence.source_references in {case_id}, copy exact pairs only from this allowed list: "
+                                f"{allowed_pairs_json}. "
+                            )
+                missing_criterion = re.search(r"acceptance criterion coverage: (AC-\d{3})", previous_error, re.IGNORECASE)
+                if missing_criterion:
+                    criterion_id = missing_criterion.group(1)
+                    for requirement in approved_requirements:
+                        criterion = next((item for item in requirement.get("acceptance_criteria", [])
+                                          if item.get("acceptance_id") == criterion_id), None)
+                        if criterion:
+                            repair_guidance += (
+                                f"The missing criterion {criterion_id} belongs to requirement {requirement.get('requirement_id')}. "
+                                f"Create or update a case for that requirement and include the exact ID {criterion_id} "
+                                "in acceptance_criteria_ids. Its approved condition is "
+                                f"given={criterion.get('given')}; when={criterion.get('when')}; then={criterion.get('then')}. "
+                                "The case must test this condition and its expected outcome, not merely add an unrelated citation. "
+                            )
+                            break
+                missing_rule = re.search(r"business rule coverage: (BR-\d{3})", previous_error, re.IGNORECASE)
+                if missing_rule:
+                    rule_id = missing_rule.group(1)
+                    for requirement in approved_requirements:
+                        rule = next((item for item in requirement.get("business_rules", [])
+                                     if item.get("rule_id") == rule_id), None)
+                        if rule:
+                            repair_guidance += (
+                                f"The missing business rule {rule_id} belongs to requirement {requirement.get('requirement_id')}. "
+                                f"Create or update a case for that requirement and include the exact ID {rule_id} "
+                                f"in business_rule_ids. The approved rule is: {rule.get('text')}. "
+                                "The case must exercise the rule's behavior, not merely add an unrelated citation. "
+                            )
+                            break
+                request_prompt = (
+                    f"{base_prompt}\n\n"
+                    "VALIDATION REPAIR REQUIRED: Your previous test-case response failed validation. "
+                    "Return a complete corrected test-case contract. Preserve valid cases, add or correct cases as needed. "
+                    f"{repair_guidance}"
+                    "and ensure every acceptance criterion and business rule listed in coverage_plan is covered by its exact ID "
+                    "in acceptance_criteria_ids or business_rule_ids on a case for the matching requirement. Do not omit "
+                    "required coverage to satisfy the requested case count.\n"
+                    f"Validation error: {previous_error}\n"
+                    f"Previous invalid response: {json.dumps(previous_invalid_output, ensure_ascii=False) if previous_invalid_output is not None else 'unavailable'}"
+                )
+            response = client.responses.create(model=OPENAI_MODEL, input=request_prompt, store=False, text={"format": {"type": "json_schema", "name": "test_case_contract", "strict": True, "schema": _test_case_generation_schema()}})
             if not response.output_text:
                 raise ValueError("OpenAI returned no test cases")
             contract = json.loads(response.output_text)
@@ -1177,6 +1339,8 @@ def _test_cases_with_openai(approved_requirements, package, requested_count, dis
             contract.setdefault("global_gaps", []).extend(payload["context"]["gaps"] + payload.get("coverage_gaps", []))
             return contract
         except Exception as exc:
+            if "contract" in locals() and isinstance(contract, dict):
+                previous_invalid_output = contract
             failures.append({"attempt": attempt, "status": "failed", "details": safe_llm_error_message(exc)})
     raise ValueError(f"LLM test-case generation failed validation after {TEST_CASE_GENERATION_MAX_ATTEMPTS} attempts: {failures[-1]['details']}")
 
@@ -1503,8 +1667,21 @@ async def upload_source(project_id: str, file: UploadFile = File(...), source_ty
             existing = conn.execute("SELECT s.*,r.* FROM source_document s JOIN source_revision r ON r.source_id=s.source_id WHERE s.project_id=%s AND s.source_type=%s ORDER BY s.updated_at DESC, r.revision DESC", (project_id, source_type)).fetchall()
         source = existing[0] if existing else None
         source_id = source["source_id"] if source else uid("src")
-        if source and any(x["sha256"] == digest for x in existing):
-            reused_revision = next(x for x in existing if x["sha256"] == digest)
+        same_content_revision = next((item for item in existing if item["sha256"] == digest), None)
+        reusable_revision = None
+        if same_content_revision:
+            previous_extraction = conn.execute(
+                "SELECT status FROM source_extraction WHERE revision_id=%s ORDER BY created_at DESC LIMIT 1",
+                (same_content_revision["revision_id"],),
+            ).fetchone()
+            has_fragments = conn.execute(
+                "SELECT 1 FROM source_fragment WHERE revision_id=%s LIMIT 1",
+                (same_content_revision["revision_id"],),
+            ).fetchone()
+            if previous_extraction and previous_extraction["status"] == "succeeded" and has_fragments:
+                reusable_revision = same_content_revision
+        if source and reusable_revision:
+            reused_revision = reusable_revision
             reused_revision_id = reused_revision["revision_id"]
             revision_id = uid("rev"); revision = max(x["revision"] for x in existing) + 1
             conn.execute("INSERT INTO source_revision (revision_id,source_id,revision,filename,content_type,size_bytes,sha256,storage_path,owner_version,ingestion_version,status,validation_messages,duplicate_of_revision_id,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (revision_id, source_id, revision, filename, detected_type, len(content), digest, reused_revision["storage_path"], owner_version, "source-intake-v1", "uploaded", json.dumps(messages), reused_revision_id, now()))
@@ -2114,22 +2291,46 @@ def _generate_functional_contract(package, items, fragments, approved_business_r
         "Set knowledge_context_ids to an empty array; cite Knowledge Base evidence using source_references. Create clear system behaviors, business rules, flow steps, and testable acceptance criteria. Do not return unapproved business use cases.\n\nINPUT JSON:\n"
         + json.dumps(payload, ensure_ascii=False)
     )
-    response = OpenAI(api_key=key, timeout=OPENAI_TIMEOUT_SECONDS).responses.create(
-        model=OPENAI_MODEL,
-        input=prompt,
-        store=False,
-        text={"format": {"type": "json_schema", "name": "functional_requirements_contract", "strict": True, "schema": _functional_requirement_schema()}},
-    )
-    if not response.output_text:
-        raise ValueError("OpenAI returned no Functional Requirements")
-    contract = json.loads(response.output_text)
-    _validate_requirements_contract(contract, allowed_fragments)
+    client = OpenAI(api_key=key, timeout=OPENAI_TIMEOUT_SECONDS)
+    previous_output = None
+    validation_error = None
+    response = None
+    for attempt in range(2):
+        repair_prompt = prompt
+        if attempt:
+            repair_prompt = (
+                "Repair the previous Functional Requirements JSON. Return the complete corrected object. "
+                "Use only the exact fragment_id and source_reference pairs present in the supplied approved use cases "
+                "and retrieved Knowledge Base evidence. Do not cite acceptance-criterion IDs or invent evidence IDs. "
+                f"Validation error: {validation_error}\n\nPREVIOUS INVALID RESPONSE:\n{previous_output}\n\nORIGINAL INPUT:\n{prompt}"
+            )
+        response = client.responses.create(
+            model=OPENAI_MODEL,
+            input=repair_prompt,
+            store=False,
+            text={"format": {"type": "json_schema", "name": "functional_requirements_contract", "strict": True, "schema": _functional_requirement_schema()}},
+        )
+        try:
+            if not response.output_text:
+                raise ValueError("OpenAI returned no Functional Requirements")
+            previous_output = json.loads(response.output_text)
+            contract = previous_output
+            _validate_requirements_contract(contract, allowed_fragments)
+            for requirement in contract["requirements"]:
+                unknown_business = set(requirement.get("business_requirement_ids", [])) - approved_ids
+                if unknown_business or not requirement.get("business_requirement_ids"):
+                    raise ValueError(f"AI returned an unapproved business requirement link for {requirement['requirement_id']}")
+                if requirement.get("knowledge_context_ids"):
+                    raise ValueError(f"AI returned non-Knowledge-Base context IDs for {requirement['requirement_id']}")
+            break
+        except (ValueError, json.JSONDecodeError) as exc:
+            validation_error = str(exc)
+            if attempt == 1:
+                raise ValueError(
+                    f"OpenAI returned Functional Requirements that failed validation after one repair attempt: {validation_error}"
+                ) from exc
+    contract["generation_attempts"] = attempt + 1
     for requirement in contract["requirements"]:
-        unknown_business = set(requirement.get("business_requirement_ids", [])) - approved_ids
-        if unknown_business or not requirement.get("business_requirement_ids"):
-            raise ValueError(f"AI returned an unapproved business requirement link for {requirement['requirement_id']}")
-        if requirement.get("knowledge_context_ids"):
-            raise ValueError(f"AI returned non-Knowledge-Base context IDs for {requirement['requirement_id']}")
         requirement["business_rules"] = [
             {"rule_id": business["business_requirement_id"], "text": business["text"], "approved": True, "review_status": "approved", "source_references": business.get("source_references", [])}
             for business in approved_business_requirements if business["business_requirement_id"] in requirement["business_requirement_ids"]
@@ -2638,7 +2839,7 @@ def execute_run(run_id: str, request: ExecutionRunExecuteRequest | None = None):
         comments = request.comments if request else None
         observations.append({
             "type": "execution_started",
-            "message": "Execution started by validating saved Bronze data for each selected test case.",
+            "message": "Execution started by validating each selected test case against its saved Bronze rows and PBM Silver results.",
             "created_at": started_at,
             "reviewer": reviewer or row["reviewer"],
             "comments": comments,
@@ -2720,37 +2921,6 @@ def _unique_test_value(key, template_id, test_case_id, ordinal=0):
     if "phone" in normalized:
         return f"+1-555-{int(suffix[:6], 16) % 1000000:06d}"
     return None
-
-def _set_unique_template_values(value, template_id, test_case_id):
-    counters = {}
-    def visit(current):
-        if isinstance(current, dict):
-            for key, item in list(current.items()):
-                normalized = key.lower()
-                ordinal = counters.get(normalized, 0)
-                counters[normalized] = ordinal + 1
-                generated = _unique_test_value(key, template_id, test_case_id, ordinal)
-                if generated is not None and (item is None or item == "" or normalized in {"member_id", "subscriber_id", "prescription_id", "claim_id", "payment_method_id", "campaign_id", "communication_id", "email_address", "phone_number", "token"}):
-                    current[key] = generated
-                else:
-                    visit(item)
-        elif isinstance(current, list):
-            for item in current:
-                visit(item)
-        return current
-    return visit(value)
-
-def _link_member_identities(payload, identities):
-    if isinstance(payload, dict):
-        for key, value in list(payload.items()):
-            if key.lower() == "member_id" and identities:
-                payload[key] = identities[0]
-            else:
-                _link_member_identities(value, identities)
-    elif isinstance(payload, list):
-        for item in payload:
-            _link_member_identities(item, identities)
-    return payload
 
 def _test_data_record_response(row):
     item = row_dict(row)
@@ -2974,45 +3144,6 @@ def _knowledge_field_names(rag_context):
         if lowered not in cleaned:
             cleaned.append(lowered)
     return cleaned[:120]
-
-def _derive_test_data_templates_locally(case_ids, cases, rag_context):
-    knowledge_fields = _knowledge_field_names(rag_context)
-    if not knowledge_fields:
-        raise ValueError("Knowledge Base did not include recognizable data fields")
-    prefix_counts = {}
-    for field in knowledge_fields:
-        prefix = field.split("_", 1)[0]
-        if len(prefix) > 2:
-            prefix_counts[prefix] = prefix_counts.get(prefix, 0) + 1
-    default_entity = max(prefix_counts, key=prefix_counts.get) if prefix_counts else "knowledge_record"
-    templates = {}
-    assignments = {}
-    for case_id in case_ids:
-        case = cases[case_id]
-        setup_names = []
-        for item in case.get("test_data_setup") or []:
-            if isinstance(item, dict) and item.get("name"):
-                setup_names.append(re.sub(r"[^A-Za-z0-9_]+", "_", str(item["name"]).lower()).strip("_"))
-        case_text = json.dumps(case, ensure_ascii=False).lower()
-        entity_candidates = [name.split("_", 1)[0] for name in setup_names if "_" in name]
-        entity_candidates.extend(prefix for prefix in prefix_counts if prefix in case_text)
-        entity = next((item for item in entity_candidates if item), default_entity)
-        fields = [field for field in knowledge_fields if field.startswith(f"{entity}_")]
-        fields.extend(name for name in setup_names if name and name not in fields)
-        if not fields:
-            fields = knowledge_fields[: min(10, len(knowledge_fields))]
-        fields = list(dict.fromkeys(fields))[:20]
-        template_id = f"kb_{entity}"
-        if template_id not in templates:
-            payload = {field: "" for field in fields}
-            templates[template_id] = {
-                "template_id": template_id,
-                "template_name": f"{entity.replace('_', ' ').title()} Knowledge Template",
-                "entity_name": entity,
-                "payload_json": json.dumps(payload, sort_keys=True),
-            }
-        assignments[case_id] = [templates[template_id]]
-    return assignments
 
 _TEST_DATA_DOMAIN_ENTITIES = ("member", "prescription", "refill", "communication", "campaign", "eligibility", "eligibility_decision", "pharmacy")
 
@@ -3254,34 +3385,6 @@ def _expand_test_data_templates_for_cases(case_ids, cases, templates_by_case, ra
         }]
     return expanded
 
-def _derive_test_data_templates_from_knowledge(case_ids, cases, rag_context):
-    if not rag_context:
-        # Keep test-data generation available while the package index is
-        # building. The scenario payload is based on the approved case and its
-        # expected outcome; Knowledge Base evidence enriches it when available.
-        templates_by_case = {}
-        for case_id in case_ids:
-            case = cases[case_id]
-            payload = _scenario_test_data_payload(case, None)
-            templates_by_case[case_id] = [{
-                "template_id": f"scenario_case_{re.sub(r'[^A-Za-z0-9_:-]+', '_', case_id).strip('_').lower()}",
-                "template_name": "Scenario Test Data",
-                "entity_name": _primary_test_data_entity(_required_test_data_sections(case), case),
-                "payload_json": json.dumps(payload, sort_keys=True),
-            }]
-        return templates_by_case
-    try:
-        templates = _derive_test_data_templates_with_openai(case_ids, cases, rag_context)
-    except Exception as exc:
-        try:
-            templates = _derive_test_data_templates_locally(case_ids, cases, rag_context)
-        except Exception as fallback_exc:
-            raise HTTPException(
-                422,
-                f"Could not derive test data templates from the Knowledge Base: {safe_llm_error_message(exc)}; local derivation failed: {safe_llm_error_message(fallback_exc)}",
-            )
-    return _expand_test_data_templates_for_cases(case_ids, cases, templates, rag_context)
-
 def _first_nested_value(payload, path):
     current = payload
     for key in path:
@@ -3341,7 +3444,7 @@ def _generate_test_data_with_openai(templates, rag_context=None):
         case_properties = {case["test_case_id"]: {"type": "object", "properties": {"payload": _test_data_value_schema(template["payload"])}, "required": ["payload"], "additionalProperties": False} for case in case_batch}
         schema = {"type": "object", "properties": {"records": {"type": "object", "properties": case_properties, "required": list(case_properties), "additionalProperties": False}}, "required": ["records"], "additionalProperties": False}
         prompt = {
-            "instructions": "Create realistic, synthetic test data for each approved test case using the supplied template, pre-step setup, and retrieved package knowledge. Return a complete payload for every case. Preserve the template's exact keys, nesting, array lengths, and value types. Use the scenario, preconditions, data needs, setup steps, database schema, and expected results to choose values that exercise that case. Keep fixed template values when they remain appropriate; vary values when the case requires a boundary, negative, or alternate state. Keep identifiers and related records consistent across the payload. Use only fictional names and example.test email addresses. Do not include explanations or keys outside the template.",
+            "instructions": "Generate synthetic scenario data for each approved test case using only the supplied versioned event template, approved case details, and retrieved package Knowledge Base evidence. Return a complete event for every case. Preserve the template's exact keys, nesting, array lengths, and value types. Choose values that make the event setup satisfy that specific case, including negative, boundary, consent, eligibility, and refill conditions when applicable. Keep member, prescription, drug, and contact values internally consistent. Use fictional test values only and the reserved +1-555 test phone shown by the template. Do not create event id, correlationId, time, source, type, or specversion values; the application sets the trace metadata after generation. Do not include explanations or keys outside the template.",
             "template": {"entity_name": template["entity_name"], "template_name": template["template_name"], "payload_shape_and_examples": template["payload"]},
             "approved_test_cases": [{key: case.get(key) for key in ("test_case_id", "title", "description", "scenario", "preconditions", "test_data_setup", "data_needs", "actions", "steps", "expected_results", "deterministic_inputs") if case.get(key) is not None} for case in case_batch],
             "retrieved_knowledge_evidence": _rag_context_for_prompt(rag_context),
@@ -3373,40 +3476,117 @@ def _test_data_generation_batches(assignments, cases, templates_by_case):
         batches.extend((item["template"], item["cases"][index:index + 10]) for index in range(0, len(item["cases"]), 10))
     return batches
 
-def _fallback_test_data_payload(template, test_case):
-    payload = json.loads(json.dumps(template["payload"]))
-    case_id = str(test_case.get("test_case_id") or "case")
-    suffix = hashlib.sha256(f"{template['template_id']}:{case_id}".encode("utf-8")).hexdigest()[:8].upper()
-    scenario = " ".join(str(test_case.get(key) or "") for key in ("title", "scenario", "expected_results")).lower()
-    inactive_case = any(term in scenario for term in ("ineligible", "inactive", "terminated", "excluded", "invalid", "rejected"))
+def _pharmacy_notification_template():
+    template_path = Path(__file__).resolve().parent / "templates" / "pharmacy_sample_notification_v1.json"
+    try:
+        template = json.loads(template_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(500, "The pharmacy notification test data template is unavailable or invalid.") from exc
+    if not isinstance(template, dict) or not template.get("data", {}).get("members"):
+        raise HTTPException(500, "The pharmacy notification test data template is missing its required member structure.")
+    return {
+        "template_id": "pharmacy_sample_notification_v1",
+        "template_name": "Pharmacy Sample Notification v1",
+        "entity_name": "pharmacy_notification",
+        "payload": template,
+    }
 
-    def fill(value, key=""):
-        normalized = key.lower()
+def _stamp_pharmacy_event_fields(payload, generation_id, test_case_id, timestamp=None):
+    template = _pharmacy_notification_template()["payload"]
+    digest = hashlib.sha256(f"{generation_id}:{test_case_id}".encode("utf-8")).hexdigest().upper()
+    payload["id"] = f"evt-testiq-{digest[:24]}"
+    payload["correlationId"] = f"testiq-run-{digest[:12].lower()}-case-{digest[12:24].lower()}"
+    payload["time"] = timestamp or datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    for key in ("type", "source", "specversion", "growthplatform", "product"):
+        payload[key] = template[key]
+    if isinstance(payload.get("data"), dict):
+        payload["data"]["recipientType"] = template["data"]["recipientType"]
+        members = payload["data"].get("members")
+        if isinstance(members, list):
+            for ordinal, member in enumerate(members):
+                if not isinstance(member, dict):
+                    continue
+                person = member.get("person")
+                if isinstance(person, dict):
+                    person["resourceID"] = _unique_test_value("member_id", f"{generation_id}:pharmacy_notification_v1", test_case_id, ordinal)
+                preference = member.get("contactPreference")
+                if isinstance(preference, dict):
+                    phone_digest = hashlib.sha256(f"{generation_id}:{test_case_id}:phone:{ordinal}".encode("utf-8")).hexdigest()
+                    phone_suffix = int(phone_digest[:12], 16) % 10_000_000
+                    preference["safeTestMobile"] = f"+1555{phone_suffix:07d}"
+    return payload
+
+def _pharmacy_case_text(test_case):
+    return " ".join(str(test_case.get(key) or "") for key in ("title", "description", "scenario", "preconditions", "steps", "expected_results", "assertions", "test_data_setup", "data_needs")).lower()
+
+def _validate_pharmacy_notification(payload, test_case, seen_member_ids=None, seen_phones=None, seen_event_ids=None, seen_correlations=None, seen_times=None):
+    template = _pharmacy_notification_template()["payload"]
+    if not _matches_test_data_template_shape(payload, template):
+        raise HTTPException(422, "Generated pharmacy notification does not match the required template structure or field types.")
+
+    def check_populated(value, path="event"):
         if isinstance(value, dict):
-            return {child_key: fill(child_value, child_key) for child_key, child_value in value.items()}
-        if isinstance(value, list):
-            return [fill(child, key) for child in value]
-        if value != "":
-            return value
-        if normalized.endswith("_id") or normalized == "id":
-            return f"QA-{normalized.upper()}-{suffix}"
-        if "email" in normalized:
-            return f"qa.{suffix.lower()}@example.test"
-        if "phone" in normalized:
-            return f"+1-555-{int(suffix[:6], 16) % 1000000:06d}"
-        if "date" in normalized:
-            return "1990-01-01" if "birth" in normalized else "2026-01-01"
-        if "status" in normalized:
-            return "INACTIVE" if inactive_case else "ACTIVE"
-        if normalized in {"first_name", "given_name"}:
-            return "Ava"
-        if normalized in {"last_name", "family_name", "surname"}:
-            return "Anderson"
-        if normalized.endswith("_name") or normalized == "name":
-            return f"QA {template['entity_name'].title()} {suffix[:4]}"
-        return f"QA-{suffix}"
+            for key, child in value.items():
+                check_populated(child, f"{path}.{key}")
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                check_populated(child, f"{path}[{index}]")
+        elif isinstance(value, str) and not value.strip():
+            raise HTTPException(422, f"Generated pharmacy notification is missing a value at {path}.")
 
-    return fill(payload)
+    check_populated(payload)
+    try:
+        event_time = datetime.fromisoformat(payload["time"].replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        raise HTTPException(422, "Generated pharmacy notification has an invalid event time.")
+    for value, seen_values, label in (
+        (payload["id"], seen_event_ids, "event id"),
+        (payload["correlationId"], seen_correlations, "correlationId"),
+        (event_time.isoformat(), seen_times, "event time"),
+    ):
+        if seen_values is not None and value in seen_values:
+            raise HTTPException(422, f"Generated test data reuses a {label} across test cases.")
+        if seen_values is not None:
+            seen_values.add(value)
+
+    members = payload["data"]["members"]
+    member_ids, phone_values = [], []
+    for member in members:
+        member_id = member["person"].get("resourceID")
+        if not isinstance(member_id, str) or not member_id.strip():
+            raise HTTPException(422, "Each generated member must have a resourceID.")
+        member_ids.append(member_id)
+        mobile = member["contactPreference"].get("safeTestMobile")
+        if not re.fullmatch(r"\+1555\d{7}", mobile or ""):
+            raise HTTPException(422, "Generated contact data must use a safe synthetic +1-555 test mobile number.")
+        phone_values.append(mobile)
+        if not member["prescription"]:
+            raise HTTPException(422, "Each generated member must have at least one prescription.")
+
+    if len(member_ids) != len(set(member_ids)) or (seen_member_ids is not None and any(item in seen_member_ids for item in member_ids)):
+        raise HTTPException(422, "Generated test data reuses a member resourceID across members or test cases.")
+    if len(phone_values) != len(set(phone_values)) or (seen_phones is not None and any(item in seen_phones for item in phone_values)):
+        raise HTTPException(422, "Generated test data reuses a safe test mobile across members or test cases.")
+    if seen_member_ids is not None:
+        seen_member_ids.update(member_ids)
+    if seen_phones is not None:
+        seen_phones.update(phone_values)
+
+    scenario_text = _pharmacy_case_text(test_case)
+    prescriptions = [prescription for member in members for prescription in member["prescription"]]
+    excluded_case = any(term in scenario_text for term in ("ineligible", "not eligible", "excluded member", "eligibility exclusion"))
+    eligible_case = not excluded_case and any(term in scenario_text for term in ("eligible member", "member is eligible", "eligible patient"))
+    if excluded_case and any(prescription["eligibleInd"] is not False for prescription in prescriptions):
+        raise HTTPException(422, "Generated prescription eligibility does not match the approved ineligible or exclusion test case.")
+    if eligible_case and not any(prescription["eligibleInd"] is True for prescription in prescriptions):
+        raise HTTPException(422, "Generated prescription eligibility does not match the approved eligible-member test case.")
+
+    no_consent = any(term in scenario_text for term in ("without sms consent", "no sms consent", "sms consent is false", "consent revoked", "declined sms consent"))
+    consented = not no_consent and any(term in scenario_text for term in ("with sms consent", "sms consent is true", "consented to sms"))
+    if no_consent and any(member["contactPreference"]["smsConsent"] is not False for member in members):
+        raise HTTPException(422, "Generated SMS consent does not match the approved no-consent test case.")
+    if consented and not any(member["contactPreference"]["smsConsent"] is True for member in members):
+        raise HTTPException(422, "Generated SMS consent does not match the approved consented test case.")
 
 @app.post("/api/v1/test-case-generations/{generation_id}/test-data", status_code=201)
 def generate_test_data(generation_id: str, request: TestDataGenerationRequest):
@@ -3434,50 +3614,37 @@ def generate_test_data(generation_id: str, request: TestDataGenerationRequest):
                 raise HTTPException(409, "Test data already exists for this generation. Use regenerate for draft records or create a new test-case generation.")
             if any(item["status"] == "saved" for item in existing_rows):
                 raise HTTPException(409, "Saved Bronze records are immutable. Create a new test-case generation to produce another dataset.")
-        rag = _try_retrieve_package_context(generation["package_id"], requested_by="Test Data Generation")
-        selected_templates_by_case = _derive_test_data_templates_from_knowledge(assignment_case_ids, cases, rag)
-        generation_mode = "openai"
-        generation_warning = None
+        rag = _require_test_data_knowledge(generation["package_id"])
+        event_template = _pharmacy_notification_template()
+        template_record = {
+            "template_id": event_template["template_id"],
+            "template_name": event_template["template_name"],
+            "entity_name": event_template["entity_name"],
+            "payload_json": json.dumps(event_template["payload"], sort_keys=True),
+        }
+        selected_templates_by_case = {case_id: [template_record] for case_id in assignment_case_ids}
         try:
             generated_payloads = _generate_test_data_with_openai(_test_data_generation_batches(assignment_case_ids, cases, selected_templates_by_case), rag)
         except Exception as exc:
-            generation_mode = "template_fallback"
-            generation_warning = f"LLM unavailable; generated test data with the template fallback. Details: {safe_llm_error_message(exc)}"
-            generated_payloads = {
-                (case_id, template["template_id"]): _fallback_test_data_payload(
-                    {"template_id": template["template_id"], "entity_name": template["entity_name"], "payload": json.loads(template["payload_json"])},
-                    cases[case_id],
-                )
-                for case_id in assignment_case_ids
-                for template in selected_templates_by_case[case_id]
-            }
+            raise HTTPException(502, f"OpenAI could not generate test data for the approved cases: {safe_llm_error_message(exc)}. No local data fallback was used.") from exc
         if existing_rows:
             conn.execute("DELETE FROM test_data_record WHERE generation_id=%s AND status='draft'", (generation_id,))
         created = []
         timestamp = now()
+        generated_member_ids, generated_phones = set(), set()
+        generated_event_ids, generated_correlations, generated_times = set(), set(), set()
         for case_id in assignment_case_ids:
             test_case = cases[case_id]
-            identities = []
-            prepared = []
+            payload = generated_payloads[(case_id, event_template["template_id"])]
+            payload = _stamp_pharmacy_event_fields(payload, generation_id, case_id)
+            _validate_pharmacy_notification(payload, test_case, generated_member_ids, generated_phones, generated_event_ids, generated_correlations, generated_times)
             for template in selected_templates_by_case[case_id]:
-                payload = generated_payloads[(case_id, template["template_id"])]
-                payload = _set_unique_template_values(payload, template["template_id"], case_id)
-                payload = _normalize_test_data_relationships(payload)
-                if template["entity_name"].lower() != "member":
-                    _link_member_identities(payload, identities)
-                    payload = _normalize_test_data_relationships(payload)
-                if template["entity_name"].lower() == "member":
-                    member_id = payload.get("member_id") if isinstance(payload, dict) else None
-                    if member_id:
-                        identities.append(member_id)
-                prepared.append((template, payload))
-            for template, payload in prepared:
                 record_id = uid("tdr")
                 pre_steps = test_case.get("test_data_setup") or []
                 schema_context = [{"source_type": item.get("source_type"), "source_reference": item.get("source_reference"), "fragment_id": item.get("original_fragment_id") or item.get("fragment_id"), "text": item.get("fragment_text")} for item in (rag or {}).get("technical_fragments", [])]
                 conn.execute("INSERT INTO test_data_record (record_id,generation_id,test_case_id,template_id,template_name,entity_name,payload_json,pre_steps_json,schema_context_json,status,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (record_id, generation_id, case_id, template["template_id"], template["template_name"], template["entity_name"], json.dumps(payload, sort_keys=True), json.dumps(pre_steps), json.dumps(schema_context), "draft", timestamp, timestamp))
                 created.append({"record_id": record_id, "generation_id": generation_id, "test_case_id": case_id, "template_id": template["template_id"], "template_name": template["template_name"], "entity_name": template["entity_name"], "payload": payload, "pre_steps": pre_steps, "schema_context": schema_context, "status": "draft", "created_at": timestamp})
-        return {"generation_id": generation_id, "generation_mode": generation_mode, "generation_model": OPENAI_MODEL if generation_mode == "openai" else None, "generation_warning": generation_warning, "rag_metadata": _rag_metadata_or_none(rag), "rag_status": _rag_status(rag), "records": created}
+        return {"generation_id": generation_id, "generation_mode": "openai", "generation_model": OPENAI_MODEL, "rag_metadata": _rag_metadata_or_none(rag), "rag_status": _rag_status(rag, required=True), "records": created}
 
 @app.get("/api/v1/test-case-generations/{generation_id}/test-data")
 def list_test_data(generation_id: str):
@@ -3501,7 +3668,7 @@ def review_test_data(generation_id: str, request: TestDataReviewRequest):
         saved_rows = conn.execute("SELECT r.* FROM test_data_record r WHERE r.generation_id=%s ORDER BY r.test_case_id,r.entity_name", (generation_id,)).fetchall()
         return [_test_data_record_response(row) for row in saved_rows]
 
-_BRONZE_TABLES = {"membership", "prescription", "order", "claim", "benefit", "drug", "medical_claim", "product"}
+_BRONZE_TABLES = {"raw_file", "membership", "prescription", "order", "claim", "benefit", "drug", "medical_claim", "product"}
 
 def _bronze_trace_fields(row):
     return {
@@ -3589,6 +3756,9 @@ def _bronze_order_data(payload, row):
     return {key: value for key, value in data.items() if value is not None}
 
 def _bronze_rows_for_payload(payload, row):
+    if isinstance(payload, dict) and payload.get("type") == "pharmacy.orders.v1.sample-notification" and payload.get("specversion") == "1.0":
+        # PBM's Silver procedure consumes domain rows tied to testiq.ingestion_load.
+        return [("membership", payload), ("prescription", payload)]
     rows = []
     if payload.get("member") or payload.get("membership") or payload.get("eligibility_decision"):
         rows.append(("membership", _bronze_member_data(payload, row)))
@@ -3602,6 +3772,29 @@ def _bronze_rows_for_payload(payload, row):
     return [(table, data) for table, data in rows if table in _BRONZE_TABLES and data]
 
 def _insert_bronze_domain_row(conn, table, load_id, data):
+    if table == "raw_file":
+        from psycopg import sql
+        import hashlib
+        from psycopg.types.json import Jsonb
+        raw_bytes = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        digest = hashlib.sha256(raw_bytes).hexdigest()
+        source_uri = f"testiq://test-data/{data['correlationId']}"
+        filename = f"{data['id']}.json"
+        row = conn.execute(
+            sql.SQL("INSERT INTO {} "
+                "(source_uri,source_path,original_filename,file_size_bytes,source_modified_at,sha256,raw_bytes,payload,status) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'BRONZE_LOADED') "
+                "ON CONFLICT (sha256) DO NOTHING RETURNING raw_file_id").format(sql.Identifier(BRONZE_SCHEMA, "raw_file")),
+            (source_uri, source_uri, filename, len(raw_bytes), datetime.now(timezone.utc), digest, raw_bytes, Jsonb(data)),
+        ).fetchone()
+        if not row:
+            row = conn.execute(
+                sql.SQL("SELECT raw_file_id FROM {} WHERE sha256=%s").format(sql.Identifier(BRONZE_SCHEMA, "raw_file")),
+                (digest,),
+            ).fetchone()
+        if not row:
+            raise RuntimeError("Bronze raw-file insert did not return a stored event reference")
+        return {"table": table, "id": str(row["raw_file_id"])}
     from psycopg import sql
     from psycopg.types.json import Jsonb
     sequence_name = f"{BRONZE_SCHEMA}.{table}_id_seq"
@@ -3611,6 +3804,85 @@ def _insert_bronze_domain_row(conn, table, load_id, data):
     )
     bronze_row = conn.execute(statement, (load_id, Jsonb(data))).fetchone()
     return {"table": table, "id": str(bronze_row["id"])}
+
+def _event_bronze_records(payload):
+    """Map the pharmacy CloudEvent to the same Bronze JSON contracts as PBM ingestion."""
+    metadata = {
+        "source_event_id": payload["id"],
+        "source_correlation_id": payload["correlationId"],
+    }
+    members, prescriptions = [], []
+    for item in payload["data"].get("members") or []:
+        person = item["person"]
+        preference = item.get("contactPreference") or {}
+        comms, phones = [], []
+        channel_values = (
+            ("SMS", preference.get("smsConsent", False), preference.get("safeTestMobile")),
+            ("EMAIL", preference.get("emailConsent", False), preference.get("safeTestEmail")),
+            ("PORTAL", preference.get("portalConsent", False), preference.get("safeTestPortal")),
+        )
+        for channel, enabled, destination in channel_values:
+            if destination:
+                comms.append({
+                    "preference_type": "PRIMARY" if preference.get("preferredChannel") == channel else "SECONDARY",
+                    "channel": channel, "value": destination, "address_reference": None,
+                    "language": None, "enabled": enabled,
+                })
+        if preference.get("safeTestMobile"):
+            phones.append({"phone_type": "MOBILE", "phone_number": preference["safeTestMobile"],
+                           "is_primary": preference.get("preferredChannel") == "SMS"})
+        members.append({
+            **metadata, "member_id": person["resourceID"], "subscriber_id": person["resourceID"],
+            "dependent_number": None, "relationship_to_subscriber": None,
+            "first_name": person["firstName"], "middle_name": None, "last_name": person["lastName"],
+            "date_of_birth": None, "gender": None, "status": "ACTIVE", "preferred_language": None,
+            "marital_status": None, "race_ethnicity": None, "effective_date": None,
+            "termination_date": None, "addresses": [], "phones": phones, "emails": [],
+            "communication_preferences": comms, "payment_methods": [],
+            "speciality_id": person["specialityID"],
+        })
+        for rx in item["prescription"]:
+            drug = rx["drug"]
+            prescriptions.append({
+                **metadata, "prescription_id": rx["resourceID"], "rx_number": rx["resourceID"],
+                "member_id": person["resourceID"], "status": rx.get("rxStatus", "ACTIVE"),
+                "eligible_ind": rx.get("eligibleInd", True), "refills_remaining": rx.get("refillsRemaining", 0),
+                "next_refill_date": rx.get("nextRefillDate"),
+                "autofill_enrolled_ind": rx.get("autofillEnrolled", False),
+                "fill_method": rx.get("fillMethod", "MANUAL"),
+                "refills_allowed": rx.get("refillsRemaining", 0), "refill_number": 0,
+                "drug_name": drug["name"], "strength": drug["strength"],
+                "therapy_code": drug["therapyCode"], "manufacturer": drug["manufacturer"],
+                "ndc": None, "route": None, "dosage_form": None, "prescribed_date": None,
+                "dispensed_date": None, "days_supply": None, "quantity_dispensed": None,
+            })
+    return members, prescriptions
+
+def _insert_pbm_event_load(conn, payload, generation_id, test_case_id, row):
+    from psycopg.types.json import Jsonb
+    from psycopg import sql
+    members, prescriptions = _event_bronze_records(payload)
+    load_id = str(conn.execute("SELECT nextval('testiq.ingestion_load_id_seq') AS value").fetchone()["value"])
+    event_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    digest = hashlib.sha256(event_bytes).hexdigest()
+    conn.execute(
+        "INSERT INTO testiq.ingestion_load (load_id,event_id,correlation_id,original_filename,sha256,source_system,document_type,document_version,file_size_bytes,status,member_count,prescription_count) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'BRONZE_LOADED',%s,%s)",
+        (load_id, payload["id"], payload["correlationId"], f"{payload['id']}.json", digest,
+         payload["source"], payload["type"], payload["specversion"], len(event_bytes), len(members), len(prescriptions)),
+    )
+    refs = []
+    created_time = payload["time"]
+    for table, records in (("membership", members), ("prescription", prescriptions)):
+        for record in records:
+            result = conn.execute(
+                sql.SQL("INSERT INTO {} (load_id,created_time,data) VALUES (%s,%s,%s) RETURNING id").format(
+                    sql.Identifier(BRONZE_SCHEMA, table)
+                ),
+                (load_id, created_time, Jsonb(record)),
+            ).fetchone()
+            refs.append({"table": table, "id": str(result["id"])})
+    return load_id, refs
 
 def _bronze_ref_id(record_id: str, bronze_schema: str, bronze_table: str, bronze_id: str) -> str:
     digest = hashlib.sha256(f"{record_id}:{bronze_schema}:{bronze_table}:{bronze_id}".encode("utf-8")).hexdigest()[:24]
@@ -3666,6 +3938,22 @@ def _bronze_refs_for_record(conn, row):
 def _fetch_bronze_domain_row(conn, table: str, bronze_id: str):
     if table not in _BRONZE_TABLES:
         return None
+    if table == "raw_file":
+        try:
+            identifier = uuid.UUID(str(bronze_id))
+        except (TypeError, ValueError):
+            return None
+        from psycopg import sql
+        row = conn.execute(
+            sql.SQL("SELECT raw_file_id AS id,status AS load_id,created_at AS created_time,payload AS data "
+                "FROM {} WHERE raw_file_id=%s").format(sql.Identifier(BRONZE_SCHEMA, "raw_file")),
+            (identifier,),
+        ).fetchone()
+        if not row:
+            return None
+        item = row_dict(row)
+        item["id"] = str(item["id"])
+        return item
     from psycopg import sql
     identifier = int(bronze_id) if str(bronze_id).isdigit() else bronze_id
     statement = sql.SQL("SELECT id, load_id, created_time, data FROM {} WHERE id=%s").format(sql.Identifier(BRONZE_SCHEMA, table))
@@ -3695,6 +3983,17 @@ def _assert_equal_if_present(assertions, name: str, expected, actual):
     _add_assertion(assertions, name, expected == actual, expected, actual)
 
 def _evaluate_record_payload(payload, actual_by_table, assertions):
+    if isinstance(payload, dict) and payload.get("type") == "pharmacy.orders.v1.sample-notification":
+        expected_members = payload.get("data", {}).get("members", [])
+        bronze_members = [_item["data"] for _item in actual_by_table.get("membership", [])]
+        bronze_prescriptions = [_item["data"] for _item in actual_by_table.get("prescription", [])]
+        expected_member_ids = [item["person"]["resourceID"] for item in expected_members]
+        expected_rx_ids = [rx["resourceID"] for item in expected_members for rx in item["prescription"]]
+        _add_assertion(assertions, "PBM membership Bronze rows exist", len(bronze_members) == len(expected_member_ids), len(expected_member_ids), len(bronze_members))
+        _add_assertion(assertions, "PBM prescription Bronze rows exist", len(bronze_prescriptions) == len(expected_rx_ids), len(expected_rx_ids), len(bronze_prescriptions))
+        _add_assertion(assertions, "member resourceIDs mapped to Bronze", sorted(item.get("member_id") for item in bronze_members) == sorted(expected_member_ids), sorted(expected_member_ids), sorted(item.get("member_id") for item in bronze_members))
+        _add_assertion(assertions, "prescription resourceIDs mapped to Bronze", sorted(item.get("prescription_id") for item in bronze_prescriptions) == sorted(expected_rx_ids), sorted(expected_rx_ids), sorted(item.get("prescription_id") for item in bronze_prescriptions))
+        return
     member = payload.get("member") or payload.get("membership") or {}
     decision = payload.get("eligibility_decision") or {}
     prescription = payload.get("prescription") or {}
@@ -3747,6 +4046,7 @@ def _execute_case_against_bronze(conn, run_id: str, generation_id: str, test_cas
     expected_records = []
     actual_records = []
     all_refs = []
+    silver_actual = {"members": [], "prescriptions": []}
     if not rows:
         _add_assertion(assertions, "saved test data exists", False, "saved test data", "none")
     for row in rows:
@@ -3770,6 +4070,64 @@ def _execute_case_against_bronze(conn, run_id: str, generation_id: str, test_cas
                 actual_records.append(actual_item)
                 actual_by_table.setdefault(ref["bronze_table"], []).append(actual_item)
         _evaluate_record_payload(payload, actual_by_table, assertions)
+        if payload.get("type") == "pharmacy.orders.v1.sample-notification":
+            load_ids = sorted({str(ref["bronze_load_id"]) for ref in refs if ref.get("bronze_load_id")})
+            for load_id in load_ids:
+                load = conn.execute("SELECT status,error_message FROM testiq.ingestion_load WHERE load_id=%s", (load_id,)).fetchone()
+                if not load:
+                    _add_assertion(assertions, f"PBM load {load_id} exists", False, "testiq.ingestion_load row", "missing")
+                    continue
+                if load["status"] == "BRONZE_LOADED":
+                    conn.execute("CALL testiq.process_bronze_load_to_silver(%s,'TESTIQ_EXECUTION')", (load_id,))
+                    load = conn.execute("SELECT status,error_message FROM testiq.ingestion_load WHERE load_id=%s", (load_id,)).fetchone()
+                _add_assertion(assertions, f"PBM Silver promotion {load_id} completed", load["status"] == "COMPLETED", "COMPLETED", load["status"], load.get("error_message") or "PBM load did not complete cleanly.")
+                audit = conn.execute("SELECT status,membership_records_read,membership_records_processed,membership_records_failed,prescription_records_read,prescription_records_processed,prescription_records_failed,unhandled_entity_counts,error_message FROM testiq.bronze_silver_run_audit WHERE load_id=%s ORDER BY started_at DESC LIMIT 1", (load_id,)).fetchone()
+                _add_assertion(assertions, f"PBM orchestration audit {load_id} completed", bool(audit) and audit["status"] == "COMPLETED", "COMPLETED audit", audit["status"] if audit else "missing", audit.get("error_message") if audit else "No PBM orchestration audit was recorded.")
+                if audit:
+                    _add_assertion(assertions, f"PBM membership rows processed {load_id}", audit["membership_records_failed"] == 0 and audit["membership_records_processed"] == audit["membership_records_read"], audit["membership_records_read"], audit["membership_records_processed"])
+                    _add_assertion(assertions, f"PBM prescription rows processed {load_id}", audit["prescription_records_failed"] == 0 and audit["prescription_records_processed"] == audit["prescription_records_read"], audit["prescription_records_read"], audit["prescription_records_processed"])
+                silver_members = conn.execute("SELECT member_id,first_name,last_name,status FROM silverbox.member WHERE load_id=%s ORDER BY member_id", (load_id,)).fetchall()
+                silver_prescriptions = conn.execute("SELECT prescription_id,member_id,status,eligible_ind,refills_remaining,next_refill_date,drug_name,strength FROM silverbox.prescription WHERE load_id=%s ORDER BY prescription_id", (load_id,)).fetchall()
+                silver_actual["members"].extend([dict(item) for item in silver_members])
+                silver_actual["prescriptions"].extend([dict(item) for item in silver_prescriptions])
+                event_members = payload.get("data", {}).get("members", [])
+                expected_member_ids = sorted(item["person"]["resourceID"] for item in event_members)
+                expected_rx = sorted(rx["resourceID"] for item in event_members for rx in item["prescription"])
+                _add_assertion(assertions, f"Silver member IDs match event {load_id}", sorted(item["member_id"] for item in silver_members) == expected_member_ids, expected_member_ids, sorted(item["member_id"] for item in silver_members))
+                _add_assertion(assertions, f"Silver prescription IDs match event {load_id}", sorted(item["prescription_id"] for item in silver_prescriptions) == expected_rx, expected_rx, sorted(item["prescription_id"] for item in silver_prescriptions))
+                silver_preferences = conn.execute(
+                    "SELECT m.member_id,p.channel,p.value,p.enabled,p.preference_type "
+                    "FROM silverbox.member_communication_preference p "
+                    "JOIN silverbox.member m ON m.member_sk=p.member_sk "
+                    "WHERE m.load_id=%s ORDER BY m.member_id,p.channel,p.value",
+                    (load_id,),
+                ).fetchall()
+                silver_actual.setdefault("communication_preferences", []).extend([dict(item) for item in silver_preferences])
+                expected_preferences = sorted(
+                    (member["person"]["resourceID"], channel, destination, enabled)
+                    for member in event_members
+                    for channel, enabled, destination in (
+                        ("SMS", member.get("contactPreference", {}).get("smsConsent", False), member.get("contactPreference", {}).get("safeTestMobile")),
+                        ("EMAIL", member.get("contactPreference", {}).get("emailConsent", False), member.get("contactPreference", {}).get("safeTestEmail")),
+                        ("PORTAL", member.get("contactPreference", {}).get("portalConsent", False), member.get("contactPreference", {}).get("safeTestPortal")),
+                    ) if destination
+                )
+                actual_preferences = sorted((item["member_id"], item["channel"].upper(), item["value"], item["enabled"]) for item in silver_preferences)
+                _add_assertion(assertions, f"Silver communication preferences match event {load_id}", actual_preferences == expected_preferences, expected_preferences, actual_preferences)
+                actual_rx = {item["prescription_id"]: item for item in silver_prescriptions}
+                for event_member in event_members:
+                    member_id = event_member["person"]["resourceID"]
+                    for expected in event_member["prescription"]:
+                        actual = actual_rx.get(expected["resourceID"])
+                        if actual:
+                            prefix = f"Silver prescription {expected['resourceID']}"
+                            _assert_equal_if_present(assertions, f"{prefix} member", member_id, actual["member_id"])
+                            _assert_equal_if_present(assertions, f"{prefix} status", expected.get("rxStatus", "ACTIVE"), actual["status"])
+                            _assert_equal_if_present(assertions, f"{prefix} eligibility", expected.get("eligibleInd", True), actual["eligible_ind"])
+                            _assert_equal_if_present(assertions, f"{prefix} remaining refills", expected.get("refillsRemaining", 0), actual["refills_remaining"])
+                            _assert_equal_if_present(assertions, f"{prefix} refill date", expected.get("nextRefillDate"), str(actual["next_refill_date"]) if actual["next_refill_date"] else None)
+                            _assert_equal_if_present(assertions, f"{prefix} drug", expected["drug"]["name"], actual["drug_name"])
+                            _assert_equal_if_present(assertions, f"{prefix} strength", expected["drug"]["strength"], actual["strength"])
         expected_records.append({
             "record_id": row["record_id"],
             "entity_name": row["entity_name"],
@@ -3785,7 +4143,7 @@ def _execute_case_against_bronze(conn, run_id: str, generation_id: str, test_cas
         "INSERT INTO test_execution_result (result_id,run_id,generation_id,test_case_id,status,expected_json,actual_json,assertions_json,bronze_refs_json,started_at,completed_at,error) "
         "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
         "ON CONFLICT (run_id, test_case_id) DO UPDATE SET status=EXCLUDED.status,expected_json=EXCLUDED.expected_json,actual_json=EXCLUDED.actual_json,assertions_json=EXCLUDED.assertions_json,bronze_refs_json=EXCLUDED.bronze_refs_json,started_at=EXCLUDED.started_at,completed_at=EXCLUDED.completed_at,error=EXCLUDED.error",
-        (result_id, run_id, generation_id, test_case_id, status, json.dumps({"records": expected_records}, sort_keys=True), json.dumps({"bronze_rows": actual_records}, sort_keys=True), json.dumps(assertions, sort_keys=True), json.dumps(all_refs, sort_keys=True), started_at, completed_at, error),
+        (result_id, run_id, generation_id, test_case_id, status, json.dumps({"records": expected_records}, sort_keys=True), json.dumps({"bronze_rows": actual_records, "silver": silver_actual}, sort_keys=True), json.dumps(assertions, sort_keys=True), json.dumps(all_refs, sort_keys=True), started_at, completed_at, error),
     )
     return status
 
@@ -3795,20 +4153,48 @@ def save_test_data_to_bronze(generation_id: str):
         raise HTTPException(503, f"Bronze insertion requires PostgreSQL and the {BRONZE_SCHEMA} schema")
     saved = []
     with connection() as conn:
+        pbm_objects = conn.execute("""SELECT to_regclass('testiq.ingestion_load') AS load_table,
+            to_regclass('testiq.ingestion_load_id_seq') AS load_sequence,
+            to_regclass('bronzebox.membership') AS membership_table,
+            to_regclass('bronzebox.prescription') AS prescription_table,
+            to_regclass('silverbox.member') AS silver_member_table,
+            to_regclass('silverbox.prescription') AS silver_prescription_table,
+            to_regprocedure('testiq.process_bronze_load_to_silver(text,text)') AS promote_procedure""").fetchone()
+        if not all(pbm_objects.values()):
+            raise HTTPException(503, "PBM Bronze/Silver integration objects are unavailable in the shared database. Check database connectivity and the PBM ingestion service readiness.")
+        generation = conn.execute("SELECT * FROM test_case_generation WHERE generation_id=%s", (generation_id,)).fetchone()
+        if not generation:
+            raise HTTPException(404, "Test-case generation run not found")
+        generation_contract = json.loads(generation["contract_json"])
+        cases = {case.get("test_case_id"): case for case in generation_contract.get("test_cases", [])}
         rows = conn.execute("SELECT * FROM test_data_record WHERE generation_id=%s ORDER BY test_case_id,entity_name", (generation_id,)).fetchall()
         if not rows:
             raise HTTPException(404, "Generate test data before saving it to Bronze")
+        member_ids, phone_values, event_ids, correlations, event_times, validated_payloads = set(), set(), set(), set(), set(), {}
+        for row in rows:
+            test_case = cases.get(row["test_case_id"])
+            if not test_case:
+                raise HTTPException(422, f"Approved test case {row['test_case_id']} is missing from its generation contract.")
+            payload = json.loads(row["payload_json"])
+            if row["status"] != "saved":
+                payload = _stamp_pharmacy_event_fields(payload, generation_id, row["test_case_id"])
+                conn.execute("UPDATE test_data_record SET payload_json=%s,updated_at=%s WHERE record_id=%s", (json.dumps(payload, sort_keys=True), now(), row["record_id"]))
+            _validate_pharmacy_notification(payload, test_case, member_ids, phone_values, event_ids, correlations, event_times)
+            validated_payloads[row["record_id"]] = payload
         for row in rows:
             if row["status"] == "saved":
                 saved.append(_test_data_record_response(row))
                 continue
-            payload = json.loads(row["payload_json"])
+            payload = validated_payloads[row["record_id"]]
             bronze_rows = _bronze_rows_for_payload(payload, row)
             if not bronze_rows:
                 raise HTTPException(422, f"No supported Bronze records could be derived for {row['test_case_id']} / {row['entity_name']}")
             try:
-                load_id = f"testiq-{generation_id}"
-                bronze_refs = [_insert_bronze_domain_row(conn, table, load_id, data) for table, data in bronze_rows]
+                if payload.get("type") == "pharmacy.orders.v1.sample-notification":
+                    load_id, bronze_refs = _insert_pbm_event_load(conn, payload, generation_id, row["test_case_id"], row)
+                else:
+                    load_id = f"testiq-{generation_id}"
+                    bronze_refs = [_insert_bronze_domain_row(conn, table, load_id, data) for table, data in bronze_rows]
                 _record_bronze_refs(conn, row, bronze_refs, load_id)
             except Exception as exc:
                 raise HTTPException(503, f"Could not insert into {BRONZE_SCHEMA} Bronze tables: {exc}") from exc
