@@ -179,6 +179,32 @@ def _require_package_context(package_id: str, requested_by: str):
     except Exception as exc:
         raise HTTPException(502, f"Knowledge Base retrieval failed for {requested_by}: {safe_llm_error_message(exc)}") from exc
 
+def _require_test_case_knowledge(package_id: str, requested_by: str):
+    try:
+        rag = _require_package_context(package_id, requested_by=requested_by)
+    except HTTPException as exc:
+        if exc.status_code in {409, 422}:
+            raise HTTPException(409, f"Test Case generation requires a ready, approved Knowledge Base for this package. Build it or wait for its current build to finish, then retry.") from exc
+        if exc.status_code in {502, 503}:
+            raise HTTPException(503, f"Knowledge Base retrieval failed for {requested_by}. Check the Knowledge Base provider and package index, then retry. No test cases were generated.") from exc
+        raise
+    if not (rag.get("brd_fragments") or rag.get("technical_fragments")):
+        raise HTTPException(409, "The Knowledge Base is ready, but returned no usable evidence for Test Case generation. Check the package sources or rebuild the Knowledge Base, then retry.")
+    return rag
+
+def _raise_test_case_generation_error(exc: Exception, operation: str):
+    detail = safe_llm_error_message(exc)
+    lowered = detail.lower()
+    if isinstance(exc, TimeoutError) or "timed out" in lowered or "timeout" in lowered:
+        message = f"OpenAI timed out during {operation}. Check service availability and retry."
+    elif "api key" in lowered or "invalid_api_key" in lowered:
+        message = "OpenAI rejected the configured API key. Check OPENAI_API_KEY and retry."
+    elif isinstance(exc, ValueError):
+        message = f"OpenAI returned test cases that failed schema, evidence, or coverage validation during {operation}: {detail}. No local fallback was used; review the response requirements and retry."
+    else:
+        message = f"OpenAI failed during {operation}: {detail}. No local fallback was used; review the OpenAI configuration and retry."
+    raise HTTPException(502, message) from exc
+
 def _rag_context_for_prompt(rag, max_evidence: int = 8, max_fragment_characters: int = 500, max_rules: int = 8, max_rule_characters: int = 260):
     if not rag:
         return {}
@@ -980,10 +1006,6 @@ def _test_case_coverage_plan(approved_requirements, requested_count=None):
         plan.append({"category": base["category"], "label": base["label"], "requirement": base["requirement"]})
     return plan[:requested_count], gaps
 
-def _test_case_seed(package, requirement, category, index):
-    payload = {"package_id": package.get("package_id"), "package_version": package.get("package_version"), "requirement_id": requirement.get("requirement_id"), "category": category, "index": index}
-    return int(hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:8], 16)
-
 def _compact_test_source_refs(refs, limit=4):
     compacted = []
     for ref in refs or []:
@@ -1157,142 +1179,6 @@ def _test_cases_with_openai(approved_requirements, package, requested_count, dis
         except Exception as exc:
             failures.append({"attempt": attempt, "status": "failed", "details": safe_llm_error_message(exc)})
     raise ValueError(f"LLM test-case generation failed validation after {TEST_CASE_GENERATION_MAX_ATTEMPTS} attempts: {failures[-1]['details']}")
-
-def _case_template(category):
-    templates = {
-        "happy_path": {"type": "positive", "scenario": "Eligible member completes the documented reminder journey.", "steps": ["Prepare an eligible active member with the required campaign inputs.", "Run the campaign eligibility and reminder flow.", "Confirm the expected reminder outcome is produced."], "expected": "The eligible member follows the approved journey and receives the expected reminder outcome."},
-        "exclusion": {"type": "negative", "scenario": "Ineligible or missing-data member is excluded from the reminder journey.", "steps": ["Prepare a member record that violates the approved eligibility rule or omits required data.", "Run the campaign eligibility flow.", "Confirm the member is excluded and no unsupported reminder is sent."], "expected": "The member is excluded according to the approved rule and the exclusion is observable."},
-        "boundary": {"type": "boundary", "scenario": "Eligibility threshold is validated at the documented boundary.", "steps": ["Prepare deterministic data at the documented eligibility threshold.", "Run the eligibility evaluation.", "Confirm the boundary result matches the approved requirement."], "expected": "The boundary condition is handled consistently with the approved criteria."},
-        "channel_fallback": {"type": "negative", "scenario": "Alternate communication path is triggered when the primary channel fails.", "steps": ["Prepare an eligible member for the primary communication channel.", "Simulate or record primary-channel failure.", "Confirm the approved alternate channel behavior occurs."], "expected": "The fallback path runs only when supported by the approved communication rule."},
-        "retry_failure": {"type": "failure", "scenario": "Retry, idempotency, or service failure is handled without duplicate or partial incorrect outcomes.", "steps": ["Prepare deterministic campaign data.", "Simulate the approved failure or retry condition.", "Confirm status, retry, and duplicate-prevention behavior."], "expected": "Failure handling remains traceable, bounded, and does not create duplicate outcomes."},
-        "requirement_validation": {"type": "positive", "scenario": "Requirement behavior is validated from the approved contract.", "steps": ["Prepare the documented preconditions.", "Execute the requirement flow.", "Confirm the approved expected behavior."], "expected": "The requirement behaves as approved."},
-    }
-    return templates.get(category, templates["requirement_validation"])
-
-def _database_test_data_setup(requirement, category, seed, criteria_ids, rule_ids):
-    requirement_id = requirement.get("requirement_id") or "approved requirement"
-    evidence_source = ",".join(criteria_ids or rule_ids or [requirement_id])
-    entity_text = " ".join(requirement.get("entities") or []).lower()
-    setup = [
-        {
-            "name": "member_id",
-            "data_type": "database primary or business key",
-            "value_strategy": f"Generated during execution from seed {seed}; placeholder MEM-{seed % 100000:05d} is used only for repeatable planning.",
-            "created_during_execution": True,
-            "setup_step": "Create a member test record before validation and capture the generated member_id for all SQL checks in this test case.",
-            "source": evidence_source,
-        },
-        {
-            "name": "member_status",
-            "data_type": "database attribute",
-            "value_strategy": "Set to ACTIVE when the approved requirement validates active-member behavior; otherwise set according to the acceptance criterion or business rule under test.",
-            "created_during_execution": True,
-            "setup_step": "Insert or update the member eligibility/status row so the member state matches the approved scenario.",
-            "source": evidence_source,
-        },
-    ]
-    if "campaign" in entity_text or category in {"happy_path", "exclusion", "retry_failure"}:
-        setup.append({
-            "name": "campaign_id",
-            "data_type": "database foreign or business key",
-            "value_strategy": f"Generated during execution from seed {seed}; placeholder CMP-{seed % 10000:04d} is used only for repeatable planning.",
-            "created_during_execution": True,
-            "setup_step": "Create or select the campaign/control record needed for the test and link it to the generated member_id.",
-            "source": evidence_source,
-        })
-    return setup
-
-def _fallback_test_case_title(acceptance_criterion, selected_rule, scenario):
-    behavior = (acceptance_criterion or {}).get("then") or (selected_rule or {}).get("text") or scenario
-    title = " ".join(str(behavior or "").split()).strip(" .!?\t\n")
-    if not title:
-        title = "Verify the approved requirement behavior"
-    if title.lower().startswith("verify "):
-        result = title[0].upper() + title[1:]
-    else:
-        result = f"Verify {title[0].lower() + title[1:]}"
-    if len(result) > 120:
-        result = result[:117].rsplit(" ", 1)[0].rstrip(" ,;:") + "..."
-    return result
-
-def _test_cases_fallback(approved_requirements, requested_count, package=None, discovery_contexts=None):
-    package = package or {}
-    discovery_contexts = discovery_contexts or []
-    plan, gaps = _test_case_coverage_plan(approved_requirements, requested_count)
-    cases = []
-    for index, entry in enumerate(plan, 1):
-        requirement = entry["requirement"]
-        category = entry["category"]
-        template = _case_template(category)
-        criteria = [item for item in requirement.get("acceptance_criteria", []) if isinstance(item, dict)]
-        rules = [item for item in requirement.get("business_rules", []) if isinstance(item, dict)]
-        case_criteria = entry.get("acceptance_criteria") or ([entry["acceptance_criterion"]] if entry.get("acceptance_criterion") else ([criteria[0]] if criteria else []))
-        selected_rules = entry.get("business_rules") or ([entry["business_rule"]] if entry.get("business_rule") else [])
-        first = case_criteria[0] if case_criteria else {}
-        selected_rule = selected_rules[0] if selected_rules else None
-        seed = _test_case_seed(package, requirement, category, index)
-        source_refs = _case_source_refs(requirement)
-        evidence_refs = source_refs[:3] or [{"fragment_id": "unavailable", "source_reference": "approved requirement contract"}]
-        actor = (requirement.get("actors") or ["Campaign Service"])[0]
-        selected_context = discovery_contexts[(index - 1) % len(discovery_contexts)] if discovery_contexts else None
-        surface_name = selected_context["name"] if selected_context else ", ".join(requirement.get("entities") or ["Campaign workflow"])
-        surface_type = selected_context["context_type"] if selected_context else "workflow"
-        steps = requirement.get("flow_steps") or template["steps"]
-        selected_rule_text = selected_rule.get("text") if isinstance(selected_rule, dict) else ""
-        expected_text = first.get("then") or selected_rule_text or template["expected"]
-        rule_ids = [rule.get("rule_id") for rule in selected_rules if rule.get("rule_id")]
-        criteria_ids = [criterion.get("acceptance_id") for criterion in case_criteria if criterion.get("acceptance_id")]
-        test_data_setup = _database_test_data_setup(requirement, category, seed, criteria_ids, rule_ids)
-        setup_steps = [item["setup_step"] for item in test_data_setup]
-        setup_fields = ", ".join(item["name"] for item in test_data_setup if item.get("name")) or "the required test data"
-        requirement_label = requirement.get("title") or requirement.get("statement") or requirement["requirement_id"]
-        case_description = f"This case validates {template['scenario'].rstrip('.')} for {requirement_label}. It prepares {setup_fields} for the approved condition, follows the documented test steps, and confirms the expected outcome: {expected_text}"
-        evidence_items = [{"evidence_id": requirement["requirement_id"], "evidence_type": "requirement", "requirement_id": requirement["requirement_id"], "summary": requirement.get("statement") or requirement.get("title") or "Approved requirement", "source_references": evidence_refs}]
-        evidence_items.extend({"evidence_id": criterion.get("acceptance_id"), "evidence_type": "acceptance_criterion", "requirement_id": requirement["requirement_id"], "summary": criterion.get("then", "Approved acceptance criterion"), "source_references": evidence_refs} for criterion in case_criteria if criterion.get("acceptance_id"))
-        evidence_items.extend({"evidence_id": item_id, "evidence_type": "business_rule", "requirement_id": requirement["requirement_id"], "summary": next((rule.get("text") for rule in rules if rule.get("rule_id") == item_id), "Approved business rule"), "source_references": evidence_refs} for item_id in rule_ids)
-        if selected_context:
-            evidence_items.append({"evidence_id": selected_context["context_id"], "evidence_type": "discovery_context", "requirement_id": requirement["requirement_id"], "summary": selected_context.get("description") or selected_context["name"], "source_references": evidence_refs})
-        cases.append({
-            "test_case_id": f"TC-{index:03d}",
-            "requirement_id": requirement["requirement_id"],
-            "title": _fallback_test_case_title(first, selected_rule, template["scenario"]),
-            "description": case_description,
-            "scenario": template["scenario"],
-            "category": category,
-            "type": template["type"],
-            "priority": requirement.get("priority") or "medium",
-            "surfaces": [{"name": surface_name, "type": surface_type, "coverage": "Grounded by linked knowledge context." if selected_context else "Derived from approved requirement; Knowledge Base context is not yet linked."}],
-            "preconditions": [first.get("given", "The documented preconditions are satisfied")] if first else ["The documented preconditions are satisfied"],
-            "test_data_setup": test_data_setup,
-            "deterministic_inputs": [
-                {"name": "seed", "value": str(seed), "seed_strategy": "sha256(package, requirement, category, index)"},
-                {"name": "member_id", "value": "created_during_execution", "seed_strategy": f"setup pre-step creates a member record using seed {seed}; placeholder MEM-{seed % 100000:05d} is replayable planning data"},
-                {"name": "campaign_id", "value": "created_during_execution", "seed_strategy": f"setup pre-step creates or selects a campaign record using seed {seed}; placeholder CMP-{seed % 10000:04d} is replayable planning data"},
-            ],
-            "data_needs": [
-                {"name": "member", "type": "entity", "value": "deterministic member record", "required": True, "source": requirement["requirement_id"]},
-                {"name": "campaign eligibility inputs", "type": "business data", "value": category, "required": True, "source": ",".join(criteria_ids or rule_ids or [requirement["requirement_id"]])},
-            ],
-            "actions": [{"step": step_index, "surface": surface_name, "actor": actor, "action": step, "data_inputs": ["member_id", "campaign_id"]} for step_index, step in enumerate([*setup_steps, *steps], 1)],
-            "steps": [*setup_steps, *steps],
-            "assertions": [{"assertion_id": f"AS-{index:03d}-001", "text": expected_text, "assertion_type": "expected_result", "evidence_id": criteria_ids[0] if criteria_ids else requirement["requirement_id"]}],
-            "expected_results": [expected_text],
-            "acceptance_criteria_ids": criteria_ids,
-            "business_rule_ids": rule_ids,
-            "discovery_context_ids": [selected_context["context_id"]] if selected_context else [],
-            "evidence": evidence_items,
-            "assumptions": requirement.get("assumptions", []),
-            "validation_results": [{"check": "Approved evidence only", "status": "passed", "details": "Fallback case was generated only from approved requirement evidence."}, {"check": "Database test data setup", "status": "passed", "details": "Case includes execution-created database test data pre-steps."}, {"check": "Deterministic inputs", "status": "passed", "details": f"Seed {seed} recorded for reproducible test data."}],
-            "cleanup_ownership": {"owner": "Test data generation", "cleanup_required": True, "cleanup_steps": ["Remove or reset deterministic campaign/member data created for this case."]},
-            "approval": {"status": "pending", "reviewer": "", "comments": "", "reviewed_at": ""},
-            "source_references": source_refs[:5] or evidence_refs,
-        })
-    contract = {"test_cases": cases, "coverage": {"required_categories": [item["category"] for item in plan]}}
-    _deduplicate_generated_test_cases(contract)
-    cases = contract["test_cases"]
-    generated_categories = list(dict.fromkeys(case["category"] for case in cases))
-    discovery_gap = [] if discovery_contexts else ["Knowledge Base context is not connected; cases are grounded only in approved requirements and source references."]
-    return {"test_cases": cases, "coverage": {"required_categories": [item["category"] for item in plan], "generated_categories": generated_categories, "missing_categories": []}, "global_gaps": ["LLM test-case generation was not run because OPENAI_API_KEY is not configured.", *discovery_gap, *gaps]}
 
 def _normalized_case_text(test_case):
     value = " ".join([
@@ -2072,35 +1958,66 @@ def _business_requirements_to_review_contract(package, items, business_items, mo
 
 def _business_requirements_with_openai(package, items, fragments, rag_context=None):
     if not os.getenv("OPENAI_API_KEY"):
-        raise RuntimeError("OPENAI_API_KEY is not configured for Business Requirements generation")
+        raise RuntimeError("OPENAI_API_KEY is not configured")
     from openai import OpenAI
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=OPENAI_TIMEOUT_SECONDS)
 
-    def run_with_limits(brd_limit, supporting_limit, anchor_limit, evidence_limit, evidence_characters, rule_limit, rule_characters):
-        payload = _business_requirement_prompt_payload(
-            package, items, fragments,
-            brd_text_limit=brd_limit,
-            supporting_text_limit=supporting_limit,
-            citation_anchor_limit=anchor_limit,
+    use_knowledge_base = bool(rag_context and rag_context.get("brd_fragments"))
+    source_type_by_id = {item.get("source_id"): item.get("source_type") for item in items}
+
+    def make_payload(brd_limit, supporting_limit, anchor_limit, evidence_limit, evidence_characters, rule_limit, rule_characters):
+        if use_knowledge_base:
+            # With retrieval ready, send only retrieved Knowledge Base evidence
+            # and anchors for those retrieved fragments.
+            retrieved_evidence = _rag_context_for_prompt(
+                rag_context, max_evidence=evidence_limit, max_fragment_characters=evidence_characters,
+                max_rules=rule_limit, max_rule_characters=rule_characters,
+            )
+            evidence_ids = {item.get("fragment_id") for item in retrieved_evidence.get("evidence", [])}
+            allowed = [item for item in fragments if item.get("fragment_id") in evidence_ids]
+            value = {
+                "package": {"package_id": package.get("package_id"), "package_name": package.get("package_name"), "scope": package.get("scope")},
+                "source_documents": [],
+                "citation_anchors": [
+                    {"fragment_id": item.get("fragment_id"), "source_reference": item.get("source_reference"),
+                     "source_id": item.get("source_id"), "source_type": item.get("source_type"), "heading": item.get("heading")}
+                    for item in allowed
+                ],
+                "retrieved_knowledge_evidence": retrieved_evidence,
+            }
+            return value, allowed
+
+        # If the Knowledge Base has no usable retrieved evidence, use only the
+        # BRD. Supporting documents must not silently replace missing KB evidence.
+        brd_items = [item for item in items if item.get("source_type") == "brd"]
+        brd_fragments = [item for item in fragments if source_type_by_id.get(item.get("source_id")) == "brd"]
+        value = _business_requirement_prompt_payload(
+            package, brd_items, brd_fragments, brd_text_limit=brd_limit,
+            supporting_text_limit=supporting_limit, citation_anchor_limit=anchor_limit,
         )
-        payload["retrieved_knowledge_evidence"] = _rag_context_for_prompt(
-            rag_context,
-            max_evidence=evidence_limit,
-            max_fragment_characters=evidence_characters,
-            max_rules=rule_limit,
-            max_rule_characters=rule_characters,
+        value["retrieved_knowledge_evidence"] = {}
+        return value, brd_fragments
+
+    def run_with_limits(brd_limit, supporting_limit, anchor_limit, evidence_limit, evidence_characters, rule_limit, rule_characters):
+        payload, allowed_fragments = make_payload(
+            brd_limit, supporting_limit, anchor_limit, evidence_limit,
+            evidence_characters, rule_limit, rule_characters,
         )
         prompt = (
-            "Generate a flat list of distinct business requirements from the source package. "
-            "Use source_documents[].full_text as the primary input. The BRD full_text is the authority for business scope. "
-            "Use database schema, API, campaign rules, and templates full_text only to clarify entities, data dependencies, eligibility checks, and implementation context. "
-            "Use retrieved_knowledge_evidence as ranked package context. It may guide consolidation and technical interpretation, but BRD evidence remains authoritative for business scope. Cite only source fragment IDs listed in citation_anchors. "
-            "Do not derive requirements by enumerating citation_anchors; citation_anchors exist only so you can return traceable source IDs. "
+            "Generate a flat list of distinct Business Use Cases / Business Requirements. "
+            + ("Use retrieved_knowledge_evidence from the package Knowledge Base as the only content source. Treat retrieved BRD evidence as authoritative for business scope; use retrieved supporting evidence only to clarify domain terms, and do not expand business scope. "
+               if use_knowledge_base else
+               "The Knowledge Base has no usable retrieved evidence for this run. Use only the BRD text in source_documents[].full_text; ignore supporting documents. Do not invent requirements beyond the BRD. ")
+            + "Cite only source fragment IDs listed in citation_anchors. "
+            + ("Put BRD citations in source_references and technical supporting citations in supporting_source_references. "
+               if use_knowledge_base else
+               "Put all citations in source_references and leave supporting_source_references empty. ")
+            + "Do not derive requirements by enumerating citation_anchors; citation_anchors exist only so you can return traceable source IDs. "
             "Do not generate Functional Requirements, acceptance criteria, flow steps, UI behavior, or test cases. "
-            "Merge duplicates and near duplicates across BRD tables, repeated headings, and supporting sources. "
+            "Merge duplicate and near-duplicate business intent within the supplied evidence. "
             "Each item must be a meaningful end-to-end business use case or business decision, not a copied sentence fragment. "
             "Prefer 5 to 12 consolidated requirements for a small BRD; create more only when the BRD has truly separate business outcomes. "
-            "Use Must have/Should have/Could have priority. Cite BRD anchors in source_references and put supporting schema/API/template anchors in supporting_source_references. "
+            "Use Must have/Should have/Could have priority. "
             "If a precise anchor is not obvious, choose the nearest anchor from the same source document and heading.\n\nINPUT JSON:\n"
             + json.dumps(payload, ensure_ascii=False)
         )
@@ -2113,7 +2030,7 @@ def _business_requirements_with_openai(package, items, fragments, rag_context=No
         if not response.output_text:
             raise ValueError("OpenAI returned no Business Requirements")
         contract = json.loads(response.output_text)
-        _validate_business_requirements_contract(contract, fragments)
+        _validate_business_requirements_contract(contract, allowed_fragments)
         return contract["business_requirements"]
 
     try:
@@ -2141,23 +2058,6 @@ def _business_requirements_with_timeout(package, items, fragments, rag_context=N
         raise failure[0]
     raise TimeoutError("Business Use Case generation timed out")
 
-def _business_requirements_fallback(package, items, fragments):
-    contract = _requirement_contract(package, items, fragments)
-    business_items = []
-    for requirement in contract.get("requirements", []):
-        for rule in requirement.get("business_rules", []):
-            business_items.append({
-                "business_requirement_id": rule.get("rule_id") or f"BR-{len(business_items)+1:03d}",
-                "description": rule.get("text") or requirement.get("statement"),
-                "priority": "Must have",
-                "business_use_case": requirement.get("title") or rule.get("text") or "Business requirement",
-                "data_entities": requirement.get("entities", []),
-                "source_references": rule.get("source_references") or requirement.get("source_references", []),
-                "supporting_source_references": [],
-            })
-    return _dedupe_business_requirement_items(business_items)
-
-
 def _approved_business_requirements(contract):
     if contract.get("approved_business_requirements"):
         return contract["approved_business_requirements"]
@@ -2181,82 +2081,65 @@ def _functional_requirement_schema():
     schema = copy.deepcopy(_requirements_analysis_schema())
     item = schema["properties"]["requirements"]["items"]
     item["properties"]["business_requirement_ids"] = {"type": "array", "minItems": 1, "items": {"type": "string"}}
-    item["properties"]["knowledge_context_ids"] = {"type": "array", "items": {"type": "string"}}
+    item["properties"]["knowledge_context_ids"] = {"type": "array", "items": {"type": "string"}, "description": "Always empty. Cite retrieved Knowledge Base evidence using source_references."}
     item["required"].extend(["business_requirement_ids", "knowledge_context_ids"])
     return schema
 
-
-def _functional_requirements_fallback(package, items, fragments, approved_business_requirements, knowledge_contexts):
-    contract = {"requirements": [], "global_gaps": ["OpenAI generation was unavailable; functional requirements were mapped from approved business requirements using the local fallback."], "global_assumptions": [], "conflicting_requirements": [], "readiness": {"status": "needs_review", "journey": "approved business requirement", "checks": [], "gaps": []}}
-    for index, business in enumerate(approved_business_requirements, 1):
-        source_refs = [ref for ref in business.get("source_references", []) if ref.get("fragment_id") or ref.get("source_reference")]
-        if not source_refs:
-            source_refs = [{"fragment_id": business["business_requirement_id"], "source_reference": "Approved Business Requirement"}]
-        text = business["text"]
-        contract["requirements"].append({
-            "requirement_id": f"FR-{index:03d}", "title": f"Functional behavior for {business['business_requirement_id']}",
-            "type": "Functional", "statement": text, "priority": "Not specified", "actors": [], "entities": [],
-            "business_rules": [{"rule_id": business["business_requirement_id"], "text": text, "approved": True, "review_status": "approved", "source_references": source_refs}],
-            "business_requirement_ids": [business["business_requirement_id"]], "knowledge_context_ids": [],
-            "acceptance_criteria": [{"acceptance_id": f"AC-{index:03d}", "given": "The approved business requirement applies.", "when": "The related system behavior is performed.", "then": text, "source_references": source_refs}],
-            "flow_steps": [text], "ambiguities": [], "assumptions": [], "source_references": source_refs,
-        })
-    contract.update({
-        "contract_version": "1.0", "package_id": package["package_id"], "project_id": package["project_id"], "package_scope": package.get("scope"),
-        "accepted_assumptions": [], "source_package_items": [{"source_id": item["source_id"], "revision_id": item["revision_id"], "source_type": item["source_type"], "logical_name": item["logical_name"], "sha256": item["sha256"]} for item in items],
-        "approved_business_requirements": approved_business_requirements, "knowledge_contexts": knowledge_contexts,
-        "generated_at": now(), "generation_mode": "approved_business_requirement_fallback", "generation_model": LOCAL_EXTRACTOR_VERSION,
-        "functional_requirements_generation": True,
-    })
-    contract["readiness"] = _contract_readiness(contract)
-    contract["conflicts"] = []
-    return contract
-
-
-def _generate_functional_contract(package, items, fragments, approved_business_requirements, knowledge_contexts, rag_context=None):
+def _generate_functional_contract(package, items, fragments, approved_business_requirements, rag_context):
+    key = os.getenv("OPENAI_API_KEY")
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY is not configured")
     approved_ids = {item["business_requirement_id"] for item in approved_business_requirements}
-    if os.getenv("OPENAI_API_KEY"):
-        from openai import OpenAI
-        payload = {
-            "approved_business_requirements": approved_business_requirements,
-            "frozen_source_package": [{"source_id": item.get("source_id"), "revision_id": item.get("revision_id"), "logical_name": item.get("logical_name"), "source_type": item.get("source_type")} for item in items],
-            "knowledge_fabric_context": [{"context_id": context["context_id"], "type": context["context_type"], "name": context["name"], "description": context.get("description"), "details": context.get("details", {})} for context in knowledge_contexts],
-            "retrieved_knowledge_evidence": _rag_context_for_prompt(rag_context),
-        }
-        prompt = (
-            "Generate functional requirements from the approved business requirements below. Treat the approved business requirements as the scope and authority: do not add behavior outside them, and preserve traceability using business_requirement_ids. Use retrieved_knowledge_evidence as supporting implementation and domain context only when it is present; do not let it expand approved scope. Cite source references already attached to the approved business requirements or retrieved knowledge evidence. Create clear system behaviors and testable acceptance criteria. Do not return unapproved business requirements.\n\nINPUT JSON:\n"
-            + json.dumps(payload, ensure_ascii=False)
-        )
-        response = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=OPENAI_TIMEOUT_SECONDS).responses.create(
-            model=OPENAI_MODEL,
-            input=prompt,
-            store=False,
-            text={"format": {"type": "json_schema", "name": "functional_requirements_contract", "strict": True, "schema": _functional_requirement_schema()}},
-        )
-        if not response.output_text:
-            raise ValueError("OpenAI returned no Functional Requirements")
-        contract = json.loads(response.output_text)
-        _validate_requirements_contract(contract, fragments)
-        knowledge_ids = {context["context_id"] for context in knowledge_contexts}
-        for requirement in contract["requirements"]:
-            unknown_business = set(requirement.get("business_requirement_ids", [])) - approved_ids
-            unknown_context = set(requirement.get("knowledge_context_ids", [])) - knowledge_ids
-            if unknown_business or not requirement.get("business_requirement_ids"):
-                raise ValueError(f"AI returned an unapproved business requirement link for {requirement['requirement_id']}")
-            if unknown_context:
-                raise ValueError(f"AI returned an unknown knowledge context for {requirement['requirement_id']}")
-            requirement["business_rules"] = [
-                {"rule_id": business["business_requirement_id"], "text": business["text"], "approved": True, "review_status": "approved", "source_references": business.get("source_references", [])}
-                for business in approved_business_requirements if business["business_requirement_id"] in requirement["business_requirement_ids"]
-            ]
-    else:
-        contract = _functional_requirements_fallback(package, items, fragments, approved_business_requirements, knowledge_contexts)
+    retrieved_evidence = _rag_context_for_prompt(rag_context, max_evidence=20, max_fragment_characters=700, max_rules=12, max_rule_characters=320)
+    if not retrieved_evidence.get("evidence"):
+        raise ValueError("The ready Knowledge Base returned no usable evidence for Functional Requirements")
+    evidence_ids = {item.get("fragment_id") for item in retrieved_evidence["evidence"]}
+    approved_reference_ids = {
+        ref.get("fragment_id")
+        for business in approved_business_requirements
+        for ref in business.get("source_references", [])
+        if ref.get("fragment_id")
+    }
+    allowed_fragments = [item for item in fragments if item.get("fragment_id") in evidence_ids | approved_reference_ids]
+    from openai import OpenAI
+    payload = {
+        "approved_business_use_cases": approved_business_requirements,
+        "retrieved_knowledge_base_evidence": retrieved_evidence,
+    }
+    prompt = (
+        "Generate Functional Requirements using only the approved_business_use_cases and retrieved_knowledge_base_evidence below. "
+        "The approved business use cases define the allowed scope. Use the Knowledge Base to provide the package context, system behavior, entities, rules, and implementation detail needed to make each requirement testable. "
+        "Do not use or infer from any other package sources or structured context. Do not expand scope beyond approved use cases. "
+        "Every requirement must link to one or more supplied business_requirement_ids and cite only source fragments from the approved use cases or retrieved Knowledge Base evidence. "
+        "Set knowledge_context_ids to an empty array; cite Knowledge Base evidence using source_references. Create clear system behaviors, business rules, flow steps, and testable acceptance criteria. Do not return unapproved business use cases.\n\nINPUT JSON:\n"
+        + json.dumps(payload, ensure_ascii=False)
+    )
+    response = OpenAI(api_key=key, timeout=OPENAI_TIMEOUT_SECONDS).responses.create(
+        model=OPENAI_MODEL,
+        input=prompt,
+        store=False,
+        text={"format": {"type": "json_schema", "name": "functional_requirements_contract", "strict": True, "schema": _functional_requirement_schema()}},
+    )
+    if not response.output_text:
+        raise ValueError("OpenAI returned no Functional Requirements")
+    contract = json.loads(response.output_text)
+    _validate_requirements_contract(contract, allowed_fragments)
+    for requirement in contract["requirements"]:
+        unknown_business = set(requirement.get("business_requirement_ids", [])) - approved_ids
+        if unknown_business or not requirement.get("business_requirement_ids"):
+            raise ValueError(f"AI returned an unapproved business requirement link for {requirement['requirement_id']}")
+        if requirement.get("knowledge_context_ids"):
+            raise ValueError(f"AI returned non-Knowledge-Base context IDs for {requirement['requirement_id']}")
+        requirement["business_rules"] = [
+            {"rule_id": business["business_requirement_id"], "text": business["text"], "approved": True, "review_status": "approved", "source_references": business.get("source_references", [])}
+            for business in approved_business_requirements if business["business_requirement_id"] in requirement["business_requirement_ids"]
+        ]
     contract.update({
         "contract_version": "1.0", "package_id": package["package_id"], "project_id": package["project_id"], "package_scope": package.get("scope"),
         "accepted_assumptions": [], "source_package_items": [{"source_id": item["source_id"], "revision_id": item["revision_id"], "source_type": item["source_type"], "logical_name": item["logical_name"], "sha256": item["sha256"]} for item in items],
-        "approved_business_requirements": approved_business_requirements, "knowledge_contexts": knowledge_contexts,
-        "generated_at": now(), "generation_mode": "openai" if os.getenv("OPENAI_API_KEY") else "approved_business_requirement_fallback",
-        "generation_model": OPENAI_MODEL if os.getenv("OPENAI_API_KEY") else LOCAL_EXTRACTOR_VERSION,
+        "approved_business_requirements": approved_business_requirements, "knowledge_contexts": [],
+        "generated_at": now(), "generation_mode": "openai",
+        "generation_model": OPENAI_MODEL,
         "functional_requirements_generation": True,
     })
     contract["readiness"] = _contract_readiness(contract)
@@ -2292,29 +2175,37 @@ def generate_functional_requirements(package_id: str):
                         break
         if not approved:
             raise HTTPException(409, "Approve at least one Business Requirement before generating Functional Requirements")
+        if not os.getenv("OPENAI_API_KEY"):
+            raise HTTPException(503, "Functional Requirements generation requires OpenAI. OPENAI_API_KEY is not configured; add a valid key and retry. No local generation fallback is used.")
         revision_ids = [item["revision_id"] for item in source_items]
         fragments = conn.execute(f"SELECT * FROM source_fragment WHERE revision_id IN ({','.join('%s' for _ in revision_ids)}) ORDER BY revision_id,fragment_index", revision_ids).fetchall()
         item_rows = [row_dict(item) for item in source_items]
         fragment_rows = [row_dict(fragment) for fragment in fragments]
-        contexts = _discovery_contexts_for_package(conn, row_dict(package))
-        # Knowledge Base retrieval enriches Functional Requirements, but it must
-        # not block generation from approved business requirements and source
-        # fragments while the package index is still building or unavailable.
-        rag = _try_retrieve_package_context(package_id, requested_by="Functional Requirements")
         try:
-            contract = _generate_functional_contract(row_dict(package), item_rows, fragment_rows, approved, contexts, rag)
-        except HTTPException:
+            rag = _require_package_context(package_id, requested_by="Functional Requirements")
+        except HTTPException as exc:
+            if exc.status_code in {409, 422, 502, 503}:
+                raise HTTPException(409, "Functional Requirements require a ready, approved Knowledge Base for this package. Build it or wait for its current build to finish, then retry.") from exc
             raise
+        try:
+            contract = _generate_functional_contract(row_dict(package), item_rows, fragment_rows, approved, rag)
         except Exception as exc:
-            contract = _functional_requirements_fallback(row_dict(package), item_rows, fragment_rows, approved, contexts)
-            contract["generation_note"] = f"LLM Functional Requirements generation failed; local fallback was used: {safe_llm_error_message(exc)}"
-            contract.setdefault("global_gaps", []).append("LLM Functional Requirements generation was unavailable, so the local fallback was used.")
+            detail = safe_llm_error_message(exc)
+            if isinstance(exc, TimeoutError):
+                message = "OpenAI timed out while generating Functional Requirements. Check service availability and retry."
+            elif "api key" in detail.lower() or "invalid_api_key" in detail.lower():
+                message = "OpenAI rejected the configured API key. Check OPENAI_API_KEY and retry."
+            elif isinstance(exc, ValueError):
+                message = f"OpenAI returned Functional Requirements that failed validation: {detail}. Review the model response or configuration and retry."
+            else:
+                message = f"OpenAI Functional Requirements generation failed: {detail}. No local fallback was used; review the OpenAI configuration and retry."
+            raise HTTPException(502, message) from exc
         contract["rag_metadata"] = _rag_metadata_or_none(rag)
-        contract["rag_status"] = _rag_status(rag)
+        contract["rag_status"] = _rag_status(rag, required=True)
         version = conn.execute("SELECT COALESCE(MAX(analysis_version),0)+1 AS v FROM requirement_analysis WHERE package_id=%s", (package_id,)).fetchone()["v"]
         analysis_id, timestamp = uid("req"), now()
         conn.execute("INSERT INTO requirement_analysis (analysis_id,package_id,project_id,analysis_version,status,contract_json,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", (analysis_id, package_id, package["project_id"], version, "needs_review", json.dumps(contract), timestamp, timestamp))
-        return _analysis_response(conn.execute("SELECT * FROM requirement_analysis WHERE analysis_id=%s", (analysis_id,)).fetchone(), len(contexts))
+        return _analysis_response(conn.execute("SELECT * FROM requirement_analysis WHERE analysis_id=%s", (analysis_id,)).fetchone(), 0)
 
 
 
@@ -2333,14 +2224,28 @@ def generate_business_requirements(package_id: str):
         item_rows = [row_dict(item) for item in items]
         fragment_rows = [row_dict(fragment) for fragment in fragments]
         if not os.getenv("OPENAI_API_KEY"):
-            raise HTTPException(422, "Business Requirements generation requires OPENAI_API_KEY because local fragment fallback is disabled for business use cases.")
-        rag = _try_retrieve_package_context(package_id, requested_by="Business Requirements")
+            raise HTTPException(503, "Business Use Case generation requires OpenAI. OPENAI_API_KEY is not configured; add a valid key and retry. No local generation fallback is used.")
+        try:
+            rag = _try_retrieve_package_context(package_id, requested_by="Business Requirements")
+        except Exception as exc:
+            print(f"Business Use Case Knowledge Base retrieval unavailable for {package_id}; using BRD-only input: {safe_llm_error_message(exc)}")
+            rag = None
+        if rag and not rag.get("brd_fragments"):
+            # Without retrieved BRD evidence, use the explicit BRD-only path.
+            rag = None
         try:
             business_items = _business_requirements_with_timeout(row_dict(package), item_rows, fragment_rows, rag)
         except HTTPException:
             raise
         except Exception as exc:
-            raise HTTPException(502, f"LLM Business Requirements generation failed: {safe_llm_error_message(exc)}")
+            detail = safe_llm_error_message(exc)
+            if isinstance(exc, TimeoutError):
+                message = "OpenAI timed out while generating Business Use Cases. Check service availability and retry."
+            elif "api key" in detail.lower() or "invalid_api_key" in detail.lower():
+                message = "OpenAI rejected the configured API key. Check OPENAI_API_KEY and retry."
+            else:
+                message = f"OpenAI could not generate Business Use Cases: {detail}. No local fallback was used; review the OpenAI configuration and retry."
+            raise HTTPException(502, message)
         contract = _business_requirements_to_review_contract(row_dict(package), item_rows, business_items, "openai", OPENAI_MODEL)
         contract["rag_metadata"] = _rag_metadata_or_none(rag)
         contract["rag_status"] = _rag_status(rag, required=False)
@@ -2479,22 +2384,16 @@ def generate_test_cases_from_analysis(analysis_id: str, request: TestCaseGenerat
         package_row = row_dict(package)
         discovery_contexts = []
         requested_count = request.count
-        rag = _try_retrieve_package_context(package_row["package_id"], requested_by="Test Case Generation")
+        if not os.getenv("OPENAI_API_KEY"):
+            raise HTTPException(503, "Test Case generation requires OpenAI. OPENAI_API_KEY is not configured; add a valid key and retry. No local generation fallback is used.")
+        rag = _require_test_case_knowledge(package_row["package_id"], requested_by="Test Case Generation")
         try:
-            if os.getenv("OPENAI_API_KEY"):
-                generated = _test_cases_with_openai(approved_requirements, package_row, requested_count, discovery_contexts, rag)
-                mode = "openai"
-            else:
-                generated = _test_cases_fallback(approved_requirements, requested_count, package_row, discovery_contexts)
-                mode = "local_fallback"
+            generated = _test_cases_with_openai(approved_requirements, package_row, requested_count, discovery_contexts, rag)
         except Exception as exc:
-            generated = _test_cases_fallback(approved_requirements, requested_count, package_row, discovery_contexts)
-            generated.setdefault("global_gaps", []).append(f"LLM test-case generation failed; local fallback was used: {safe_llm_error_message(exc)}")
-            mode = "local_fallback"
-        _validate_test_case_contract(generated, approved_requirements, requested_count, discovery_contexts, rag)
+            _raise_test_case_generation_error(exc, "Test Case generation")
         generation_id, timestamp = uid("tcg"), now()
         requirement_contract_hash = hashlib.sha256(json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-        generated.update({"contract_version": "1.0", "generation_id": generation_id, "analysis_id": analysis_id, "analysis_version": analysis["analysis_version"], "project_id": analysis["project_id"], "requirement_contract_hash": requirement_contract_hash, "package_id": package["package_id"], "package_version": package["package_version"], "source_package_run_id": package["run_id"], "requested_test_case_count": len(generated.get("test_cases", [])), "count_strategy": "derived_from_approved_functional_requirements_acceptance_criteria_and_business_rules" if requested_count is None else "user_requested", "generation_mode": mode, "generation_model": OPENAI_MODEL if mode == "openai" else LOCAL_EXTRACTOR_VERSION, "generation_prompt_version": TEST_CASE_GENERATION_PROMPT_VERSION, "generation_prompt_hash": test_case_generation_prompt_hash(), "generated_at": timestamp, "approved_requirement_ids": [item["requirement_id"] for item in approved_requirements], "source_package_items": contract.get("source_package_items", []), "discovery_contexts": discovery_contexts, "discovery_context_ids": [context["context_id"] for context in discovery_contexts], "rag_metadata": _rag_metadata_or_none(rag), "rag_status": _rag_status(rag)})
+        generated.update({"contract_version": "1.0", "generation_id": generation_id, "analysis_id": analysis_id, "analysis_version": analysis["analysis_version"], "project_id": analysis["project_id"], "requirement_contract_hash": requirement_contract_hash, "package_id": package["package_id"], "package_version": package["package_version"], "source_package_run_id": package["run_id"], "requested_test_case_count": len(generated.get("test_cases", [])), "count_strategy": "derived_from_approved_functional_requirements_acceptance_criteria_and_business_rules" if requested_count is None else "user_requested", "generation_mode": "openai", "generation_model": OPENAI_MODEL, "generation_prompt_version": TEST_CASE_GENERATION_PROMPT_VERSION, "generation_prompt_hash": test_case_generation_prompt_hash(), "generated_at": timestamp, "approved_requirement_ids": [item["requirement_id"] for item in approved_requirements], "source_package_items": contract.get("source_package_items", []), "discovery_contexts": discovery_contexts, "discovery_context_ids": [context["context_id"] for context in discovery_contexts], "rag_metadata": _rag_metadata_or_none(rag), "rag_status": _rag_status(rag, required=True)})
         for test_case in generated.get("test_cases", []):
             test_case["review_status"] = "pending"
             test_case["approved"] = False
@@ -2592,20 +2491,14 @@ def regenerate_test_cases(generation_id: str, request: TestCaseRegenerationReque
             raise HTTPException(404, "Source package not found")
         package_row = row_dict(package)
         discovery_contexts = []
-        rag = _try_retrieve_package_context(package["package_id"], requested_by="Test Case Regeneration")
+        if not os.getenv("OPENAI_API_KEY"):
+            raise HTTPException(503, "Test Case regeneration requires OpenAI. OPENAI_API_KEY is not configured; add a valid key and retry. No local generation fallback is used.")
+        rag = _require_test_case_knowledge(package["package_id"], requested_by="Test Case Regeneration")
         try:
-            if os.getenv("OPENAI_API_KEY"):
-                generated = _test_cases_with_openai(approved_requirements, package_row, requested_count, discovery_contexts, rag)
-                mode = "openai"
-            else:
-                generated = _test_cases_fallback(approved_requirements, requested_count, package_row, discovery_contexts)
-                mode = "local_fallback"
+            generated = _test_cases_with_openai(approved_requirements, package_row, requested_count, discovery_contexts, rag)
         except Exception as exc:
-            generated = _test_cases_fallback(approved_requirements, requested_count, package_row, discovery_contexts)
-            generated.setdefault("global_gaps", []).append(f"LLM test-case regeneration failed; local fallback was used: {safe_llm_error_message(exc)}")
-            mode = "local_fallback"
+            _raise_test_case_generation_error(exc, "Test Case regeneration")
 
-        _validate_test_case_contract(generated, approved_requirements, requested_count, discovery_contexts, rag)
         new_generation_id, timestamp = uid("tcg"), now()
         requirement_contract_hash = hashlib.sha256(json.dumps(requirement_contract, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
         generation_version = conn.execute("SELECT COUNT(*)+1 AS v FROM test_case_generation WHERE analysis_id=%s", (parent["analysis_id"],)).fetchone()["v"]
@@ -2620,8 +2513,8 @@ def regenerate_test_cases(generation_id: str, request: TestCaseRegenerationReque
             "package_version": package["package_version"],
             "source_package_run_id": package["run_id"],
             "requested_test_case_count": requested_count,
-            "generation_mode": mode,
-            "generation_model": OPENAI_MODEL if mode == "openai" else LOCAL_EXTRACTOR_VERSION,
+            "generation_mode": "openai",
+            "generation_model": OPENAI_MODEL,
             "generation_prompt_version": TEST_CASE_GENERATION_PROMPT_VERSION,
             "generation_prompt_hash": test_case_generation_prompt_hash(),
             "generated_at": timestamp,
@@ -2630,7 +2523,7 @@ def regenerate_test_cases(generation_id: str, request: TestCaseRegenerationReque
             "discovery_contexts": discovery_contexts,
             "discovery_context_ids": [context["context_id"] for context in discovery_contexts],
             "rag_metadata": _rag_metadata_or_none(rag),
-            "rag_status": _rag_status(rag),
+            "rag_status": _rag_status(rag, required=True),
             "parent_generation_id": generation_id,
             "generation_version": generation_version,
             "regeneration_request": {
