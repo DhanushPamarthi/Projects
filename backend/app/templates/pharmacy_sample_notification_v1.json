@@ -1,0 +1,43 @@
+{
+  "id": "evt-testiq-template",
+  "correlationId": "testiq-template-case",
+  "time": "2026-10-05T10:00:00Z",
+  "type": "pharmacy.orders.v1.sample-notification",
+  "source": "TestIQ",
+  "specversion": "1.0",
+  "data": {
+    "recipientType": "PERSON",
+    "members": [
+      {
+        "person": {
+          "resourceID": "QA-MEMBER-TEMPLATE",
+          "specialityID": "SP-0001",
+          "firstName": "Ava",
+          "lastName": "Anderson"
+        },
+        "prescription": [
+          {
+            "resourceID": "QA-RX-TEMPLATE",
+            "rxStatus": "ACTIVE",
+            "eligibleInd": true,
+            "refillsRemaining": 2,
+            "nextRefillDate": "2026-10-12",
+            "drug": {
+              "name": "Humira",
+              "strength": "40 MG",
+              "therapyCode": "IMMUNOLOGY",
+              "manufacturer": "AbbVie"
+            }
+          }
+        ],
+        "contactPreference": {
+          "preferredChannel": "SMS",
+          "smsConsent": true,
+          "safeTestMobile": "+15550001001"
+        }
+      }
+    ]
+  },
+  "growthplatform": "enhs",
+  "product": "Accredo"
+}

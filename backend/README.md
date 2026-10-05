@@ -7,7 +7,7 @@ FastAPI service for BRD ingestion, source-package creation, and Requirements Ana
 - Accepts BRD files and supporting sources (`.docx`, `.pdf`, `.txt`, `.md`, `.json`, `.yaml`, `.yml`, `.sql`, `.csv`). JSON is syntax-validated; other structured sources are preserved and extracted as UTF-8 text.
 - Preserves original files and immutable source revisions.
 - Extracts traceable fragments with paragraph, table, page, or line references.
-- Uses OpenAI extraction when configured and local extraction as a fallback.
+- Uses OpenAI file extraction for BRDs and supporting sources, with local extraction as a documented fallback when the OpenAI call fails.
 - Creates immutable source-package manifests.
 - Generates versioned Requirements Analysis contracts from the selected package.
 - Supports reviewer decisions, comments, accepted assumptions, ambiguity/conflict findings, and readiness status.
@@ -160,9 +160,9 @@ The PBM refill-reminder POC splits the BRD into functional requirements such as 
 
 ## Test data and Bronze records
 
-Approved cases derive their test data shape from the selected package Knowledge Base, the approved test case, and the case pre-step setup. `POST /api/v1/test-case-generations/{generation_id}/test-data` creates case-specific drafts without storing reusable templates in the database.
+Approved test cases use the versioned CloudEvent contract at `backend/app/templates/pharmacy_sample_notification_v1.json`. `POST /api/v1/test-case-generations/{generation_id}/test-data` requires a ready package Knowledge Base index and a working OpenAI configuration; the LLM generates case-specific synthetic values from the approved case and retrieved evidence. There is no local data-generation fallback. TestIQ assigns unique event IDs, correlation IDs, timestamps, member resource IDs, and safe synthetic phone values.
 
-Generation uses the configured OpenAI model to create scenario-specific synthetic values from the Knowledge Base evidence. If the LLM is unavailable or fails, deterministic synthetic values are generated from the case context and the response identifies that fallback for the reviewer. The frontend lets the reviewer edit the generated JSON before `POST /api/v1/test-case-generations/{generation_id}/test-data/save` writes reviewed setup data to the Bronze domain tables in `bronzebox`: member data goes to `membership`, prescription data goes to `prescription`, and campaign or communication setup goes to `order`. The saved TestIQ row keeps the legacy Bronze reference text, and `testiq.test_data_bronze_ref` stores normalized Bronze references for execution and traceability.
+Generated events are checked against the exact template shape and types, populated-field rules, unique identifiers, safe phone format, and supported eligibility and SMS-consent scenario expectations. Reviewers can edit the draft JSON. Before insertion, TestIQ reassigns its trace metadata and validates the reviewed event again. `POST /api/v1/test-case-generations/{generation_id}/test-data/save` stores the intact CloudEvent envelope and original JSON bytes in `bronzebox.raw_file`; the downstream Bronze-to-Silver process owns splitting and Silver projection. `testiq.test_data_bronze_ref` records the raw-file ID for traceability. Execution checks that the reviewed event matches the Bronze payload; it does not execute the event through the application under test.
 
 ## Test
 
