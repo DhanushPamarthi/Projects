@@ -172,7 +172,10 @@ export async function generateTestCasesFromAnalysis(analysisId) {
 }
 
 export async function listGeneratedTestCases(analysisId) {
-  return request(`/api/v1/requirement-analyses/${encodeURIComponent(analysisId)}/test-cases`);
+  // Review decisions are persisted through a separate POST endpoint. Always
+  // reload the latest generation contract instead of reusing a cached,
+  // pre-review GET response when navigating to Test Data.
+  return request(`/api/v1/requirement-analyses/${encodeURIComponent(analysisId)}/test-cases`, { cache: "no-store" });
 }
 
 export async function reviewTestCaseGeneration(generationId, review) {
