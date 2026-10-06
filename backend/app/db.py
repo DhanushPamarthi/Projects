@@ -187,6 +187,7 @@ CREATE TABLE IF NOT EXISTS testiq.test_data_record (
   test_case_id TEXT NOT NULL,
   template_id TEXT NOT NULL,
   template_name TEXT NOT NULL,
+  template_version INTEGER NOT NULL DEFAULT 1,
   entity_name TEXT NOT NULL,
   payload_json TEXT NOT NULL,
   pre_steps_json TEXT NOT NULL,
@@ -196,6 +197,17 @@ CREATE TABLE IF NOT EXISTS testiq.test_data_record (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE(generation_id, test_case_id, template_id)
+);
+CREATE TABLE IF NOT EXISTS testiq.test_data_template (
+  template_id TEXT PRIMARY KEY,
+  template_name TEXT NOT NULL,
+  entity_name TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1,
+  payload_json TEXT NOT NULL,
+  source_filename TEXT NOT NULL,
+  active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS testiq.test_data_bronze_ref (
   bronze_ref_id TEXT PRIMARY KEY,
@@ -289,6 +301,14 @@ SQLITE_SCHEMA = SCHEMA.replace("CREATE SCHEMA IF NOT EXISTS testiq;\n", "").repl
 MIGRATIONS = [
     "ALTER TABLE test_data_record ADD COLUMN schema_context_json TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE test_data_record ADD COLUMN template_name TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE test_data_record ADD COLUMN template_version INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE test_data_template ADD COLUMN version INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE test_data_template ADD COLUMN payload_json TEXT NOT NULL DEFAULT '{}'",
+    "ALTER TABLE test_data_template ADD COLUMN source_filename TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE test_data_template ADD COLUMN active BOOLEAN NOT NULL DEFAULT TRUE",
+    "ALTER TABLE test_data_template ADD COLUMN created_at TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE test_data_template ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''",
+    "DO $$ BEGIN IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='testiq' AND table_name='test_data_template' AND column_name='active' AND data_type IN ('smallint','integer','bigint')) THEN ALTER TABLE testiq.test_data_template ALTER COLUMN active DROP DEFAULT; ALTER TABLE testiq.test_data_template ALTER COLUMN active TYPE BOOLEAN USING COALESCE(active,0)<>0; ALTER TABLE testiq.test_data_template ALTER COLUMN active SET DEFAULT TRUE; END IF; END $$",
     "ALTER TABLE source_document ADD COLUMN logical_source_id TEXT",
     "ALTER TABLE source_fragment ADD COLUMN source_id TEXT",
     "ALTER TABLE source_package_item ADD COLUMN source_version TEXT",
@@ -509,8 +529,6 @@ def _init_db_uncached():
                 conn.execute("COMMIT")
             if "test_data_template" in existing_relations:
                 conn.execute("UPDATE test_data_record r SET template_name=t.template_name FROM test_data_template t WHERE r.template_id=t.template_id AND r.template_name=''")
-                conn.execute("ALTER TABLE test_data_record DROP CONSTRAINT IF EXISTS test_data_record_template_id_fkey")
-                conn.execute("DROP TABLE test_data_template")
                 conn.commit()
     else:
         with sqlite3.connect(DB_PATH) as conn:
@@ -550,6 +568,7 @@ def _migrate_sqlite_test_data_templates(conn):
           test_case_id TEXT NOT NULL,
           template_id TEXT NOT NULL,
           template_name TEXT NOT NULL DEFAULT '',
+          template_version INTEGER NOT NULL DEFAULT 1,
           entity_name TEXT NOT NULL,
           payload_json TEXT NOT NULL,
           pre_steps_json TEXT NOT NULL,
@@ -560,15 +579,12 @@ def _migrate_sqlite_test_data_templates(conn):
           updated_at TEXT NOT NULL,
           UNIQUE(generation_id, test_case_id, template_id)
         )""")
-        column_list = "record_id,generation_id,test_case_id,template_id,template_name,entity_name,payload_json,pre_steps_json,schema_context_json,status,bronze_raw_file_id,created_at,updated_at"
+        column_list = "record_id,generation_id,test_case_id,template_id,template_name,template_version,entity_name,payload_json,pre_steps_json,schema_context_json,status,bronze_raw_file_id,created_at,updated_at"
         conn.execute(f"INSERT INTO test_data_record_new ({column_list}) SELECT {column_list} FROM test_data_record")
         conn.execute("DROP TABLE test_data_record")
         conn.execute("ALTER TABLE test_data_record_new RENAME TO test_data_record")
         conn.commit()
         conn.execute("PRAGMA foreign_keys=ON")
-    if "test_data_template" in tables:
-        conn.execute("DROP TABLE test_data_template")
-        conn.commit()
 
 @contextmanager
 def connection():

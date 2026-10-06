@@ -14,7 +14,7 @@ import { KnowledgeBasePage } from "./components/KnowledgeBasePage.jsx";
 import { logoutUser } from "./api/client.js";
 import { ToastContainer } from "react-toastify";
 import { toast } from "react-toastify";
-import { clearFinishedActivities, dismissActivity, reconcileStaleActivities, useActivities } from "./activity/activityStore.js";
+import { clearFinishedActivities, dismissActivity, reconcileStaleActivities, recoverInterruptedTabActivities, useActivities } from "./activity/activityStore.js";
 
 function displayNameFromEmail(email) { return String(email || "").split("@")[0].replace(/[._-]+/g, " ").trim().split(/\s+/).filter(Boolean).map((part) => part[0].toUpperCase() + part.slice(1).toLowerCase()).join(" "); }
 
@@ -57,7 +57,7 @@ function Navigation({ items, activeNav, onNavigate, onLogout, user, initials, ex
     </button>
   );
   return <>
-    <div className="brand-lockup"><div className="brand-mark"><FlaskConical size={19} /></div><div className="brand-copy"><div className="brand-name">Test<span>IQ</span></div><div className="brand-caption">Source workspace</div></div></div>
+    <div className="brand-lockup"><div className="brand-mark"><FlaskConical size={19} /></div><div className="brand-copy"><div className="brand-name">Dava.Test<span>IQ</span></div><div className="brand-caption">Source workspace</div></div></div>
     <div className="sidebar-section-label">Workspace</div><nav className="sidebar-nav" aria-label="Workspace navigation">{primaryItems.map(renderItem)}</nav>
     {toolItems.length > 0 && <><div className="sidebar-divider" /><div className="sidebar-section-label">Workspace tools</div><nav className="sidebar-nav" aria-label="Workspace tools">{toolItems.map(renderItem)}</nav></>}
     <div className="sidebar-spacer" /><div className="sidebar-help"><CircleHelp size={18} aria-hidden="true" /><div className="sidebar-help-copy"><strong>Need a hand?</strong><span>Read the source guide</span></div></div>
@@ -110,6 +110,7 @@ export default function App() {
   const workspaceContentRef = useRef(null);
   const activities = useActivities();
   useEffect(() => {
+    recoverInterruptedTabActivities();
     reconcileStaleActivities();
     const timer = window.setInterval(reconcileStaleActivities, 60_000);
     return () => window.clearInterval(timer);

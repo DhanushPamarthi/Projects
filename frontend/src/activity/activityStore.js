@@ -1,9 +1,22 @@
 import { useSyncExternalStore } from "react";
 
 const STORAGE_KEY = "testiq_workspace_activities_v1";
+const TAB_SESSION_KEY = "testiq_workspace_tab_session_v1";
 const MAX_ACTIVITIES = 30;
 const STALE_ACTIVITY_MS = 20 * 60 * 1000;
 const listeners = new Set();
+
+function getTabSessionId() {
+  if (typeof sessionStorage === "undefined") return `tab_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  let id = sessionStorage.getItem(TAB_SESSION_KEY);
+  if (!id) {
+    id = `tab_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    sessionStorage.setItem(TAB_SESSION_KEY, id);
+  }
+  return id;
+}
+
+const tabSessionId = getTabSessionId();
 
 function loadActivities() {
   try {
@@ -42,7 +55,7 @@ export function startActivity({ id, label, detail = "", section = "activity", pr
   const activityId = id || makeId();
   const now = timestamp();
   const existing = activities.find((item) => item.id === activityId);
-  const next = { id: activityId, label, detail, section, kind, progress, status: "running", startedAt: existing?.startedAt || now, updatedAt: now, finishedAt: null, error: "" };
+  const next = { id: activityId, label, detail, section, kind, progress, status: "running", tabSessionId, startedAt: existing?.startedAt || now, updatedAt: now, finishedAt: null, error: "" };
   publish([next, ...activities.filter((item) => item.id !== activityId)]);
   return activityId;
 }
@@ -76,6 +89,18 @@ export function reconcileStaleActivities() {
     const finishedAt = timestamp();
     return { ...item, status: "failed", finishedAt, updatedAt: finishedAt,
       error: "The activity stopped reporting progress.", detail: "The activity was interrupted or timed out. Retry if needed." };
+  });
+  if (changed) publish(next);
+}
+export function recoverInterruptedTabActivities() {
+  let changed = false;
+  const finishedAt = timestamp();
+  const next = activities.map((item) => {
+    if (item.status !== "running" || (item.tabSessionId && item.tabSessionId !== tabSessionId)) return item;
+    changed = true;
+    return { ...item, status: "failed", finishedAt, updatedAt: finishedAt,
+      error: "The page was reloaded before this activity completed.",
+      detail: "The previous request was interrupted. Retry the operation if it is still needed." };
   });
   if (changed) publish(next);
 }

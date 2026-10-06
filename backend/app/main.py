@@ -490,6 +490,9 @@ class TestDataReviewItem(BaseModel):
 class TestDataReviewRequest(BaseModel):
     items: list[TestDataReviewItem] = Field(min_length=1)
 
+class TestDataSubmitRequest(BaseModel):
+    test_case_ids: list[str] = Field(min_length=1)
+
 class DiscoveryContextRequest(BaseModel):
     package_id: str | None = None
     context_type: str = Field(pattern="^(web_ui|api|schema)$")
@@ -1658,13 +1661,16 @@ def _execution_summary(results):
     total = len(results)
     passed = sum(1 for item in results if item.get("status") == "passed")
     failed = sum(1 for item in results if item.get("status") == "failed")
+    pending = sum(1 for item in results if item.get("status") == "pending")
     if not total:
         status = "not_executed"
+    elif pending:
+        status = "waiting_for_cdp"
     elif failed:
         status = "fail"
     else:
         status = "pass"
-    return {"total": total, "passed": passed, "failed": failed, "status": status}
+    return {"total": total, "passed": passed, "failed": failed, "pending": pending, "status": status}
 
 def _test_run_response(row, conn=None):
     result = row_dict(row)
@@ -1691,7 +1697,92 @@ def _audit_response(row):
     return result
 
 @app.on_event("startup")
-def startup(): warm_connection_pool()
+def startup():
+    warm_connection_pool()
+    seed_default_test_data_templates()
+
+
+def seed_default_test_data_templates():
+    """Store the final BronzeBox payload templates in the control-plane DB."""
+    template_specs = (
+        ("bronze_membership_v1", "BronzeBox Membership v1", "membership", "BronzeBox(Membership)_Template.txt", {
+            "member_id": "MEMBER-TEST-001", "subscriber_id": "MEMBER-TEST-001", "dependent_number": None,
+            "relationship_to_subscriber": None, "first_name": "Alice", "middle_name": None,
+            "last_name": "Johnson", "date_of_birth": "1985-04-15", "gender": "F", "status": "ACTIVE",
+            "preferred_language": "EN", "marital_status": None, "race_ethnicity": None,
+            "effective_date": "2026-01-01", "termination_date": None, "addresses": [],
+            "phones": [{"phone_type": "MOBILE", "phone_number": "+15550000001", "is_primary": True}],
+            "emails": [{"email_type": "PERSONAL", "email_address": "alice.test@example.com", "is_primary": True}],
+            "communication_preferences": [{
+                "preference_type": "PRIMARY", "channel": "SMS", "value": "+15550000001",
+                "address_reference": None, "language": "EN", "enabled": True,
+            }],
+            "payment_methods": [], "source_event_id": "EVENT-TEST-001", "source_correlation_id": "CORR-TEST-001",
+        }),
+        ("bronze_prescription_v1", "BronzeBox Prescription v1", "prescription", "BronzeBox(Prescription)_Template.txt", {
+            "member_id": "MEMBER-TEST-001", "prescription_id": "RX-TEST-001", "rx_number": "RX-TEST-001",
+            "ndc": "00000000001", "drug_name": "Test Medication", "strength": "40 MG",
+            "dosage_form": "TABLET", "route": "ORAL", "manufacturer": "Test Manufacturer",
+            "prescriber_id": "PRESCRIBER-001", "prescribed_date": "2026-01-15", "refills_allowed": 3,
+            "refills_remaining": 2, "next_refill_date": "2026-10-15", "eligible_ind": True,
+            "status": "ACTIVE", "refill_number": 0, "dispensed_date": None, "days_supply": None,
+            "quantity_dispensed": None, "pharmacy_id": None, "pharmacy_npi": None, "pharmacy_name": None,
+            "pharmacy_phone": None, "claim_id": None, "transaction_id": None, "claim_status": None,
+            "reversal_indicator": None, "currency": None, "gross_amount": None, "plan_paid_amount": None,
+            "member_paid_amount": None, "copay_amount": None,
+            "source_event_id": "EVENT-TEST-001", "source_correlation_id": "CORR-TEST-001",
+        }),
+    )
+    timestamp = now()
+    with connection() as conn:
+        # The dataset wrapper was an application-only envelope. New records are
+        # stored against their actual Membership/Prescription templates.
+        conn.execute("UPDATE test_data_template SET active=FALSE WHERE template_id='bronze_test_dataset_v1'")
+        conn.execute(
+            "UPDATE test_data_template SET active=FALSE WHERE template_id IN ('member_details_v1','prescription_v1') "
+            "AND source_filename IN ('member_details_v1.json','prescription_v1.json')"
+        )
+        for template_id, template_name, entity_name, source_filename, payload in template_specs:
+            conn.execute(
+                "INSERT INTO test_data_template (template_id,template_name,entity_name,version,payload_json,source_filename,active,created_at,updated_at) "
+                "VALUES (%s,%s,%s,1,%s,%s,TRUE,%s,%s) ON CONFLICT (template_id) DO UPDATE SET "
+                "template_name=EXCLUDED.template_name,entity_name=EXCLUDED.entity_name,version=test_data_template.version+1,"
+                "payload_json=EXCLUDED.payload_json,active=TRUE,updated_at=EXCLUDED.updated_at "
+                "WHERE test_data_template.source_filename=EXCLUDED.source_filename "
+                "AND test_data_template.payload_json<>EXCLUDED.payload_json",
+                (template_id, template_name, entity_name, json.dumps(payload, ensure_ascii=False), source_filename, timestamp, timestamp),
+            )
+
+
+@app.get("/api/v1/test-data/templates")
+def list_test_data_templates():
+    with connection() as conn:
+        rows = conn.execute("SELECT * FROM test_data_template WHERE active=TRUE ORDER BY template_id").fetchall()
+        return [{**row_dict(row), "payload": json.loads(row["payload_json"])} for row in rows]
+
+
+def _test_data_templates_for_request(conn, request, assignments):
+    timestamp = now()
+    for definition in request.template_definitions:
+        conn.execute(
+            "INSERT INTO test_data_template (template_id,template_name,entity_name,version,payload_json,source_filename,active,created_at,updated_at) "
+            "VALUES (%s,%s,%s,1,%s,'api:template_definitions',TRUE,%s,%s) "
+            "ON CONFLICT (template_id) DO UPDATE SET template_name=EXCLUDED.template_name,entity_name=EXCLUDED.entity_name,"
+            "version=test_data_template.version+1,payload_json=EXCLUDED.payload_json,source_filename=EXCLUDED.source_filename,"
+            "active=TRUE,updated_at=EXCLUDED.updated_at",
+            (definition.template_id, definition.template_name, definition.entity_name, json.dumps(definition.payload, ensure_ascii=False), timestamp, timestamp),
+        )
+    rows = conn.execute("SELECT * FROM test_data_template WHERE active=TRUE ORDER BY template_id").fetchall()
+    available = {row["template_id"]: {**row_dict(row), "payload": json.loads(row["payload_json"])} for row in rows}
+    requested_ids = set(request.template_ids)
+    for assignment in assignments:
+        requested_ids.update(assignment.template_ids)
+    if not requested_ids:
+        requested_ids = {"bronze_membership_v1", "bronze_prescription_v1"} & set(available)
+    missing = sorted(requested_ids - set(available))
+    if missing:
+        raise HTTPException(422, {"message": "Requested test data templates are unavailable", "template_ids": missing})
+    return {template_id: available[template_id] for template_id in requested_ids}
 
 @app.on_event("shutdown")
 def shutdown(): close_connection_pool()
@@ -2943,12 +3034,12 @@ def create_execution_run(generation_id: str, request: ExecutionRunRequest):
         selected_test_data = []
         if request.selected_test_case_ids:
             placeholders = ",".join(["%s"] * len(request.selected_test_case_ids))
-            data_rows = conn.execute(f"SELECT r.* FROM test_data_record r WHERE r.generation_id=%s AND r.test_case_id IN ({placeholders}) AND r.status='saved' ORDER BY r.test_case_id,r.entity_name", tuple([generation_id] + request.selected_test_case_ids)).fetchall()
+            data_rows = conn.execute(f"SELECT r.* FROM test_data_record r WHERE r.generation_id=%s AND r.test_case_id IN ({placeholders}) AND r.status IN ('saved','ready_for_cdp') ORDER BY r.test_case_id,r.entity_name", tuple([generation_id] + request.selected_test_case_ids)).fetchall()
             selected_test_data = [_test_data_record_response(data_row) for data_row in data_rows]
         cases_with_saved_data = {record["test_case_id"] for record in selected_test_data}
         missing_test_data = sorted(set(request.selected_test_case_ids) - cases_with_saved_data)
         if missing_test_data:
-            raise HTTPException(422, {"message": "Generate and save test data to Bronze before freezing the execution baseline", "missing_test_data": missing_test_data})
+            raise HTTPException(422, {"message": "Generate and save test data for CDP before creating an execution run", "missing_test_data": missing_test_data})
         source_contract_hash = hashlib.sha256(json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
         frozen_contract = {
             "baseline_version": "1.0",
@@ -2988,10 +3079,9 @@ def list_execution_runs_for_generation(generation_id: str):
         rows = conn.execute("SELECT * FROM test_run WHERE generation_id=%s ORDER BY created_at DESC", (generation_id,)).fetchall()
         return [_test_run_response(row, conn) for row in rows]
 
+
 @app.post("/api/v1/execution-runs/{run_id}/execute")
 def execute_run(run_id: str, request: ExecutionRunExecuteRequest | None = None):
-    if not DATABASE_URL:
-        raise HTTPException(503, f"Execution requires PostgreSQL and the {BRONZE_SCHEMA} schema")
     with connection() as conn:
         row = conn.execute("SELECT * FROM test_run WHERE run_id=%s", (run_id,)).fetchone()
         if not row:
@@ -3010,7 +3100,7 @@ def execute_run(run_id: str, request: ExecutionRunExecuteRequest | None = None):
         comments = request.comments if request else None
         observations.append({
             "type": "execution_started",
-            "message": "Execution started by validating each selected test case against its saved Bronze rows and PBM Silver results.",
+            "message": "Execution check started for CDP's Bronze, Silver, Gold, and Transport outputs for each selected test case.",
             "created_at": started_at,
             "reviewer": reviewer or row["reviewer"],
             "comments": comments,
@@ -3024,9 +3114,12 @@ def execute_run(run_id: str, request: ExecutionRunExecuteRequest | None = None):
         completed_at = now()
         passed = sum(status == "passed" for status in statuses)
         failed = sum(status == "failed" for status in statuses)
-        message = f"Execution completed with {passed} passed and {failed} failed test case(s)."
+        pending = sum(status == "pending" for status in statuses)
+        waiting_for_cdp = pending > 0
+        message = (f"Waiting for CDP to finish processing {pending} test case(s). Run this check again when its layer processing completes."
+                   if waiting_for_cdp else f"Execution completed with {passed} passed and {failed} failed test case(s).")
         observations.append({
-            "type": "execution_completed",
+            "type": "execution_waiting_for_cdp" if waiting_for_cdp else "execution_completed",
             "message": message,
             "created_at": completed_at,
             "reviewer": reviewer or row["reviewer"],
@@ -3034,7 +3127,7 @@ def execute_run(run_id: str, request: ExecutionRunExecuteRequest | None = None):
         })
         conn.execute(
             "UPDATE test_run SET status=%s,lifecycle_state=%s,completed_at=%s,error=%s,immutable_observations_json=%s WHERE run_id=%s",
-            ("completed", "completed", completed_at, None if failed == 0 else message, json.dumps(observations), run_id),
+            ("running" if waiting_for_cdp else "completed", "running" if waiting_for_cdp else "completed", None if waiting_for_cdp else completed_at, None if waiting_for_cdp or failed == 0 else message, json.dumps(observations), run_id),
         )
         return _test_run_response(conn.execute("SELECT * FROM test_run WHERE run_id=%s", (run_id,)).fetchone(), conn)
 
@@ -3083,7 +3176,7 @@ def update_execution_run_lifecycle(run_id: str, request: ExecutionRunLifecycleRe
 def _unique_test_value(key, template_id, test_case_id, ordinal=0):
     suffix = hashlib.sha256(f"{template_id}:{test_case_id}:{ordinal}".encode("utf-8")).hexdigest()[:10].upper()
     normalized = str(key).lower()
-    if normalized in {"member_id", "subscriber_id", "prescription_id", "claim_id", "payment_method_id", "campaign_id", "communication_id"}:
+    if normalized.endswith("_id") or normalized in {"rx_number", "transaction_id"}:
         return f"QA-{normalized.upper()}-{suffix}"
     if normalized == "token":
         return f"tok_mock_{suffix.lower()}"
@@ -3092,6 +3185,97 @@ def _unique_test_value(key, template_id, test_case_id, ordinal=0):
     if "phone" in normalized:
         return f"+1-555-{int(suffix[:6], 16) % 1000000:06d}"
     return None
+
+
+def _test_data_eligibility_expectation(test_case):
+    text = _pharmacy_case_text(test_case)
+    if any(term in text for term in ("ineligible", "not eligible", "excluded", "exclusion", "does not qualify", "fails eligibility")):
+        return False
+    if any(term in text for term in ("eligible member", "member is eligible", "eligible patient", "eligible prescription", "meets eligibility")):
+        return True
+    return None
+
+
+def _test_case_requires_prescription(test_case):
+    text = _test_case_text(test_case).lower()
+    return bool(re.search(r"\b(?:prescriptions?|rx|refills?|drugs?|medications?|pharmacy)\b", text))
+
+
+def _test_case_requires_membership(test_case):
+    text = _test_case_text(test_case).lower()
+    return bool(re.search(r"\b(?:members?|membership|subscribers?|dependents?|contact|communication|consent|phone|email|address)\b", text))
+
+
+def _constrain_template_eligibility(schema, payload, test_case):
+    expected = _test_data_eligibility_expectation(test_case)
+    if expected is None:
+        return schema
+    if "eligible_ind" in payload:
+        schema.setdefault("properties", {}).setdefault("eligible_ind", {})["enum"] = [expected]
+    return schema
+
+
+def _stamp_domain_template_payload(payload, template, generation_id, test_case_id, linked_member_id=None, regeneration_id=None):
+    stamped = copy.deepcopy(payload)
+    entity = str(template.get("entity_name") or "").lower()
+    original_member_id = stamped.get("member_id")
+    original_subscriber_id = stamped.get("subscriber_id")
+    identity_scope = f"{generation_id}:{template['template_id']}:{regeneration_id or 'initial'}"
+    ordinal = [0]
+
+    def visit(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                normalized = str(key).lower()
+                if normalized == "member_id" and entity in {"prescription", "prescriptions"} and linked_member_id:
+                    value[key] = linked_member_id
+                elif (normalized.endswith("_id") or normalized in {"rx_number", "transaction_id"}) and isinstance(child, str):
+                    value[key] = _unique_test_value(normalized, identity_scope, test_case_id, ordinal[0])
+                    ordinal[0] += 1
+                elif (normalized in {"email", "email_address"} or normalized.endswith(("_email", "_email_address"))) and isinstance(child, str):
+                    value[key] = _unique_test_value(normalized, identity_scope, test_case_id, ordinal[0])
+                    ordinal[0] += 1
+                elif (normalized in {"phone", "phone_number", "mobile", "mobile_number"} or normalized.endswith(("_phone_number", "_mobile_number"))) and isinstance(child, str):
+                    suffix = hashlib.sha256(f"{identity_scope}:{test_case_id}:{ordinal[0]}".encode()).hexdigest()[:7]
+                    value[key] = f"+1555{int(suffix, 16) % 10_000_000:07d}"
+                    ordinal[0] += 1
+                else:
+                    visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(stamped)
+    if entity in {"membership", "member", "member_details"}:
+        member_id = _unique_test_value("member_id", identity_scope, test_case_id)
+        stamped["member_id"] = member_id
+        if "subscriber_id" in stamped:
+            stamped["subscriber_id"] = member_id if original_subscriber_id == original_member_id else _unique_test_value("subscriber_id", identity_scope, test_case_id)
+    elif entity in {"prescription", "prescriptions"} and linked_member_id:
+        stamped["member_id"] = linked_member_id
+    trace = hashlib.sha256(f"{generation_id}:{test_case_id}:{regeneration_id or 'initial'}".encode("utf-8")).hexdigest().upper()
+    if "source_event_id" in stamped:
+        stamped["source_event_id"] = f"evt-testiq-{trace[:24]}"
+    if "source_correlation_id" in stamped:
+        stamped["source_correlation_id"] = f"testiq-{trace[:32].lower()}"
+    return stamped, stamped.get("member_id") if entity in {"membership", "member", "member_details"} else linked_member_id
+
+
+def _validate_domain_template_payload(payload, template, test_case, member_id=None):
+    expected_shape = template["payload"]
+    if not _matches_test_data_template_shape(payload, expected_shape):
+        raise HTTPException(422, f"Generated {template['template_name']} does not match its stored template keys, nesting, or value types.")
+    entity = str(template.get("entity_name") or "").lower()
+    if entity in {"membership", "member", "member_details"} and not payload.get("member_id"):
+        raise HTTPException(422, "Generated Membership template data is missing member_id.")
+    if entity in {"prescription", "prescriptions"}:
+        if not payload.get("prescription_id"):
+            raise HTTPException(422, "Generated Prescription template data is missing prescription_id.")
+        if member_id and payload.get("member_id") != member_id:
+            raise HTTPException(422, "Membership and Prescription templates must use the same member_id for this test case.")
+        expected = _test_data_eligibility_expectation(test_case)
+        if expected is not None and payload.get("eligible_ind") is not expected:
+            raise HTTPException(422, "Generated prescription eligibility does not match the approved test case.")
 
 def _test_data_record_response(row):
     item = row_dict(row)
@@ -3107,7 +3291,12 @@ def _test_data_value_schema(value):
         properties = {key: _test_data_value_schema(child) for key, child in value.items()}
         return {"type": "object", "properties": properties, "required": list(properties), "additionalProperties": False}
     if isinstance(value, list):
-        return {"type": "array", "items": _test_data_value_schema(value[0]) if value else {"type": "string"}}
+        return {
+            "type": "array",
+            "items": _test_data_value_schema(value[0]) if value else {"type": "string"},
+            "minItems": len(value),
+            "maxItems": len(value),
+        }
     if isinstance(value, bool): return {"type": "boolean"}
     if isinstance(value, int): return {"type": "integer"}
     if isinstance(value, float): return {"type": "number"}
@@ -3128,6 +3317,41 @@ def _matches_test_data_template_shape(value, template):
     if isinstance(template, float):
         return isinstance(value, (int, float)) and not isinstance(value, bool)
     return isinstance(value, str)
+
+def _test_data_template_shape_error(value, template, path="$"):
+    if isinstance(template, dict):
+        if not isinstance(value, dict):
+            return f"{path} must be an object"
+        missing = sorted(set(template) - set(value))
+        extra = sorted(set(value) - set(template))
+        if missing:
+            return f"{path} is missing template field(s): {', '.join(missing)}"
+        if extra:
+            return f"{path} contains field(s) outside the template: {', '.join(extra)}"
+        for key, child in template.items():
+            issue = _test_data_template_shape_error(value[key], child, f"{path}.{key}")
+            if issue:
+                return issue
+        return None
+    if isinstance(template, list):
+        if not isinstance(value, list):
+            return f"{path} must be an array"
+        if len(value) != len(template):
+            return f"{path} must contain exactly {len(template)} item(s), received {len(value)}"
+        for index, child in enumerate(template):
+            issue = _test_data_template_shape_error(value[index], child, f"{path}[{index}]")
+            if issue:
+                return issue
+        return None
+    if template is None:
+        return None if value is None or isinstance(value, str) else f"{path} must be a string or null"
+    if isinstance(template, bool):
+        return None if isinstance(value, bool) else f"{path} must be a boolean"
+    if isinstance(template, int):
+        return None if isinstance(value, int) and not isinstance(value, bool) else f"{path} must be an integer"
+    if isinstance(template, float):
+        return None if isinstance(value, (int, float)) and not isinstance(value, bool) else f"{path} must be a number"
+    return None if isinstance(value, str) else f"{path} must be a string"
 
 def _test_data_template_plan_schema(case_ids):
     assignment_properties = {
@@ -3603,7 +3827,7 @@ def _normalize_test_data_relationships(payload):
         _set_all_matching_keys(payload, "prescription_id", prescription_id)
     return payload
 
-def _generate_test_data_with_openai(templates, rag_context=None):
+def _generate_test_data_with_openai(templates):
     key = os.getenv("OPENAI_API_KEY")
     if not key:
         raise RuntimeError("OPENAI_API_KEY is not configured for test-data generation")
@@ -3613,12 +3837,14 @@ def _generate_test_data_with_openai(templates, rag_context=None):
     generated = {}
     for template, case_batch in templates:
         case_properties = {case["test_case_id"]: {"type": "object", "properties": {"payload": _test_data_value_schema(template["payload"])}, "required": ["payload"], "additionalProperties": False} for case in case_batch}
+        for case in case_batch:
+            payload_schema = case_properties[case["test_case_id"]]["properties"]["payload"]
+            _constrain_template_eligibility(payload_schema, template["payload"], case)
         schema = {"type": "object", "properties": {"records": {"type": "object", "properties": case_properties, "required": list(case_properties), "additionalProperties": False}}, "required": ["records"], "additionalProperties": False}
         prompt = {
-            "instructions": "Generate synthetic scenario data for each approved test case using only the supplied versioned event template, approved case details, and retrieved package Knowledge Base evidence. Return a complete event for every case. Preserve the template's exact keys, nesting, array lengths, and value types. Choose values that make the event setup satisfy that specific case, including negative, boundary, consent, eligibility, and refill conditions when applicable. Keep member, prescription, drug, and contact values internally consistent. Use fictional test values only and the reserved +1-555 test phone shown by the template. Do not create event id, correlationId, time, source, type, or specversion values; the application sets the trace metadata after generation. Do not include explanations or keys outside the template.",
+            "instructions": "Generate synthetic scenario data for each approved test case using only the supplied versioned BronzeBox template and the approved case including its pre-step setup. Return exactly one complete template-shaped record for every listed test case. Preserve every key and value type. Every array must keep exactly the same number of items as the corresponding template array: fill existing object entries, do not add or remove items, and keep empty template arrays empty. Make values satisfy the case, including negative, boundary, eligibility, refill, and member-to-prescription relationship requirements. If required_prescription_eligibleInd is supplied, copy it into the template's eligible_ind field exactly. Use fictional test data. Copy source_event_id and source_correlation_id from the template; TestIQ replaces those values with run-specific trace IDs before Bronze insertion. Do not add fields or explanations.",
             "template": {"entity_name": template["entity_name"], "template_name": template["template_name"], "payload_shape_and_examples": template["payload"]},
-            "approved_test_cases": [{key: case.get(key) for key in ("test_case_id", "title", "description", "scenario", "preconditions", "test_data_setup", "data_needs", "actions", "steps", "expected_results", "deterministic_inputs") if case.get(key) is not None} for case in case_batch],
-            "retrieved_knowledge_evidence": _rag_context_for_prompt(rag_context),
+            "approved_test_cases": [{**{key: case.get(key) for key in ("test_case_id", "title", "description", "scenario", "preconditions", "test_data_setup", "data_needs", "actions", "steps", "expected_results", "deterministic_inputs") if case.get(key) is not None}, **({"required_prescription_eligibleInd": _test_data_eligibility_expectation(case)} if "eligible_ind" in template["payload"] and _test_data_eligibility_expectation(case) is not None else {})} for case in case_batch],
         }
         response = responses_create(client,
             model=OPENAI_MODEL,
@@ -3630,8 +3856,27 @@ def _generate_test_data_with_openai(templates, rag_context=None):
             raise ValueError("OpenAI returned no test data")
         result = json.loads(response.output_text).get("records", {})
         expected_ids = {case["test_case_id"] for case in case_batch}
-        if set(result) != expected_ids or any(not isinstance(item, dict) or not isinstance(item.get("payload"), dict) or not _matches_test_data_template_shape(item["payload"], template["payload"]) for item in result.values()):
-            raise ValueError("OpenAI returned incomplete or invalid test data for the selected cases")
+        missing_cases = sorted(expected_ids - set(result))
+        extra_cases = sorted(set(result) - expected_ids)
+        if missing_cases or extra_cases:
+            details = []
+            if missing_cases:
+                details.append(f"missing case(s): {', '.join(missing_cases)}")
+            if extra_cases:
+                details.append(f"unexpected case(s): {', '.join(extra_cases)}")
+            raise ValueError(f"OpenAI returned incomplete test data for {template['template_name']} ({'; '.join(details)}).")
+        for case in case_batch:
+            case_id = case["test_case_id"]
+            item = result[case_id]
+            if not isinstance(item, dict) or not isinstance(item.get("payload"), dict):
+                raise ValueError(f"OpenAI returned no template payload for {template['template_name']} in {case_id}.")
+            shape_error = _test_data_template_shape_error(item["payload"], template["payload"])
+            if shape_error:
+                raise ValueError(f"OpenAI returned invalid {template['template_name']} data for {case_id}: {shape_error}.")
+        for case in case_batch:
+            expected_eligibility = _test_data_eligibility_expectation(case)
+            if "eligible_ind" in template["payload"] and expected_eligibility is not None and result[case["test_case_id"]]["payload"].get("eligible_ind") is not expected_eligibility:
+                raise ValueError(f"OpenAI returned prescription eligibility inconsistent with approved test case {case['test_case_id']}.")
         generated.update({(case_id, template["template_id"]): item["payload"] for case_id, item in result.items()})
     return generated
 
@@ -3779,43 +4024,75 @@ def generate_test_data(generation_id: str, request: TestDataGenerationRequest):
         unapproved = [case_id for case_id in assignment_case_ids if _review_status(cases[case_id]) != "approved"]
         if unapproved:
             raise HTTPException(422, {"message": "Test data can only be generated for approved test cases", "not_approved": unapproved})
-        existing_rows = conn.execute("SELECT status FROM test_data_record WHERE generation_id=%s", (generation_id,)).fetchall()
+        existing_rows = conn.execute("SELECT test_case_id,status FROM test_data_record WHERE generation_id=%s", (generation_id,)).fetchall()
         if existing_rows:
             if not request.replace_existing_drafts:
                 raise HTTPException(409, "Test data already exists for this generation. Use regenerate for draft records or create a new test-case generation.")
-            if any(item["status"] == "saved" for item in existing_rows):
-                raise HTTPException(409, "Saved Bronze records are immutable. Create a new test-case generation to produce another dataset.")
-        rag = _require_test_data_knowledge(generation["package_id"])
-        event_template = _pharmacy_notification_template()
-        template_record = {
-            "template_id": event_template["template_id"],
-            "template_name": event_template["template_name"],
-            "entity_name": event_template["entity_name"],
-            "payload_json": json.dumps(event_template["payload"], sort_keys=True),
-        }
-        selected_templates_by_case = {case_id: [template_record] for case_id in assignment_case_ids}
+        available_templates = _test_data_templates_for_request(conn, request, assignments)
+        membership_template = available_templates.get("bronze_membership_v1")
+        prescription_template = available_templates.get("bronze_prescription_v1")
+        membership_cases = {assignment.test_case_id: _test_case_requires_membership(cases[assignment.test_case_id]) for assignment in assignments}
+        prescription_cases = {assignment.test_case_id: _test_case_requires_prescription(cases[assignment.test_case_id]) for assignment in assignments}
+        ambiguous_cases = [case_id for case_id in assignment_case_ids if not membership_cases[case_id] and not prescription_cases[case_id]]
+        if ambiguous_cases:
+            raise HTTPException(422, f"Could not determine whether these cases need Membership or Prescription data: {', '.join(ambiguous_cases)}. Clarify the approved scenario and retry.")
+        if any(membership_cases.values()) and not membership_template:
+            raise HTTPException(422, "These approved cases need Membership data, but the BronzeBox Membership template is unavailable.")
+        if any(prescription_cases.values()) and not prescription_template:
+            raise HTTPException(422, "These approved cases need prescription data, but the BronzeBox Prescription template is unavailable.")
+        selected_templates_by_case = {}
+        for assignment in assignments:
+            required_templates = set()
+            if membership_cases[assignment.test_case_id]:
+                required_templates.add("bronze_membership_v1")
+            if prescription_cases[assignment.test_case_id]:
+                required_templates.add("bronze_prescription_v1")
+            requested = set(assignment.template_ids or request.template_ids)
+            if requested and requested != required_templates:
+                raise HTTPException(422, f"{assignment.test_case_id} requires these template(s): {', '.join(sorted(required_templates))}.")
+            selected_templates_by_case[assignment.test_case_id] = [available_templates[item] for item in sorted(required_templates)]
+        regeneration_id = uid("regen") if request.replace_existing_drafts and existing_rows else None
         try:
-            generated_payloads = _generate_test_data_with_openai(_test_data_generation_batches(assignment_case_ids, cases, selected_templates_by_case), rag)
+            generated_payloads = _generate_test_data_with_openai(_test_data_generation_batches(assignment_case_ids, cases, selected_templates_by_case))
         except Exception as exc:
             raise HTTPException(502, f"OpenAI could not generate test data for the approved cases: {safe_llm_error_message(exc)}. No local data fallback was used.") from exc
         if existing_rows:
-            conn.execute("DELETE FROM test_data_record WHERE generation_id=%s AND status='draft'", (generation_id,))
+            conn.execute("DELETE FROM test_data_record WHERE generation_id=%s AND status='draft' AND test_case_id=ANY(%s)", (generation_id, assignment_case_ids))
         created = []
         timestamp = now()
-        generated_member_ids, generated_phones = set(), set()
-        generated_event_ids, generated_correlations, generated_times = set(), set(), set()
         for case_id in assignment_case_ids:
             test_case = cases[case_id]
-            payload = generated_payloads[(case_id, event_template["template_id"])]
-            payload = _stamp_pharmacy_event_fields(payload, generation_id, case_id)
-            _validate_pharmacy_notification(payload, test_case, generated_member_ids, generated_phones, generated_event_ids, generated_correlations, generated_times)
-            for template in selected_templates_by_case[case_id]:
-                record_id = uid("tdr")
-                pre_steps = test_case.get("test_data_setup") or []
-                schema_context = [{"source_type": item.get("source_type"), "source_reference": item.get("source_reference"), "fragment_id": item.get("original_fragment_id") or item.get("fragment_id"), "text": item.get("fragment_text")} for item in (rag or {}).get("technical_fragments", [])]
-                conn.execute("INSERT INTO test_data_record (record_id,generation_id,test_case_id,template_id,template_name,entity_name,payload_json,pre_steps_json,schema_context_json,status,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (record_id, generation_id, case_id, template["template_id"], template["template_name"], template["entity_name"], json.dumps(payload, sort_keys=True), json.dumps(pre_steps), json.dumps(schema_context), "draft", timestamp, timestamp))
-                created.append({"record_id": record_id, "generation_id": generation_id, "test_case_id": case_id, "template_id": template["template_id"], "template_name": template["template_name"], "entity_name": template["entity_name"], "payload": payload, "pre_steps": pre_steps, "schema_context": schema_context, "status": "draft", "created_at": timestamp})
-        return {"generation_id": generation_id, "generation_mode": "openai", "generation_model": OPENAI_MODEL, "rag_metadata": _rag_metadata_or_none(rag), "rag_status": _rag_status(rag, required=True), "records": created}
+            case_payloads = []
+            member_id = None
+            if membership_cases[case_id]:
+                member_payload, member_id = _stamp_domain_template_payload(
+                    generated_payloads[(case_id, membership_template["template_id"])], membership_template, generation_id, case_id, regeneration_id=regeneration_id,
+                )
+                _validate_domain_template_payload(member_payload, membership_template, test_case)
+                case_payloads.append((membership_template, member_payload))
+            if prescription_cases[case_id]:
+                prescription_payload, _ = _stamp_domain_template_payload(
+                    generated_payloads[(case_id, prescription_template["template_id"])], prescription_template, generation_id, case_id, member_id, regeneration_id,
+                )
+                _validate_domain_template_payload(prescription_payload, prescription_template, test_case, member_id)
+                case_payloads.append((prescription_template, prescription_payload))
+            pre_steps = test_case.get("test_data_setup") or []
+            schema_context = []
+            for record_template, payload in case_payloads:
+                template_version = record_template["version"]
+                existing_record = conn.execute("SELECT record_id,status FROM test_data_record WHERE generation_id=%s AND test_case_id=%s AND template_id=%s", (generation_id, case_id, record_template["template_id"])).fetchone()
+                if existing_record:
+                    record_id = existing_record["record_id"]
+                    if existing_record["status"] == "saved":
+                        # Keep Bronze immutable, but drop TestIQ's old lookup references
+                        # so a regenerated staging row is matched to its new identifiers.
+                        conn.execute("DELETE FROM test_data_bronze_ref WHERE record_id=%s", (record_id,))
+                    conn.execute("UPDATE test_data_record SET template_name=%s,template_version=%s,entity_name=%s,payload_json=%s,pre_steps_json=%s,schema_context_json=%s,status='draft',updated_at=%s WHERE record_id=%s", (record_template["template_name"], template_version, record_template["entity_name"], json.dumps(payload, sort_keys=True), json.dumps(pre_steps), json.dumps(schema_context), timestamp, record_id))
+                else:
+                    record_id = uid("tdr")
+                    conn.execute("INSERT INTO test_data_record (record_id,generation_id,test_case_id,template_id,template_name,template_version,entity_name,payload_json,pre_steps_json,schema_context_json,status,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (record_id, generation_id, case_id, record_template["template_id"], record_template["template_name"], template_version, record_template["entity_name"], json.dumps(payload, sort_keys=True), json.dumps(pre_steps), json.dumps(schema_context), "draft", timestamp, timestamp))
+                created.append({"record_id": record_id, "generation_id": generation_id, "test_case_id": case_id, "template_id": record_template["template_id"], "template_name": record_template["template_name"], "template_version": template_version, "entity_name": record_template["entity_name"], "payload": payload, "pre_steps": pre_steps, "schema_context": schema_context, "status": "draft", "created_at": timestamp})
+        return {"generation_id": generation_id, "generation_mode": "openai", "generation_model": OPENAI_MODEL, "records": created}
 
 @app.get("/api/v1/test-case-generations/{generation_id}/test-data")
 def list_test_data(generation_id: str):
@@ -4055,6 +4332,30 @@ def _insert_pbm_event_load(conn, payload, generation_id, test_case_id, row):
             refs.append({"table": table, "id": str(result["id"])})
     return load_id, refs
 
+def _insert_pbm_template_load(conn, membership_row, prescription_row, membership, prescription, generation_id, test_case_id):
+    from psycopg.types.json import Jsonb
+    from psycopg import sql
+    load_id = str(conn.execute("SELECT nextval('testiq.ingestion_load_id_seq') AS value").fetchone()["value"])
+    trace = hashlib.sha256(f"{generation_id}:{test_case_id}:{load_id}".encode("utf-8")).hexdigest().upper()
+    event_id = f"evt-testiq-{trace[:24]}"
+    correlation_id = f"testiq-{trace[:32].lower()}"
+    membership_data = {**membership, "source_event_id": event_id, "source_correlation_id": correlation_id}
+    prescription_data = {**prescription, "source_event_id": event_id, "source_correlation_id": correlation_id}
+    digest = hashlib.sha256(json.dumps([membership_data, prescription_data], sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    conn.execute(
+        "INSERT INTO testiq.ingestion_load (load_id,event_id,correlation_id,original_filename,sha256,source_system,document_type,document_version,file_size_bytes,status,member_count,prescription_count) "
+        "VALUES (%s,%s,%s,%s,%s,'TestIQ','testiq.bronzebox.templates','1',%s,'BRONZE_LOADED',1,1)",
+        (load_id, event_id, correlation_id, f"{event_id}.json", digest, len(json.dumps([membership_data, prescription_data], separators=(",", ":")).encode("utf-8"))),
+    )
+    refs = []
+    for table, payload in (("membership", membership_data), ("prescription", prescription_data)):
+        stored = conn.execute(
+            sql.SQL("INSERT INTO {} (load_id,created_time,data) VALUES (%s,now(),%s) RETURNING id").format(sql.Identifier(BRONZE_SCHEMA, table)),
+            (load_id, Jsonb(payload)),
+        ).fetchone()
+        refs.append({"table": table, "id": str(stored["id"])})
+    return load_id, refs, membership_data, prescription_data
+
 def _bronze_ref_id(record_id: str, bronze_schema: str, bronze_table: str, bronze_id: str) -> str:
     digest = hashlib.sha256(f"{record_id}:{bronze_schema}:{bronze_table}:{bronze_id}".encode("utf-8")).hexdigest()[:24]
     return f"bref_{digest}"
@@ -4153,7 +4454,130 @@ def _assert_equal_if_present(assertions, name: str, expected, actual):
         return
     _add_assertion(assertions, name, expected == actual, expected, actual)
 
+def _add_pending_assertion(assertions, name: str, expected=None, actual=None, message: str = "Waiting for CDP to complete this layer."):
+    assertions.append({"name": name, "status": "pending", "expected": expected, "actual": actual, "message": message})
+
+def _expected_test_data_ids(payload):
+    members, prescriptions = [], []
+    if payload.get("type") == "pharmacy.orders.v1.sample-notification":
+        for item in (payload.get("data") or {}).get("members") or []:
+            if item.get("person", {}).get("resourceID"):
+                members.append(item["person"]["resourceID"])
+            prescriptions.extend(rx.get("resourceID") for rx in item.get("prescription", []) if rx.get("resourceID"))
+    else:
+        membership = payload.get("membership") or payload.get("member") or payload
+        prescription = payload.get("prescription")
+        if isinstance(membership, dict) and membership.get("member_id"):
+            members.append(membership["member_id"])
+        if isinstance(prescription, dict) and prescription.get("prescription_id"):
+            prescriptions.append(prescription["prescription_id"])
+    return sorted(set(members)), sorted(set(prescriptions))
+
+def _validate_gold_transport(conn, rows, generation_id, test_case_id, assertions):
+    case = conn.execute("SELECT contract_json FROM test_case_generation WHERE generation_id=%s", (generation_id,)).fetchone()
+    contract = json.loads(case["contract_json"]) if case else {}
+    approved_case = next((item for item in contract.get("test_cases", []) if item.get("test_case_id") == test_case_id), {})
+    description = " ".join(str(approved_case.get(key) or "") for key in ("title", "description", "scenario", "expected_results", "assertions")).lower()
+    expects_dnc = any(term in description for term in ("suppression", "do not contact", "dnc"))
+    expects_missing_contact = any(term in description for term in ("without valid phone", "no valid phone", "missing phone", "no phone number", "invalid phone"))
+    rx_ids = sorted({rx for row in rows for rx in _expected_test_data_ids(json.loads(row["payload_json"]))[1]})
+    gold_actual, transport_actual = [], []
+    if not rx_ids:
+        _add_assertion(assertions, "Gold and Transport applicability", True, "Prescription test case", "No Prescription template for this Membership-only case.")
+        return gold_actual, transport_actual
+    for rx_id in rx_ids:
+        gold_rows = conn.execute(
+            "SELECT refill_gold_sk,member_id,prescription_id,campaign_code,campaign_eligible_ind,source_load_id "
+            "FROM goldbox.prescription_refill WHERE prescription_id=%s ORDER BY gold_updated_at DESC LIMIT 1",
+            (rx_id,),
+        ).fetchall()
+        audit_rows = conn.execute(
+            "SELECT a.member_id,a.action,a.status,a.campaign_eligible_ind,a.exclusion_reason,a.evaluation_date "
+            "FROM goldbox.prescription_refill_record_audit a "
+            "JOIN silverbox.prescription p ON p.prescription_sk=a.prescription_sk "
+            "WHERE p.prescription_id=%s ORDER BY a.evaluation_date DESC",
+            (rx_id,),
+        ).fetchall()
+        if not audit_rows:
+            _add_pending_assertion(assertions, f"Gold evaluation for {rx_id}", "campaign decision audit", "not recorded yet", "Waiting for CDP's Gold campaign process.")
+        else:
+            latest_audit = audit_rows[-1]
+            prescription_payload = {}
+            for row in rows:
+                row_payload = json.loads(row["payload_json"])
+                nested_prescription = row_payload.get("prescription")
+                if isinstance(nested_prescription, dict):
+                    prescription_payload = nested_prescription
+                    break
+                if str(row["entity_name"]).lower() == "prescription" or row_payload.get("prescription_id"):
+                    prescription_payload = row_payload
+                    break
+            ineligible = isinstance(prescription_payload, dict) and prescription_payload.get("eligible_ind") is False
+            no_refills = isinstance(prescription_payload, dict) and int(prescription_payload.get("refills_remaining") or 0) <= 0
+            expects_exclusion = expects_missing_contact or ineligible or no_refills
+            expected_action = "EXCLUDED" if expects_exclusion else "QUALIFIED"
+            _add_assertion(assertions, f"Gold campaign decision for {rx_id}", latest_audit["action"] == expected_action, expected_action, latest_audit["action"], latest_audit.get("exclusion_reason"))
+            gold_actual.append({"prescription_id": rx_id, "audit": dict(latest_audit), "refill_rows": [dict(item) for item in gold_rows]})
+        if gold_rows:
+            refill_ids = [item["refill_gold_sk"] for item in gold_rows]
+            routed = conn.execute(
+                "SELECT member_id,campaign_code,selected_channel,result_status,target_table,transport_record_sk,failure_reason,event_time "
+                "FROM transport.journey_record_audit WHERE gold_refill_sk=ANY(%s) ORDER BY event_time",
+                (refill_ids,),
+            ).fetchall()
+            transport_actual.extend([dict(item) for item in routed])
+            if not routed:
+                _add_pending_assertion(assertions, f"Transport result for {rx_id}", "journey audit", "not recorded yet", "Gold qualified the refill; waiting for CDP's Transport process.")
+            else:
+                expected_status = "DNC_EXCLUDED" if expects_dnc else "MISSING_CONTACT" if expects_missing_contact else "ROUTED"
+                observed_statuses = sorted({item["result_status"] for item in routed})
+                _add_assertion(assertions, f"Transport outcome for {rx_id}", expected_status in observed_statuses, expected_status, observed_statuses, "; ".join(item.get("failure_reason") or "" for item in routed if item.get("failure_reason")) or None)
+        elif audit_rows and audit_rows[-1]["action"] == "EXCLUDED":
+            _add_assertion(assertions, f"Transport not routed for excluded {rx_id}", True, "No Transport journey", "Gold excluded this prescription.")
+        else:
+            _add_pending_assertion(assertions, f"Gold refill record for {rx_id}", "eligible Gold refill or exclusion result", "not available yet")
+    return gold_actual, transport_actual
+
+def _discover_bronze_refs_for_record(conn, row, payload):
+    refs = _bronze_refs_for_record(conn, row)
+    if refs:
+        return refs
+    member_ids, prescription_ids = _expected_test_data_ids(payload)
+    from psycopg import sql
+    discovered = []
+    for table, key, values in (("membership", "member_id", member_ids), ("prescription", "prescription_id", prescription_ids)):
+        for value in values:
+            item = conn.execute(
+                sql.SQL("SELECT id,load_id FROM {} WHERE data->>%s=%s ORDER BY created_time DESC,id DESC LIMIT 1").format(sql.Identifier(BRONZE_SCHEMA, table)),
+                (key, value),
+            ).fetchone()
+            if item:
+                discovered.append({"table": table, "id": str(item["id"]), "load_id": str(item["load_id"])})
+    for ref in discovered:
+        _record_bronze_refs(conn, row, [{"table": ref["table"], "id": ref["id"]}], ref["load_id"])
+    return _bronze_refs_for_record(conn, row) if discovered else []
+
 def _evaluate_record_payload(payload, actual_by_table, assertions):
+    if isinstance(payload, dict) and isinstance(payload.get("membership"), dict) and isinstance(payload.get("prescription"), dict):
+        _evaluate_record_payload(payload["membership"], actual_by_table, assertions)
+        _evaluate_record_payload(payload["prescription"], actual_by_table, assertions)
+        return
+    if isinstance(payload, dict) and payload.get("member_id") and payload.get("first_name") is not None:
+        bronze_members = [_item["data"] for _item in actual_by_table.get("membership", [])]
+        _add_assertion(assertions, "Membership template row exists", len(bronze_members) == 1, 1, len(bronze_members))
+        if bronze_members:
+            _assert_equal_if_present(assertions, "member_id stored in Bronze", payload.get("member_id"), bronze_members[0].get("member_id"))
+            _assert_equal_if_present(assertions, "subscriber_id stored in Bronze", payload.get("subscriber_id"), bronze_members[0].get("subscriber_id"))
+            _assert_equal_if_present(assertions, "member first_name stored in Bronze", payload.get("first_name"), bronze_members[0].get("first_name"))
+            _assert_equal_if_present(assertions, "member last_name stored in Bronze", payload.get("last_name"), bronze_members[0].get("last_name"))
+        return
+    if isinstance(payload, dict) and payload.get("prescription_id") and "eligible_ind" in payload:
+        bronze_prescriptions = [_item["data"] for _item in actual_by_table.get("prescription", [])]
+        _add_assertion(assertions, "Prescription template row exists", len(bronze_prescriptions) == 1, 1, len(bronze_prescriptions))
+        if bronze_prescriptions:
+            for key in ("prescription_id", "member_id", "eligible_ind", "status", "refills_remaining", "next_refill_date", "drug_name", "strength"):
+                _assert_equal_if_present(assertions, f"{key} stored in Bronze", payload.get(key), bronze_prescriptions[0].get(key))
+        return
     if isinstance(payload, dict) and payload.get("type") == "pharmacy.orders.v1.sample-notification":
         expected_members = payload.get("data", {}).get("members", [])
         bronze_members = [_item["data"] for _item in actual_by_table.get("membership", [])]
@@ -4210,7 +4634,7 @@ def _evaluate_record_payload(payload, actual_by_table, assertions):
 
 def _execute_case_against_bronze(conn, run_id: str, generation_id: str, test_case_id: str, started_at: str):
     rows = conn.execute(
-        "SELECT * FROM test_data_record WHERE generation_id=%s AND test_case_id=%s AND status='saved' ORDER BY entity_name,record_id",
+        "SELECT * FROM test_data_record WHERE generation_id=%s AND test_case_id=%s AND status IN ('saved','ready_for_cdp') ORDER BY entity_name,record_id",
         (generation_id, test_case_id),
     ).fetchall()
     assertions = []
@@ -4218,18 +4642,37 @@ def _execute_case_against_bronze(conn, run_id: str, generation_id: str, test_cas
     actual_records = []
     all_refs = []
     silver_actual = {"members": [], "prescriptions": []}
+    expected_domain_by_case = {}
+    for saved_row in rows:
+        saved_payload = json.loads(saved_row["payload_json"])
+        entity = str(saved_row["entity_name"]).lower()
+        if entity == "test_dataset":
+            member_payload = saved_payload.get("membership") or {}
+            prescription_payload = saved_payload.get("prescription") or {}
+            if member_payload.get("member_id"):
+                expected_domain_by_case.setdefault(test_case_id, {})["member_id"] = member_payload["member_id"]
+            if prescription_payload.get("prescription_id"):
+                expected_domain_by_case.setdefault(test_case_id, {})["prescription_id"] = prescription_payload["prescription_id"]
+        if entity == "membership" and saved_payload.get("member_id"):
+            expected_domain_by_case.setdefault(test_case_id, {})["member_id"] = saved_payload["member_id"]
+        elif entity == "prescription" and saved_payload.get("prescription_id"):
+            expected_domain_by_case.setdefault(test_case_id, {})["prescription_id"] = saved_payload["prescription_id"]
     if not rows:
         _add_assertion(assertions, "saved test data exists", False, "saved test data", "none")
     for row in rows:
         payload = json.loads(row["payload_json"])
-        refs = _bronze_refs_for_record(conn, row)
+        refs = _discover_bronze_refs_for_record(conn, row, payload)
         serializable_refs = [{key: ref[key] for key in ("bronze_ref_id", "record_id", "bronze_schema", "bronze_table", "bronze_id", "bronze_load_id", "created_at") if key in ref} for ref in refs]
         all_refs.extend(serializable_refs)
-        _add_assertion(assertions, f"{row['record_id']} has Bronze reference", bool(refs), "at least one Bronze reference", f"{len(refs)} reference(s)")
+        member_ids, prescription_ids = _expected_test_data_ids(payload)
+        expected_bronze = (["membership"] if member_ids else []) + (["prescription"] if prescription_ids else [])
+        if not refs:
+            _add_pending_assertion(assertions, f"{row['record_id']} appears in Bronze", expected_bronze, "not found yet")
         actual_by_table = {}
         for ref in refs:
             bronze_row = _fetch_bronze_domain_row(conn, ref["bronze_table"], ref["bronze_id"])
-            _add_assertion(assertions, f"{ref['bronze_table']}:{ref['bronze_id']} exists", bool(bronze_row), "Bronze row", "found" if bronze_row else "missing")
+            if not bronze_row:
+                _add_pending_assertion(assertions, f"{ref['bronze_table']}:{ref['bronze_id']} exists", "Bronze row", "not found yet")
             if bronze_row:
                 actual_item = {
                     "record_id": row["record_id"],
@@ -4240,20 +4683,33 @@ def _execute_case_against_bronze(conn, run_id: str, generation_id: str, test_cas
                 }
                 actual_records.append(actual_item)
                 actual_by_table.setdefault(ref["bronze_table"], []).append(actual_item)
-        _evaluate_record_payload(payload, actual_by_table, assertions)
-        if payload.get("type") == "pharmacy.orders.v1.sample-notification":
+        found_members = {item.get("data", {}).get("member_id") for item in actual_by_table.get("membership", [])}
+        found_prescriptions = {item.get("data", {}).get("prescription_id") for item in actual_by_table.get("prescription", [])}
+        bronze_complete = set(member_ids).issubset(found_members) and set(prescription_ids).issubset(found_prescriptions)
+        if bronze_complete:
+            _add_assertion(assertions, f"{row['record_id']} Bronze rows exist", True, expected_bronze, "found")
+            _evaluate_record_payload(payload, actual_by_table, assertions)
+        else:
+            _add_pending_assertion(assertions, f"{row['record_id']} Bronze rows are complete", expected_bronze, {"members": sorted(found_members), "prescriptions": sorted(found_prescriptions)})
+        if payload.get("type") == "pharmacy.orders.v1.sample-notification" or str(row["entity_name"]).lower() in {"membership", "prescription", "test_dataset"}:
             load_ids = sorted({str(ref["bronze_load_id"]) for ref in refs if ref.get("bronze_load_id")})
             for load_id in load_ids:
                 load = conn.execute("SELECT status,error_message FROM testiq.ingestion_load WHERE load_id=%s", (load_id,)).fetchone()
                 if not load:
-                    _add_assertion(assertions, f"PBM load {load_id} exists", False, "testiq.ingestion_load row", "missing")
+                    _add_pending_assertion(assertions, f"CDP load {load_id} exists", "testiq.ingestion_load row", "not visible yet")
                     continue
-                if load["status"] == "BRONZE_LOADED":
-                    conn.execute("CALL testiq.process_bronze_load_to_silver(%s,'TESTIQ_EXECUTION')", (load_id,))
-                    load = conn.execute("SELECT status,error_message FROM testiq.ingestion_load WHERE load_id=%s", (load_id,)).fetchone()
-                _add_assertion(assertions, f"PBM Silver promotion {load_id} completed", load["status"] == "COMPLETED", "COMPLETED", load["status"], load.get("error_message") or "PBM load did not complete cleanly.")
+                if load["status"] in {"BRONZE_LOADED", "SILVER_PROCESSING", "DISCOVERED"}:
+                    _add_pending_assertion(assertions, f"CDP Silver processing {load_id}", "COMPLETED", load["status"], "CDP still has this load in progress; recheck after its pipeline runs.")
+                    continue
+                if load["status"] in {"FAILED", "COMPLETED_WITH_ERRORS", "QUARANTINED"}:
+                    _add_assertion(assertions, f"CDP Silver processing {load_id}", False, "COMPLETED", load["status"], load.get("error_message") or "CDP reported a failed or partial load.")
+                    continue
+                _add_assertion(assertions, f"CDP Silver processing {load_id}", load["status"] == "COMPLETED", "COMPLETED", load["status"], load.get("error_message") or "CDP load did not complete cleanly.")
                 audit = conn.execute("SELECT status,membership_records_read,membership_records_processed,membership_records_failed,prescription_records_read,prescription_records_processed,prescription_records_failed,unhandled_entity_counts,error_message FROM testiq.bronze_silver_run_audit WHERE load_id=%s ORDER BY started_at DESC LIMIT 1", (load_id,)).fetchone()
-                _add_assertion(assertions, f"PBM orchestration audit {load_id} completed", bool(audit) and audit["status"] == "COMPLETED", "COMPLETED audit", audit["status"] if audit else "missing", audit.get("error_message") if audit else "No PBM orchestration audit was recorded.")
+                if not audit:
+                    _add_pending_assertion(assertions, f"CDP layer audit {load_id}", "completed audit", "not recorded yet")
+                else:
+                    _add_assertion(assertions, f"CDP layer audit {load_id} completed", audit["status"] == "COMPLETED", "COMPLETED audit", audit["status"], audit.get("error_message") or "CDP audit did not complete cleanly.")
                 if audit:
                     _add_assertion(assertions, f"PBM membership rows processed {load_id}", audit["membership_records_failed"] == 0 and audit["membership_records_processed"] == audit["membership_records_read"], audit["membership_records_read"], audit["membership_records_processed"])
                     _add_assertion(assertions, f"PBM prescription rows processed {load_id}", audit["prescription_records_failed"] == 0 and audit["prescription_records_processed"] == audit["prescription_records_read"], audit["prescription_records_read"], audit["prescription_records_processed"])
@@ -4261,9 +4717,11 @@ def _execute_case_against_bronze(conn, run_id: str, generation_id: str, test_cas
                 silver_prescriptions = conn.execute("SELECT prescription_id,member_id,status,eligible_ind,refills_remaining,next_refill_date,drug_name,strength FROM silverbox.prescription WHERE load_id=%s ORDER BY prescription_id", (load_id,)).fetchall()
                 silver_actual["members"].extend([dict(item) for item in silver_members])
                 silver_actual["prescriptions"].extend([dict(item) for item in silver_prescriptions])
-                event_members = payload.get("data", {}).get("members", [])
-                expected_member_ids = sorted(item["person"]["resourceID"] for item in event_members)
-                expected_rx = sorted(rx["resourceID"] for item in event_members for rx in item["prescription"])
+                is_event_payload = payload.get("type") == "pharmacy.orders.v1.sample-notification"
+                event_members = payload.get("data", {}).get("members", []) if is_event_payload else []
+                domain_expected = expected_domain_by_case.get(test_case_id, {})
+                expected_member_ids = sorted(item["person"]["resourceID"] for item in event_members) if is_event_payload else ([domain_expected["member_id"]] if domain_expected.get("member_id") else [])
+                expected_rx = sorted(rx["resourceID"] for item in event_members for rx in item["prescription"]) if is_event_payload else ([domain_expected["prescription_id"]] if domain_expected.get("prescription_id") else [])
                 _add_assertion(assertions, f"Silver member IDs match event {load_id}", sorted(item["member_id"] for item in silver_members) == expected_member_ids, expected_member_ids, sorted(item["member_id"] for item in silver_members))
                 _add_assertion(assertions, f"Silver prescription IDs match event {load_id}", sorted(item["prescription_id"] for item in silver_prescriptions) == expected_rx, expected_rx, sorted(item["prescription_id"] for item in silver_prescriptions))
                 silver_preferences = conn.execute(
@@ -4284,7 +4742,8 @@ def _execute_case_against_bronze(conn, run_id: str, generation_id: str, test_cas
                     ) if destination
                 )
                 actual_preferences = sorted((item["member_id"], item["channel"].upper(), item["value"], item["enabled"]) for item in silver_preferences)
-                _add_assertion(assertions, f"Silver communication preferences match event {load_id}", actual_preferences == expected_preferences, expected_preferences, actual_preferences)
+                if is_event_payload:
+                    _add_assertion(assertions, f"Silver communication preferences match event {load_id}", actual_preferences == expected_preferences, expected_preferences, actual_preferences)
                 actual_rx = {item["prescription_id"]: item for item in silver_prescriptions}
                 for event_member in event_members:
                     member_id = event_member["person"]["resourceID"]
@@ -4299,81 +4758,137 @@ def _execute_case_against_bronze(conn, run_id: str, generation_id: str, test_cas
                             _assert_equal_if_present(assertions, f"{prefix} refill date", expected.get("nextRefillDate"), str(actual["next_refill_date"]) if actual["next_refill_date"] else None)
                             _assert_equal_if_present(assertions, f"{prefix} drug", expected["drug"]["name"], actual["drug_name"])
                             _assert_equal_if_present(assertions, f"{prefix} strength", expected["drug"]["strength"], actual["strength"])
+                if not is_event_payload:
+                    if row["entity_name"] == "membership":
+                        actual_member = next((item for item in silver_members if item["member_id"] == payload.get("member_id")), None)
+                        _add_assertion(assertions, f"Silver member {payload.get('member_id')} exists", bool(actual_member), payload.get("member_id"), actual_member.get("member_id") if actual_member else None)
+                        if actual_member:
+                            for key in ("first_name", "last_name", "status"):
+                                _assert_equal_if_present(assertions, f"Silver member {key}", payload.get(key), actual_member.get(key))
+                    elif row["entity_name"] == "prescription":
+                        actual_prescription = next((item for item in silver_prescriptions if item["prescription_id"] == payload.get("prescription_id")), None)
+                        _add_assertion(assertions, f"Silver prescription {payload.get('prescription_id')} exists", bool(actual_prescription), payload.get("prescription_id"), actual_prescription.get("prescription_id") if actual_prescription else None)
+                        if actual_prescription:
+                            for key in ("member_id", "eligible_ind", "refills_remaining", "next_refill_date", "drug_name", "strength"):
+                                expected_value = payload.get(key)
+                                if key == "next_refill_date" and expected_value:
+                                    expected_value = str(expected_value)
+                                actual_value = actual_prescription.get(key)
+                                if key == "next_refill_date" and actual_value:
+                                    actual_value = str(actual_value)
+                                _assert_equal_if_present(assertions, f"Silver prescription {key}", expected_value, actual_value)
+                    elif str(row["entity_name"]).lower() == "test_dataset":
+                        member_payload = payload.get("membership") or {}
+                        prescription_payload = payload.get("prescription") or {}
+                        actual_member = next((item for item in silver_members if item["member_id"] == member_payload.get("member_id")), None)
+                        actual_prescription = next((item for item in silver_prescriptions if item["prescription_id"] == prescription_payload.get("prescription_id")), None)
+                        _add_assertion(assertions, f"Silver member {member_payload.get('member_id')} exists", bool(actual_member), member_payload.get("member_id"), actual_member.get("member_id") if actual_member else None)
+                        _add_assertion(assertions, f"Silver prescription {prescription_payload.get('prescription_id')} exists", bool(actual_prescription), prescription_payload.get("prescription_id"), actual_prescription.get("prescription_id") if actual_prescription else None)
+                        if actual_member:
+                            for key in ("first_name", "last_name", "status"):
+                                _assert_equal_if_present(assertions, f"Silver member {key}", member_payload.get(key), actual_member.get(key))
+                        if actual_prescription:
+                            for key in ("member_id", "eligible_ind", "refills_remaining", "next_refill_date", "drug_name", "strength"):
+                                expected_value = prescription_payload.get(key)
+                                actual_value = actual_prescription.get(key)
+                                if key == "next_refill_date":
+                                    expected_value = str(expected_value) if expected_value else None
+                                    actual_value = str(actual_value) if actual_value else None
+                                _assert_equal_if_present(assertions, f"Silver prescription {key}", expected_value, actual_value)
         expected_records.append({
             "record_id": row["record_id"],
             "entity_name": row["entity_name"],
             "payload": payload,
             "pre_steps": json.loads(row["pre_steps_json"] or "[]"),
         })
+    gold_actual, transport_actual = _validate_gold_transport(conn, rows, generation_id, test_case_id, assertions)
     completed_at = now()
     failed = [item for item in assertions if item["status"] == "failed"]
-    status = "failed" if failed else "passed"
-    error = "; ".join(item["name"] for item in failed[:5]) if failed else None
+    pending = [item for item in assertions if item["status"] == "pending"]
+    status = "failed" if failed else "pending" if pending else "passed"
+    error = "; ".join(item["name"] for item in failed[:5]) if failed else "Waiting for CDP: " + "; ".join(item["name"] for item in pending[:5]) if pending else None
     result_id = "xres_" + hashlib.sha256(f"{run_id}:{test_case_id}".encode("utf-8")).hexdigest()[:24]
     conn.execute(
         "INSERT INTO test_execution_result (result_id,run_id,generation_id,test_case_id,status,expected_json,actual_json,assertions_json,bronze_refs_json,started_at,completed_at,error) "
         "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
         "ON CONFLICT (run_id, test_case_id) DO UPDATE SET status=EXCLUDED.status,expected_json=EXCLUDED.expected_json,actual_json=EXCLUDED.actual_json,assertions_json=EXCLUDED.assertions_json,bronze_refs_json=EXCLUDED.bronze_refs_json,started_at=EXCLUDED.started_at,completed_at=EXCLUDED.completed_at,error=EXCLUDED.error",
-        (result_id, run_id, generation_id, test_case_id, status, json.dumps({"records": expected_records}, sort_keys=True), json.dumps({"bronze_rows": actual_records, "silver": silver_actual}, sort_keys=True), json.dumps(assertions, sort_keys=True), json.dumps(all_refs, sort_keys=True), started_at, completed_at, error),
+        (result_id, run_id, generation_id, test_case_id, status, json.dumps({"records": expected_records}, sort_keys=True), json.dumps({"bronze_rows": actual_records, "silver": silver_actual, "gold": gold_actual, "transport": transport_actual}, sort_keys=True), json.dumps(assertions, sort_keys=True), json.dumps(all_refs, sort_keys=True), started_at, completed_at, error),
     )
     return status
 
 @app.post("/api/v1/test-case-generations/{generation_id}/test-data/save")
-def save_test_data_to_bronze(generation_id: str):
-    if not DATABASE_URL:
-        raise HTTPException(503, f"Bronze insertion requires PostgreSQL and the {BRONZE_SCHEMA} schema")
-    saved = []
+def save_test_data_to_bronze(generation_id: str, request: TestDataSubmitRequest):
     with connection() as conn:
-        pbm_objects = conn.execute("""SELECT to_regclass('testiq.ingestion_load') AS load_table,
-            to_regclass('testiq.ingestion_load_id_seq') AS load_sequence,
-            to_regclass('bronzebox.membership') AS membership_table,
-            to_regclass('bronzebox.prescription') AS prescription_table,
-            to_regclass('silverbox.member') AS silver_member_table,
-            to_regclass('silverbox.prescription') AS silver_prescription_table,
-            to_regprocedure('testiq.process_bronze_load_to_silver(text,text)') AS promote_procedure""").fetchone()
-        if not all(pbm_objects.values()):
-            raise HTTPException(503, "PBM Bronze/Silver integration objects are unavailable in the shared database. Check database connectivity and the PBM ingestion service readiness.")
         generation = conn.execute("SELECT * FROM test_case_generation WHERE generation_id=%s", (generation_id,)).fetchone()
         if not generation:
             raise HTTPException(404, "Test-case generation run not found")
         generation_contract = json.loads(generation["contract_json"])
         cases = {case.get("test_case_id"): case for case in generation_contract.get("test_cases", [])}
-        rows = conn.execute("SELECT * FROM test_data_record WHERE generation_id=%s ORDER BY test_case_id,entity_name", (generation_id,)).fetchall()
+        if len(set(request.test_case_ids)) != len(request.test_case_ids):
+            raise HTTPException(422, "Each selected test case must appear only once")
+        unknown_cases = sorted(set(request.test_case_ids) - set(cases))
+        if unknown_cases:
+            raise HTTPException(422, {"unknown_test_case_ids": unknown_cases})
+        rows = conn.execute("SELECT * FROM test_data_record WHERE generation_id=%s AND test_case_id=ANY(%s) ORDER BY test_case_id,entity_name", (generation_id, request.test_case_ids)).fetchall()
         if not rows:
-            raise HTTPException(404, "Generate test data before saving it to Bronze")
-        member_ids, phone_values, event_ids, correlations, event_times, validated_payloads = set(), set(), set(), set(), set(), {}
+            raise HTTPException(404, "Generate test data before saving it for CDP")
+        templates = {}
+        template_ids = sorted({row["template_id"] for row in rows})
+        if "bronze_test_dataset_v1" in template_ids:
+            template_ids = sorted(set(template_ids) | {"bronze_membership_v1", "bronze_prescription_v1"})
+        if template_ids:
+            for template_row in conn.execute("SELECT * FROM test_data_template WHERE template_id = ANY(%s)", (template_ids,)).fetchall():
+                templates[template_row["template_id"]] = {**row_dict(template_row), "payload": json.loads(template_row["payload_json"])}
+        validated_payloads = {}
+        records_by_case = {}
+        case_statuses = {case_id for case_id in request.test_case_ids}
+        if {row["test_case_id"] for row in rows} != case_statuses:
+            raise HTTPException(422, {"message": "Generate test data for every selected case before saving it for CDP", "missing_test_data": sorted(case_statuses - {row["test_case_id"] for row in rows})})
         for row in rows:
             test_case = cases.get(row["test_case_id"])
             if not test_case:
                 raise HTTPException(422, f"Approved test case {row['test_case_id']} is missing from its generation contract.")
             payload = json.loads(row["payload_json"])
-            if row["status"] != "saved":
-                payload = _stamp_pharmacy_event_fields(payload, generation_id, row["test_case_id"])
-                conn.execute("UPDATE test_data_record SET payload_json=%s,updated_at=%s WHERE record_id=%s", (json.dumps(payload, sort_keys=True), now(), row["record_id"]))
-            _validate_pharmacy_notification(payload, test_case, member_ids, phone_values, event_ids, correlations, event_times)
-            validated_payloads[row["record_id"]] = payload
-        for row in rows:
-            if row["status"] == "saved":
-                saved.append(_test_data_record_response(row))
-                continue
-            payload = validated_payloads[row["record_id"]]
-            bronze_rows = _bronze_rows_for_payload(payload, row)
-            if not bronze_rows:
-                raise HTTPException(422, f"No supported Bronze records could be derived for {row['test_case_id']} / {row['entity_name']}")
-            try:
-                if payload.get("type") == "pharmacy.orders.v1.sample-notification":
-                    load_id, bronze_refs = _insert_pbm_event_load(conn, payload, generation_id, row["test_case_id"], row)
+            if payload.get("type") == "pharmacy.orders.v1.sample-notification":
+                if row["status"] not in {"saved", "ready_for_cdp"}:
+                    payload = _stamp_pharmacy_event_fields(payload, generation_id, row["test_case_id"])
+                _validate_pharmacy_notification(payload, test_case)
+            else:
+                template = templates.get(row["template_id"])
+                if not template:
+                    raise HTTPException(422, f"Stored template {row['template_id']} is unavailable; regenerate this test data.")
+                _validate_domain_template_payload(payload, template, test_case)
+                if row["template_id"] == "bronze_test_dataset_v1":
+                    membership_template = templates.get("bronze_membership_v1")
+                    prescription_template = templates.get("bronze_prescription_v1")
+                    if not membership_template or not prescription_template:
+                        raise HTTPException(422, "The stored Membership or Prescription template is unavailable; regenerate this test data.")
+                    _validate_domain_template_payload(payload["membership"], membership_template, test_case)
+                    _validate_domain_template_payload(payload["prescription"], prescription_template, test_case, payload["membership"].get("member_id"))
                 else:
-                    load_id = f"testiq-{generation_id}"
-                    bronze_refs = [_insert_bronze_domain_row(conn, table, load_id, data) for table, data in bronze_rows]
-                _record_bronze_refs(conn, row, bronze_refs, load_id)
-            except Exception as exc:
-                raise HTTPException(503, f"Could not insert into {BRONZE_SCHEMA} Bronze tables: {exc}") from exc
-            bronze_ref_text = ",".join(f"{item['table']}:{item['id']}" for item in bronze_refs)
-            conn.execute("UPDATE test_data_record SET status='saved',bronze_raw_file_id=%s,updated_at=%s WHERE record_id=%s", (bronze_ref_text, now(), row["record_id"]))
-            row = conn.execute("SELECT r.* FROM test_data_record r WHERE r.record_id=%s", (row["record_id"],)).fetchone()
-            saved.append(_test_data_record_response(row))
-        return {"generation_id": generation_id, "saved_count": len(saved), "records": saved}
+                    records_by_case.setdefault(row["test_case_id"], {})[str(row["entity_name"]).lower()] = (row, payload, template)
+            validated_payloads[row["record_id"]] = payload
+        for case_id, items in records_by_case.items():
+            membership_item = items.get("membership")
+            prescription_item = items.get("prescription")
+            if not membership_item and _test_case_requires_membership(cases[case_id]):
+                raise HTTPException(422, f"Test case {case_id} requires Membership data before it can be queued for CDP.")
+            if not prescription_item and _test_case_requires_prescription(cases[case_id]):
+                raise HTTPException(422, f"Test case {case_id} requires Prescription data before it can be queued for CDP.")
+            if not membership_item and not prescription_item:
+                raise HTTPException(422, f"Test case {case_id} must have at least one Membership or Prescription record before it can be queued for CDP.")
+            if membership_item:
+                _validate_domain_template_payload(membership_item[1], membership_item[2], cases[case_id])
+            if prescription_item:
+                _validate_domain_template_payload(prescription_item[1], prescription_item[2], cases[case_id], membership_item[1].get("member_id") if membership_item else None)
+        staged = []
+        for row in rows:
+            payload = validated_payloads[row["record_id"]]
+            conn.execute("UPDATE test_data_record SET payload_json=%s,status='ready_for_cdp',updated_at=%s WHERE record_id=%s", (json.dumps(payload, sort_keys=True), now(), row["record_id"]))
+            saved_row = conn.execute("SELECT r.* FROM test_data_record r WHERE r.record_id=%s", (row["record_id"],)).fetchone()
+            staged.append(_test_data_record_response(saved_row))
+        return {"generation_id": generation_id, "saved_count": len(staged), "ready_case_count": len(case_statuses), "handoff_status": "ready_for_cdp", "records": staged}
+
 
 @app.get("/api/v1/requirement-analyses/{analysis_id}/review-audit")
 def list_requirement_review_audit(analysis_id: str):
