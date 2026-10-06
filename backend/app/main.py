@@ -6,10 +6,11 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadF
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from .config import BRONZE_SCHEMA, DATABASE_URL, EXTRACTION_CONFIG_VERSION, EXTRACTION_PROMPT_VERSION, LOCAL_EXTRACTOR_VERSION, MAX_UPLOAD_BYTES, OPENAI_MODEL, OPENAI_TIMEOUT_SECONDS, REQUIRED_BRD_SECTIONS, REQUIREMENTS_ANALYSIS_PROMPT_VERSION, SUPPORTED_EXTENSIONS, TEST_CASE_GENERATION_PROMPT_VERSION, UPLOAD_DIR
-from .db import connection, init_db
+from .openai_requests import responses_create
+from .db import close_connection_pool, connection, init_db, warm_connection_pool
 from .extractors import _json_sections, extract_local, extract_openai_file, extraction_prompt_hash, missing_sections
 from .validation import validate_file_content
-from .knowledge_fabric import BuildIndexRequest, build_knowledge_index, router as knowledge_fabric_router
+from .knowledge_fabric import router as knowledge_fabric_router
 from .knowledge_fabric import retrieve_package_context
 
 app = FastAPI(title="TestIQ Source Package API", version="1.0.0")
@@ -32,6 +33,54 @@ def _business_rule_impact(statement: str) -> str:
     if any(term in lowered for term in ("record", "status", "outcome")):
         return "QA cannot define an objective pass or fail result without this rule."
     return "The affected requirement and its acceptance criteria cannot be treated as fully testable without this rule."
+
+def _package_rule_id(package_id: str, business_requirement_id: str) -> str:
+    """Return a stable package-scoped ID for an LLM-extracted BRD rule."""
+    digest = hashlib.sha256(f"{package_id}:{business_requirement_id}".encode("utf-8")).hexdigest()[:24]
+    return f"rule_{digest}"
+
+def _replace_package_rules_from_business_requirements(conn, package_id: str, business_items: list[dict]) -> None:
+    """Make reviewed Business Use Cases the rule input for the Knowledge Base."""
+    if conn.execute("SELECT 1 FROM knowledge_index WHERE package_id=%s LIMIT 1", (package_id,)).fetchone():
+        raise HTTPException(409, "Business Use Cases are locked because this package already has a Knowledge Base version")
+    timestamp = now()
+    conn.execute("DELETE FROM package_business_rule WHERE package_id=%s", (package_id,))
+    for ordinal, item in enumerate(business_items, 1):
+        business_id = str(item.get("business_requirement_id") or f"BR-{ordinal:03d}")
+        statement = " ".join(str(item.get("description") or item.get("text") or "").split())
+        references = _merge_source_references(item.get("source_references"), item.get("supporting_source_references"))
+        reference = references[0] if references else {}
+        conn.execute(
+            "INSERT INTO package_business_rule (rule_id,package_id,ordinal,statement,source_fragment_id,source_reference,impact_if_missing,status,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,'pending',%s,%s)",
+            (_package_rule_id(package_id, business_id), package_id, ordinal, statement,
+             reference.get("fragment_id"), reference.get("source_reference") or "BRD source package",
+             _business_rule_impact(statement), timestamp, timestamp),
+        )
+    _refresh_package_business_rule_summary(conn, package_id)
+
+def _sync_business_requirement_rule_review(conn, package_id: str, contract: dict, reviewer: str, timestamp: str) -> dict | None:
+    """Persist Business Use Case review decisions into the package Knowledge Base gate."""
+    if not contract.get("business_requirements_generation"):
+        return None
+    existing = {row["rule_id"]: row_dict(row) for row in conn.execute(
+        "SELECT * FROM package_business_rule WHERE package_id=%s", (package_id,)
+    ).fetchall()}
+    for requirement in contract.get("requirements", []):
+        for rule in requirement.get("business_rules", []):
+            if not isinstance(rule, dict):
+                continue
+            package_rule_id = rule.get("package_rule_id") or _package_rule_id(package_id, str(rule.get("rule_id") or ""))
+            if package_rule_id not in existing:
+                continue
+            status = rule.get("review_status") or ("approved" if rule.get("approved") else "pending")
+            conn.execute(
+                "UPDATE package_business_rule SET statement=%s,status=%s,reviewer=%s,reviewed_at=%s,updated_at=%s WHERE rule_id=%s AND package_id=%s",
+                (" ".join(str(rule.get("text") or existing[package_rule_id]["statement"]).split()), status,
+                 reviewer, timestamp if status != "pending" else None, timestamp, package_rule_id, package_id),
+            )
+    _refresh_package_business_rule_summary(conn, package_id)
+    summary = _package_business_rule_response(conn, package_id)
+    return {"review_status": summary["review_status"], "counts": summary["counts"], "rules_reviewed_at": summary["rules_reviewed_at"]}
 
 def _ensure_package_business_rules(conn, package_id: str) -> None:
     if conn.execute("SELECT 1 FROM package_business_rule WHERE package_id=%s LIMIT 1", (package_id,)).fetchone():
@@ -57,26 +106,33 @@ def _ensure_package_business_rules(conn, package_id: str) -> None:
             rule_id = "rule_" + hashlib.sha256(f"{package_id}:{fragment['fragment_id']}:{statement}".encode()).hexdigest()[:24]
             source_reference = f"{fragment['logical_name']}@v{fragment['revision']} | {fragment['source_reference']}"
             conn.execute(
-                "INSERT INTO package_business_rule (rule_id,package_id,ordinal,statement,source_fragment_id,source_reference,impact_if_missing,status,reviewer,reviewed_at,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,'approved','system:auto',%s,%s,%s)",
-                (rule_id, package_id, ordinal, statement, fragment["fragment_id"], source_reference, _business_rule_impact(statement), timestamp, timestamp, timestamp),
+                "INSERT INTO package_business_rule (rule_id,package_id,ordinal,statement,source_fragment_id,source_reference,impact_if_missing,status,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,'pending',%s,%s)",
+                (rule_id, package_id, ordinal, statement, fragment["fragment_id"], source_reference, _business_rule_impact(statement), timestamp, timestamp),
             )
 
 def _refresh_package_business_rule_summary(conn, package_id: str) -> None:
     rules = [row_dict(row) for row in conn.execute("SELECT rule_id,statement,status,source_reference FROM package_business_rule WHERE package_id=%s ORDER BY ordinal", (package_id,)).fetchall()]
+    current = conn.execute("SELECT rule_review_status,rule_set_hash,rules_reviewed_at FROM source_package_manifest WHERE package_id=%s", (package_id,)).fetchone()
     timestamp = now()
     if not rules:
-        conn.execute("UPDATE source_package_manifest SET rule_review_status=%s,rule_set_hash=%s,rules_reviewed_at=%s WHERE package_id=%s",
-            ("approved", hashlib.sha256(f"{package_id}:no-rules".encode()).hexdigest(), timestamp, package_id))
+        conn.execute("UPDATE source_package_manifest SET rule_review_status=%s,rule_set_hash=NULL,rules_reviewed_at=NULL WHERE package_id=%s",
+            ("pending", package_id))
         return
+    approved = [rule for rule in rules if rule["status"] == "approved"]
+    review_complete = bool(approved) and not any(rule["status"] == "pending" for rule in rules)
     rule_set_hash = hashlib.sha256(json.dumps([{"rule_id": rule["rule_id"], "statement": rule["statement"], "status": rule["status"], "source_reference": rule["source_reference"]} for rule in rules], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    reviewed_at = (current["rules_reviewed_at"] if review_complete and current and current["rule_review_status"] == "approved"
+        and current["rule_set_hash"] == rule_set_hash else timestamp if review_complete else None)
     conn.execute("UPDATE source_package_manifest SET rule_review_status=%s,rule_set_hash=%s,rules_reviewed_at=%s WHERE package_id=%s",
-        ("approved", rule_set_hash, timestamp, package_id))
+        ("approved" if review_complete else "pending", rule_set_hash if review_complete else None, reviewed_at, package_id))
 
 def _package_business_rule_response(conn, package_id: str) -> dict:
     package = conn.execute("SELECT * FROM source_package_manifest WHERE package_id=%s", (package_id,)).fetchone()
     if not package:
         raise HTTPException(404, "Source package not found")
     _ensure_package_business_rules(conn, package_id)
+    _refresh_package_business_rule_summary(conn, package_id)
+    package = conn.execute("SELECT * FROM source_package_manifest WHERE package_id=%s", (package_id,)).fetchone()
     rules = [row_dict(row) for row in conn.execute("SELECT * FROM package_business_rule WHERE package_id=%s ORDER BY ordinal", (package_id,)).fetchall()]
     return {"package_id": package_id, "review_status": package["rule_review_status"], "rule_set_hash": package["rule_set_hash"],
             "rules_reviewed_at": package["rules_reviewed_at"], "rules": rules,
@@ -219,7 +275,7 @@ def _raise_test_case_generation_error(exc: Exception, operation: str):
         message = f"OpenAI failed during {operation}: {detail}. No local fallback was used; review the OpenAI configuration and retry."
     raise HTTPException(502, message) from exc
 
-def _rag_context_for_prompt(rag, max_evidence: int = 8, max_fragment_characters: int = 500, max_rules: int = 8, max_rule_characters: int = 260):
+def _rag_context_for_prompt(rag, max_evidence: int = 24, max_fragment_characters: int = 1200, max_rules: int = 50, max_rule_characters: int = 500):
     if not rag:
         return {}
     fragments = rag.get("brd_fragments", []) + rag.get("technical_fragments", [])
@@ -236,15 +292,6 @@ def _rag_context_for_prompt(rag, max_evidence: int = 8, max_fragment_characters:
          "text": str(item.get("fragment_text") or "")[:max_fragment_characters]} for item in fragments[:max_evidence]
     ]}
 
-def _build_knowledge_index_background(package_id: str) -> None:
-    try:
-        build_knowledge_index(package_id, BuildIndexRequest())
-    except Exception as exc:
-        print(f"Knowledge Base background build skipped for {package_id}: {safe_llm_error_message(exc)}")
-
-def _queue_knowledge_index_background(package_id: str) -> None:
-    threading.Thread(target=_build_knowledge_index_background, args=(package_id,), daemon=True).start()
-
 def requirements_analysis_config_hash() -> str:
     payload = {"model": OPENAI_MODEL, "timeout": OPENAI_TIMEOUT_SECONDS, "prompt_version": REQUIREMENTS_ANALYSIS_PROMPT_VERSION}
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
@@ -260,53 +307,47 @@ async def read_upload_with_limit(file: UploadFile) -> bytes:
     return b"".join(chunks)
 
 def process_extraction(revision_id, source_id, extraction_id, storage_path, filename, required_sections):
-    # Upload extraction always uses OpenAI; keep the model call in the background.
+    # Parse machine-readable documents locally first. OpenAI is reserved for
+    # scanned/image-only PDFs or files the deterministic parser cannot read.
     started_at = time.monotonic()
     with connection() as conn:
         source_row = conn.execute("SELECT source_type FROM source_document WHERE source_id=%s", (source_id,)).fetchone()
         source_type = source_row["source_type"] if source_row else None
-        conn.execute("UPDATE source_extraction SET mode=%s,status=%s WHERE extraction_id=%s", ("openai", "processing", extraction_id))
+        conn.execute("UPDATE source_extraction SET mode=%s,status=%s WHERE extraction_id=%s", ("local", "processing", extraction_id))
         conn.execute("UPDATE source_revision SET status=%s WHERE revision_id=%s", ("processing", revision_id))
-    mode = "openai"
+    mode = "local"
     try:
         content = Path(storage_path).read_bytes()
         fallback_message = None
-        if Path(filename).suffix.lower() == ".json":
-            # JSON documents already have machine-readable structure. Parse
-            # them exactly instead of paying for an LLM to transcribe the same
-            # 1:1 JSON, which can be slow and can alter source values.
+        local_started_at = time.monotonic()
+        try:
             text, sections = extract_local(filename, content)
-            mode = "local"
             logger.info(
-                "Source extraction used exact JSON parser revision=%s source_type=%s filename=%s size_bytes=%d fragments=%d duration_seconds=%.2f",
-                revision_id, source_type, filename, len(content), len(sections), time.monotonic() - started_at,
+                "Source extraction local parser completed revision=%s source_type=%s filename=%s size_bytes=%d fragments=%d duration_seconds=%.2f",
+                revision_id, source_type, filename, len(content), len(sections), time.monotonic() - local_started_at,
             )
-        else:
+        except Exception as local_error:
+            logger.info(
+                "Source extraction local parser requires OpenAI revision=%s filename=%s duration_seconds=%.2f reason=%s",
+                revision_id, filename, time.monotonic() - local_started_at, local_error,
+            )
             openai_started_at = time.monotonic()
             try:
                 text, sections = extract_openai_file(content, filename)
+                mode = "openai"
+                fallback_message = f"Local extraction was unavailable; OpenAI extraction was used: {local_error}"
                 logger.info(
                     "Source extraction OpenAI completed revision=%s filename=%s size_bytes=%d duration_seconds=%.2f",
                     revision_id, filename, len(content), time.monotonic() - openai_started_at,
                 )
             except Exception as openai_error:
-                logger.warning(
-                    "Source extraction OpenAI failed revision=%s filename=%s size_bytes=%d duration_seconds=%.2f error=%s",
+                logger.exception(
+                    "Source extraction OpenAI fallback failed revision=%s filename=%s size_bytes=%d duration_seconds=%.2f error=%s",
                     revision_id, filename, len(content), time.monotonic() - openai_started_at, openai_error,
                 )
-                fallback_started_at = time.monotonic()
-                try:
-                    text, sections = extract_local(filename, content)
-                    mode = "local"
-                    fallback_message = f"OpenAI extraction failed; local extraction was used: {openai_error}"
-                    logger.info(
-                        "Source extraction local fallback completed revision=%s filename=%s duration_seconds=%.2f",
-                        revision_id, filename, time.monotonic() - fallback_started_at,
-                    )
-                except Exception as local_error:
-                    raise RuntimeError(
-                        f"OpenAI extraction failed ({openai_error}); local extraction fallback failed ({local_error})"
-                    ) from local_error
+                raise RuntimeError(
+                    f"Local extraction failed ({local_error}); OpenAI extraction failed ({openai_error})"
+                ) from openai_error
         with connection() as conn:
             source = conn.execute("SELECT validation_messages FROM source_revision WHERE revision_id=%s", (revision_id,)).fetchone()
             messages = json.loads(source["validation_messages"] or "[]") if source else []
@@ -523,17 +564,19 @@ def _requirements_analysis_schema():
                         "actors": {"type": "array", "items": {"type": "string"}},
                         "entities": {"type": "array", "items": {"type": "string"}},
                         "business_rules": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": False, "properties": {"rule_id": {"type": "string", "pattern": "^BR-[0-9]{3}$"}, "text": {"type": "string"}, "source_references": references}, "required": ["rule_id", "text", "source_references"]}},
-                        "acceptance_criteria": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": False, "properties": {"acceptance_id": {"type": "string", "pattern": "^AC-[0-9]{3}$"}, "given": {"type": "string"}, "when": {"type": "string"}, "then": {"type": "string"}, "source_references": references}, "required": ["acceptance_id", "given", "when", "then", "source_references"]}},
+                        "acceptance_criteria": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": False, "properties": {"acceptance_id": {"type": "string", "pattern": "^AC-[0-9]{3}$"}, "scenario": {"type": "string"}, "given": {"type": "array", "minItems": 1, "items": {"type": "string"}}, "when": {"type": "string"}, "then": {"type": "string"}, "source_references": references}, "required": ["acceptance_id", "scenario", "given", "when", "then", "source_references"]}},
+                        "expected_outcomes": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": False, "properties": {"outcome_id": {"type": "string", "pattern": "^EO-[0-9]{3}$"}, "text": {"type": "string"}, "source_references": references}, "required": ["outcome_id", "text", "source_references"]}},
                         "flow_steps": {"type": "array", "minItems": 1, "items": {"type": "string"}},
                         "ambiguities": {"type": "array", "items": {"type": "string"}},
                         "assumptions": {"type": "array", "items": {"type": "string"}},
                         "source_references": references,
                     },
-                    "required": ["requirement_id", "title", "type", "statement", "priority", "actors", "entities", "business_rules", "acceptance_criteria", "flow_steps", "ambiguities", "assumptions", "source_references"],
+                    "required": ["requirement_id", "title", "type", "statement", "priority", "actors", "entities", "business_rules", "acceptance_criteria", "expected_outcomes", "flow_steps", "ambiguities", "assumptions", "source_references"],
                 },
             },
             "global_gaps": {"type": "array", "items": {"type": "string"}},
             "global_assumptions": {"type": "array", "items": {"type": "string"}},
+            "technical_gaps": {"type": "array", "items": {"type": "object", "additionalProperties": False, "properties": {"gap_id": {"type": "string", "pattern": "^TG-[0-9]{3}$"}, "text": {"type": "string"}, "technical_reference": {"type": "string"}, "source_references": references}, "required": ["gap_id", "text", "technical_reference", "source_references"]}},
             "conflicting_requirements": {"type": "array", "items": conflict},
             "readiness": {
                 "type": "object",
@@ -547,7 +590,7 @@ def _requirements_analysis_schema():
                 "required": ["status", "journey", "checks", "gaps"],
             },
         },
-        "required": ["requirements", "global_gaps", "global_assumptions", "conflicting_requirements", "readiness"],
+        "required": ["requirements", "global_gaps", "global_assumptions", "technical_gaps", "conflicting_requirements", "readiness"],
     }
 
 def _contract_readiness(contract):
@@ -558,6 +601,7 @@ def _contract_readiness(contract):
         {"check_id": "RD-002", "label": "Acceptance criteria", "status": "passed" if requirements and all(item.get("acceptance_criteria") for item in requirements) else "gap", "details": "Every requirement should include acceptance criteria."},
         {"check_id": "RD-003", "label": "Business rules", "status": "passed" if requirements and all(item.get("business_rules") for item in requirements) else "gap", "details": "Every requirement should include business rules."},
         {"check_id": "RD-004", "label": "Source traceability", "status": "passed" if source_refs else "gap", "details": "Requirements should retain source references back to package fragments."},
+        {"check_id": "RD-005", "label": "Expected outcomes", "status": "passed" if requirements and all(item.get("expected_outcomes") for item in requirements) else "gap", "details": "Every requirement should include at least one observable expected outcome."},
     ]
     gaps = [check["details"] for check in checks if check["status"] == "gap"]
     if any(check["status"] == "gap" for check in checks):
@@ -641,8 +685,19 @@ def _validate_requirements_contract(contract, fragments):
                 raise ValueError(f"AI returned an unknown source reference for {label}")
             # Store the exact database values even if the model changed the
             # display formatting of the source reference.
-            ref["fragment_id"] = fragment["fragment_id"]
-            ref["source_reference"] = fragment["source_reference"]
+            ref.update({field: fragment.get(field) for field in (
+                "fragment_id", "source_id", "revision_id", "source_type", "source_reference",
+                "heading", "content_hash",
+            ) if fragment.get(field) is not None})
+
+    def validate_supported_numbers(value, refs, label):
+        evidence_text = " ".join(
+            str(fragments_by_id.get(ref.get("fragment_id"), {}).get("fragment_text") or "")
+            for ref in refs or []
+        )
+        for number in re.findall(r"\b\d+(?:\.\d+)?\b", str(value or "")):
+            if not re.search(rf"\b{re.escape(number)}\b", evidence_text):
+                raise ValueError(f"AI introduced an unsupported numeric value in {label}: {number}")
 
     for requirement in contract["requirements"]:
         requirement_id = requirement.get("requirement_id")
@@ -650,6 +705,7 @@ def _validate_requirements_contract(contract, fragments):
             raise ValueError("AI returned an invalid or duplicate requirement")
         seen_ids.add(requirement_id)
         validate_refs(requirement.get("source_references"), requirement_id)
+        validate_supported_numbers(requirement.get("statement"), requirement.get("source_references"), requirement_id)
         if not requirement.get("business_rules"):
             raise ValueError(f"AI returned no business rules for {requirement_id}")
         if not requirement.get("acceptance_criteria"):
@@ -663,21 +719,52 @@ def _validate_requirements_contract(contract, fragments):
             if not criterion.get("given") or not criterion.get("when") or not criterion.get("then"):
                 raise ValueError(f"AI returned an invalid acceptance criterion for {requirement_id}")
             validate_refs(criterion.get("source_references"), criterion.get("acceptance_id", requirement_id))
+            given_text = "; ".join(criterion.get("given", [])) if isinstance(criterion.get("given"), list) else str(criterion.get("given") or "")
+            validate_supported_numbers(" ".join([given_text, criterion.get("when", ""), criterion.get("then", "")]), criterion.get("source_references"), criterion.get("acceptance_id", requirement_id))
+        if not requirement.get("expected_outcomes"):
+            raise ValueError(f"AI returned no expected outcomes for {requirement_id}")
+        for outcome in requirement.get("expected_outcomes", []):
+            if not outcome.get("text"):
+                raise ValueError(f"AI returned an empty expected outcome for {requirement_id}")
+            validate_refs(outcome.get("source_references"), outcome.get("outcome_id", requirement_id))
+            validate_supported_numbers(outcome.get("text"), outcome.get("source_references"), outcome.get("outcome_id", requirement_id))
     for conflict in contract.get("conflicting_requirements", []):
         if not conflict.get("description"):
             raise ValueError("AI returned an invalid conflict")
         validate_refs(conflict.get("source_references"), conflict.get("conflict_id", "conflict"))
+    for gap in contract.get("technical_gaps", []):
+        if not gap.get("text"):
+            raise ValueError("AI returned an empty technical gap")
+        validate_refs(gap.get("source_references"), gap.get("gap_id", "technical gap"))
+        exact_references = {ref.get("source_reference") for ref in gap.get("source_references", [])}
+        if gap.get("technical_reference") not in exact_references:
+            raise ValueError(f"AI returned an unsupported technical reference for {gap.get('gap_id', 'technical gap')}")
 
 def _requirements_contract_with_openai(package, items, fragments, rag_context=None):
     key = os.getenv("OPENAI_API_KEY")
     if not key:
         raise RuntimeError("OPENAI_API_KEY is not configured for Requirements Analysis")
     from openai import OpenAI
-    usable_fragments = [fragment for fragment in fragments if str(fragment.get("fragment_text") or "").strip()]
+    retrieved_evidence = (rag_context or {}).get("evidence") or []
+    if retrieved_evidence:
+        # Requirement generation is RAG-grounded: send and validate only the
+        # evidence selected by retrieval, rather than duplicating every source
+        # fragment and overflowing the model context window.
+        usable_fragments = [
+            {
+                "fragment_id": evidence.get("fragment_id"),
+                "source_reference": evidence.get("source_reference"),
+                "fragment_text": evidence.get("text"),
+            }
+            for evidence in retrieved_evidence
+            if evidence.get("fragment_id") and str(evidence.get("text") or "").strip()
+        ]
+    else:
+        usable_fragments = [fragment for fragment in fragments if str(fragment.get("fragment_text") or "").strip()]
     source_fragments = _analysis_source_references(usable_fragments)
     fragment_text = "\n".join(json.dumps({**ref, "text": str(fragment.get("fragment_text") or "")}, ensure_ascii=False) for ref, fragment in zip(source_fragments, usable_fragments))
     client = OpenAI(api_key=key, timeout=OPENAI_TIMEOUT_SECONDS)
-    response = client.responses.create(
+    response = responses_create(client,
         model=OPENAI_MODEL,
         input=REQUIREMENTS_ANALYSIS_PROMPT + "\n\nRETRIEVED KNOWLEDGE BASE EVIDENCE (supporting context; cite only original source fragment IDs):\n" + json.dumps(rag_context or {}, ensure_ascii=False) + "\n\nSOURCE FRAGMENTS:\n" + fragment_text,
         store=False,
@@ -686,7 +773,7 @@ def _requirements_contract_with_openai(package, items, fragments, rag_context=No
     if not response.output_text:
         raise ValueError("OpenAI returned no Requirements Analysis")
     contract = json.loads(response.output_text)
-    _validate_requirements_contract(contract, fragments)
+    _validate_requirements_contract(contract, usable_fragments)
     for requirement in contract["requirements"]:
         requirement["approved"] = False
         for rule in requirement.get("business_rules", []): rule["approved"] = False
@@ -806,16 +893,18 @@ def _merge_source_references(*collections):
         for ref in refs or []:
             if isinstance(ref, dict) and (ref.get("fragment_id") or ref.get("source_reference")):
                 key = (ref.get("fragment_id"), ref.get("source_reference"))
-                merged[key] = {"fragment_id": ref.get("fragment_id"), "source_reference": ref.get("source_reference")}
+                merged[key] = {field: ref.get(field) for field in (
+                    "fragment_id", "source_id", "revision_id", "source_type", "source_reference",
+                    "heading", "content_hash",
+                ) if ref.get(field) is not None}
     return list(merged.values())
 
 def _dedupe_business_rules(contract):
-    """Remove duplicate or near duplicate business rules while preserving traceability."""
-    seen = []
-    sequence = 1
+    """Remove duplicates inside an FR without changing approved Business Use Case IDs."""
     for requirement in contract.get("requirements", []) or []:
+        seen = []
         unique_rules = []
-        for rule in requirement.get("business_rules", []) or []:
+        for index, rule in enumerate(requirement.get("business_rules", []) or [], 1):
             if isinstance(rule, str):
                 rule = {"text": rule, "source_references": requirement.get("source_references", [])}
             text = str(rule.get("text") or "").strip()
@@ -832,10 +921,9 @@ def _dedupe_business_rules(contract):
             if duplicate:
                 duplicate["rule"]["source_references"] = _merge_source_references(duplicate["rule"].get("source_references"), rule.get("source_references"))
                 continue
-            rule["rule_id"] = f"BR-{sequence:03d}"
+            rule["rule_id"] = str(rule.get("rule_id") or f"BR-{index:03d}")
             rule["text"] = text
             rule["source_references"] = _merge_source_references(rule.get("source_references"), requirement.get("source_references"))
-            sequence += 1
             unique_rules.append(rule)
             seen.append({"signature": " ".join(sorted(tokens)), "tokens": tokens, "rule": rule})
         requirement["business_rules"] = unique_rules
@@ -869,8 +957,6 @@ def _clean_requirement_contract(contract):
             contract[key] = [item for item in contract.get(key, []) if item not in GENERIC_ANALYSIS_NOTICE_TEXTS]
     if isinstance(contract.get("readiness"), dict):
         contract["readiness"]["gaps"] = [item for item in contract["readiness"].get("gaps", []) if item not in GENERIC_ANALYSIS_NOTICE_TEXTS]
-    for requirement in contract.get("requirements", []):
-        requirement.pop("expected_outcomes", None)
     return contract
 
 def _analysis_response(row, discovery_context_count=0):
@@ -893,6 +979,10 @@ def _review_items(contract):
             if isinstance(criterion, str):
                 requirement["acceptance_criteria"][index - 1] = criterion = {"acceptance_id": f"AC-{index}", "text": criterion, "approved": False}
             items.append((f"{requirement_id}:{criterion.get('acceptance_id', f'AC-{index}')}", criterion, "acceptance_criterion"))
+        for index, outcome in enumerate(requirement.get("expected_outcomes", []), 1):
+            if isinstance(outcome, str):
+                requirement["expected_outcomes"][index - 1] = outcome = {"outcome_id": f"EO-{index}", "text": outcome, "approved": False}
+            items.append((f"{requirement_id}:{outcome.get('outcome_id', f'EO-{index}')}", outcome, "expected_outcome"))
     return items
 
 def _approved_requirement_payload(contract):
@@ -912,7 +1002,12 @@ def _approved_requirement_payload(contract):
             rule_id = rule.get("rule_id") if isinstance(rule, dict) else None
             if rule_id and (f"{requirement_id}:{rule_id}" in approved_ids or rule.get("review_status") == "approved"):
                 rules.append(rule)
-        approved.append({"requirement_id": requirement_id, "title": requirement.get("title"), "type": requirement.get("type"), "statement": requirement.get("statement"), "priority": requirement.get("priority"), "actors": requirement.get("actors", []), "entities": requirement.get("entities", []), "flow_steps": requirement.get("flow_steps", []), "acceptance_criteria": criteria, "business_rules": rules, "source_references": requirement.get("source_references", [])})
+        outcomes = []
+        for outcome in requirement.get("expected_outcomes", []):
+            outcome_id = outcome.get("outcome_id") if isinstance(outcome, dict) else None
+            if outcome_id and (f"{requirement_id}:{outcome_id}" in approved_ids or outcome.get("review_status") == "approved"):
+                outcomes.append(outcome)
+        approved.append({"requirement_id": requirement_id, "title": requirement.get("title"), "type": requirement.get("type"), "statement": requirement.get("statement"), "priority": requirement.get("priority"), "actors": requirement.get("actors", []), "entities": requirement.get("entities", []), "flow_steps": requirement.get("flow_steps", []), "acceptance_criteria": criteria, "expected_outcomes": outcomes, "business_rules": rules, "source_references": requirement.get("source_references", [])})
     return approved
 
 def _test_case_generation_schema():
@@ -1329,7 +1424,7 @@ def _test_cases_with_openai(approved_requirements, package, requested_count, dis
                     f"Validation error: {previous_error}\n"
                     f"Previous invalid response: {json.dumps(previous_invalid_output, ensure_ascii=False) if previous_invalid_output is not None else 'unavailable'}"
                 )
-            response = client.responses.create(model=OPENAI_MODEL, input=request_prompt, store=False, text={"format": {"type": "json_schema", "name": "test_case_contract", "strict": True, "schema": _test_case_generation_schema()}})
+            response = responses_create(client, model=OPENAI_MODEL, input=request_prompt, store=False, text={"format": {"type": "json_schema", "name": "test_case_contract", "strict": True, "schema": _test_case_generation_schema()}})
             if not response.output_text:
                 raise ValueError("OpenAI returned no test cases")
             contract = json.loads(response.output_text)
@@ -1596,7 +1691,10 @@ def _audit_response(row):
     return result
 
 @app.on_event("startup")
-def startup(): init_db()
+def startup(): warm_connection_pool()
+
+@app.on_event("shutdown")
+def shutdown(): close_connection_pool()
 
 @app.get("/health")
 def health(): return {"status": "ok", "service": "source-package"}
@@ -1852,8 +1950,7 @@ def create_manifest(project_id: str, request: ManifestRequest, background_tasks:
             items.append({"source_id": source["source_id"], "revision_id": revision["revision_id"], "ingestion_status": revision["extraction_status"], "content_hash": revision["sha256"], "model_name": revision["model_name"], "prompt_version": revision["prompt_version"], "config_version": revision["config_version"], "extractor_version": revision["extractor_version"], "prompt_hash": revision["prompt_hash"], "config_hash": revision["config_hash"]})
         _ensure_package_business_rules(conn, package_id)
         _refresh_package_business_rule_summary(conn, package_id)
-        background_tasks.add_task(_queue_knowledge_index_background, package_id)
-        return {"package_id": package_id, "project_id": project_id, "package_version": version, "package_name": package_name, "scope": request.scope, "manifest_hash": manifest_hash, "lifecycle_status": "ready", "run_id": run_id, "knowledge_build_status": "queued", "items": items}
+        return {"package_id": package_id, "project_id": project_id, "package_version": version, "package_name": package_name, "scope": request.scope, "manifest_hash": manifest_hash, "lifecycle_status": "ready", "run_id": run_id, "knowledge_build_status": "awaiting_rule_review", "items": items}
 
 @app.get("/api/v1/projects/{project_id}/manifests")
 def list_manifests(project_id: str):
@@ -2085,6 +2182,7 @@ def _business_requirements_to_review_contract(package, items, business_items, mo
     rules = [
         {
             "rule_id": item["business_requirement_id"],
+            "package_rule_id": _package_rule_id(package["package_id"], item["business_requirement_id"]),
             "text": item["description"],
             "business_use_case": item.get("business_use_case") or item["description"],
             "priority": item.get("priority") or "Must have",
@@ -2198,7 +2296,7 @@ def _business_requirements_with_openai(package, items, fragments, rag_context=No
             "If a precise anchor is not obvious, choose the nearest anchor from the same source document and heading.\n\nINPUT JSON:\n"
             + json.dumps(payload, ensure_ascii=False)
         )
-        response = client.responses.create(
+        response = responses_create(client,
             model=OPENAI_MODEL,
             input=prompt,
             store=False,
@@ -2278,6 +2376,15 @@ def _generate_functional_contract(package, items, fragments, approved_business_r
         if ref.get("fragment_id")
     }
     allowed_fragments = [item for item in fragments if item.get("fragment_id") in evidence_ids | approved_reference_ids]
+    fragment_metadata = {item.get("fragment_id"): item for item in allowed_fragments}
+    for business in approved_business_requirements:
+        for ref in business.get("source_references", []):
+            fragment = fragment_metadata.get(ref.get("fragment_id"))
+            if fragment:
+                ref.update({field: fragment.get(field) for field in (
+                    "fragment_id", "source_id", "revision_id", "source_type", "source_reference",
+                    "heading", "content_hash",
+                ) if fragment.get(field) is not None})
     from openai import OpenAI
     payload = {
         "approved_business_use_cases": approved_business_requirements,
@@ -2288,7 +2395,9 @@ def _generate_functional_contract(package, items, fragments, approved_business_r
         "The approved business use cases define the allowed scope. Use the Knowledge Base to provide the package context, system behavior, entities, rules, and implementation detail needed to make each requirement testable. "
         "Do not use or infer from any other package sources or structured context. Do not expand scope beyond approved use cases. "
         "Every requirement must link to one or more supplied business_requirement_ids and cite only source fragments from the approved use cases or retrieved Knowledge Base evidence. "
-        "Set knowledge_context_ids to an empty array; cite Knowledge Base evidence using source_references. Create clear system behaviors, business rules, flow steps, and testable acceptance criteria. Do not return unapproved business use cases.\n\nINPUT JSON:\n"
+        "Set knowledge_context_ids to an empty array; cite Knowledge Base evidence using source_references. Create clear system behaviors, business rules, flow steps, testable acceptance criteria, and at least one observable expected outcome for every requirement. "
+        "Each acceptance criterion must include a concise scenario and one or more Given conditions. Report a technical gap only when retrieved technical evidence directly supports it, and copy the exact source_reference into technical_reference. "
+        "Do not introduce thresholds, values, or behavior that are absent from the cited evidence. Do not return unapproved business use cases.\n\nINPUT JSON:\n"
         + json.dumps(payload, ensure_ascii=False)
     )
     client = OpenAI(api_key=key, timeout=OPENAI_TIMEOUT_SECONDS)
@@ -2304,7 +2413,7 @@ def _generate_functional_contract(package, items, fragments, approved_business_r
                 "and retrieved Knowledge Base evidence. Do not cite acceptance-criterion IDs or invent evidence IDs. "
                 f"Validation error: {validation_error}\n\nPREVIOUS INVALID RESPONSE:\n{previous_output}\n\nORIGINAL INPUT:\n{prompt}"
             )
-        response = client.responses.create(
+        response = responses_create(client,
             model=OPENAI_MODEL,
             input=repair_prompt,
             store=False,
@@ -2331,16 +2440,37 @@ def _generate_functional_contract(package, items, fragments, approved_business_r
                 ) from exc
     contract["generation_attempts"] = attempt + 1
     for requirement in contract["requirements"]:
+        requirement["approved"] = False
+        requirement["review_status"] = "pending"
         requirement["business_rules"] = [
-            {"rule_id": business["business_requirement_id"], "text": business["text"], "approved": True, "review_status": "approved", "source_references": business.get("source_references", [])}
+            {"rule_id": business["business_requirement_id"], "text": business["text"], "approved": True, "review_status": "approved", "mapping_basis": "Linked by the Functional Requirement generator to an approved Business Use Case", "origin": "approved_business_use_case", "source_references": business.get("source_references", [])}
             for business in approved_business_requirements if business["business_requirement_id"] in requirement["business_requirement_ids"]
         ]
+        for criterion in requirement.get("acceptance_criteria", []):
+            criterion.update({"text": criterion.get("then", ""), "approved": False, "review_status": "pending", "origin": "openai_rag_draft"})
+        for outcome in requirement.get("expected_outcomes", []):
+            outcome.update({"approved": False, "review_status": "pending", "origin": "openai_rag_draft"})
+        requirement["origin"] = "openai_rag_draft"
+    rag_metadata = rag_context.get("rag_metadata") or {}
+    input_fragment_hash = hashlib.sha256(json.dumps({
+        "fragments": [{"fragment_id": item.get("fragment_id"), "content_hash": item.get("content_hash")} for item in allowed_fragments],
+        "approved_business_use_cases": [{"business_requirement_id": item.get("business_requirement_id"), "text": item.get("text")} for item in approved_business_requirements],
+        "model": OPENAI_MODEL,
+        "prompt_version": REQUIREMENTS_ANALYSIS_PROMPT_VERSION,
+        "rag": rag_metadata,
+    }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
     contract.update({
-        "contract_version": "1.0", "package_id": package["package_id"], "project_id": package["project_id"], "package_scope": package.get("scope"),
+        "contract_version": "1.1", "document_type": "functional_requirement_analysis", "schema_version": "testiq.functional-requirements.v1",
+        "package_id": package["package_id"], "project_id": package["project_id"], "package_scope": package.get("scope"),
         "accepted_assumptions": [], "source_package_items": [{"source_id": item["source_id"], "revision_id": item["revision_id"], "source_type": item["source_type"], "logical_name": item["logical_name"], "sha256": item["sha256"]} for item in items],
         "approved_business_requirements": approved_business_requirements, "knowledge_contexts": [],
-        "generated_at": now(), "generation_mode": "openai",
-        "generation_model": OPENAI_MODEL,
+        "generated_at": now(), "generation_mode": "openai_rag_grounded",
+        "generation_model": OPENAI_MODEL, "model_name": OPENAI_MODEL,
+        "model_response_id": getattr(response, "id", None), "prompt_version": REQUIREMENTS_ANALYSIS_PROMPT_VERSION,
+        "knowledge_index_id": rag_metadata.get("index_id"), "knowledge_index_config_hash": rag_metadata.get("index_config_hash"),
+        "retrieval_ids": rag_metadata.get("retrieval_ids", []), "rag_context_hash": rag_metadata.get("context_hash"),
+        "rag_trace": rag_metadata, "input_fragment_hash": input_fragment_hash,
+        "quality_controls": {"strict_json_schema": True, "source_citations_required": True, "approved_business_use_cases_only": True, "unsupported_numeric_values_rejected": True, "automatic_validation_retry": True, "openai_response_storage": False},
         "functional_requirements_generation": True,
     })
     contract["readiness"] = _contract_readiness(contract)
@@ -2375,37 +2505,42 @@ def generate_functional_requirements(package_id: str):
                     if approved:
                         break
         if not approved:
-            raise HTTPException(409, "Approve at least one Business Requirement before generating Functional Requirements")
-        if not os.getenv("OPENAI_API_KEY"):
-            raise HTTPException(503, "Functional Requirements generation requires OpenAI. OPENAI_API_KEY is not configured; add a valid key and retry. No local generation fallback is used.")
+            raise HTTPException(409, "Approve at least one Business Use Case before generating Functional Requirements")
         revision_ids = [item["revision_id"] for item in source_items]
         fragments = conn.execute(f"SELECT * FROM source_fragment WHERE revision_id IN ({','.join('%s' for _ in revision_ids)}) ORDER BY revision_id,fragment_index", revision_ids).fetchall()
+        package_row = row_dict(package)
         item_rows = [row_dict(item) for item in source_items]
         fragment_rows = [row_dict(fragment) for fragment in fragments]
-        try:
-            rag = _require_package_context(package_id, requested_by="Functional Requirements")
-        except HTTPException as exc:
-            if exc.status_code in {409, 422, 502, 503}:
-                raise HTTPException(409, "Functional Requirements require a ready, approved Knowledge Base for this package. Build it or wait for its current build to finish, then retry.") from exc
-            raise
-        try:
-            contract = _generate_functional_contract(row_dict(package), item_rows, fragment_rows, approved, rag)
-        except Exception as exc:
-            detail = safe_llm_error_message(exc)
-            if isinstance(exc, TimeoutError):
-                message = "OpenAI timed out while generating Functional Requirements. Check service availability and retry."
-            elif "api key" in detail.lower() or "invalid_api_key" in detail.lower():
-                message = "OpenAI rejected the configured API key. Check OPENAI_API_KEY and retry."
-            elif isinstance(exc, ValueError):
-                message = f"OpenAI returned Functional Requirements that failed validation: {detail}. Review the model response or configuration and retry."
-            else:
-                message = f"OpenAI Functional Requirements generation failed: {detail}. No local fallback was used; review the OpenAI configuration and retry."
-            raise HTTPException(502, message) from exc
-        contract["rag_metadata"] = _rag_metadata_or_none(rag)
-        contract["rag_status"] = _rag_status(rag, required=True)
+        source_types = {item["revision_id"]: item["source_type"] for item in item_rows}
+        for fragment in fragment_rows:
+            fragment["source_type"] = source_types.get(fragment.get("revision_id"))
+    if not os.getenv("OPENAI_API_KEY"):
+        raise HTTPException(503, "Functional Requirement generation requires OpenAI. Configure OPENAI_API_KEY and retry.")
+    try:
+        rag = _require_package_context(package_id, requested_by="Functional Requirements")
+    except HTTPException as exc:
+        if exc.status_code in {409, 422, 502, 503}:
+            raise HTTPException(409, "Build the Knowledge Base for this Resource Package before generating Functional Requirements.") from exc
+        raise
+    try:
+        contract = _generate_functional_contract(package_row, item_rows, fragment_rows, approved, rag)
+    except Exception as exc:
+        detail = safe_llm_error_message(exc)
+        if isinstance(exc, TimeoutError):
+            message = "OpenAI timed out while generating Functional Requirements. Check service availability and retry."
+        elif "api key" in detail.lower() or "invalid_api_key" in detail.lower():
+            message = "OpenAI rejected the configured API key. Check OPENAI_API_KEY and retry."
+        elif isinstance(exc, ValueError):
+            message = f"OpenAI returned Functional Requirements that failed validation: {detail}. Review the model response or configuration and retry."
+        else:
+            message = f"OpenAI Functional Requirement generation failed: {detail}. Review the OpenAI configuration and retry."
+        raise HTTPException(502, message) from exc
+    contract["rag_metadata"] = _rag_metadata_or_none(rag)
+    contract["rag_status"] = _rag_status(rag, required=True)
+    with connection() as conn:
         version = conn.execute("SELECT COALESCE(MAX(analysis_version),0)+1 AS v FROM requirement_analysis WHERE package_id=%s", (package_id,)).fetchone()["v"]
         analysis_id, timestamp = uid("req"), now()
-        conn.execute("INSERT INTO requirement_analysis (analysis_id,package_id,project_id,analysis_version,status,contract_json,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", (analysis_id, package_id, package["project_id"], version, "needs_review", json.dumps(contract), timestamp, timestamp))
+        conn.execute("INSERT INTO requirement_analysis (analysis_id,package_id,project_id,analysis_version,status,analysis_kind,contract_json,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)", (analysis_id, package_id, package_row["project_id"], version, "needs_review", "functional", json.dumps(contract), timestamp, timestamp))
         return _analysis_response(conn.execute("SELECT * FROM requirement_analysis WHERE analysis_id=%s", (analysis_id,)).fetchone(), 0)
 
 
@@ -2419,41 +2554,42 @@ def generate_business_requirements(package_id: str):
         items = conn.execute("SELECT pi.*,s.logical_name,s.source_type,r.sha256,r.filename,e.status AS extraction_status,e.extracted_text AS extracted_text FROM source_package_item pi JOIN source_document s ON s.source_id=pi.source_id JOIN source_revision r ON r.revision_id=pi.revision_id LEFT JOIN source_extraction e ON e.revision_id=pi.revision_id WHERE pi.package_id=%s", (package_id,)).fetchall()
         not_ready = [item["logical_name"] for item in items if item["extraction_status"] != "succeeded"]
         if not_ready:
-            raise HTTPException(422, f"Business Requirements cannot be generated until extraction succeeds for: {', '.join(not_ready)}")
+            raise HTTPException(422, f"Business Use Cases cannot be generated until extraction succeeds for: {', '.join(not_ready)}")
         ids = [item["revision_id"] for item in items]
         fragments = conn.execute(f"SELECT * FROM source_fragment WHERE revision_id IN ({','.join('%s' for _ in ids)}) ORDER BY revision_id,fragment_index", ids).fetchall()
+        if conn.execute("SELECT 1 FROM knowledge_index WHERE package_id=%s LIMIT 1", (package_id,)).fetchone():
+            raise HTTPException(409, "Business Use Cases are locked because this package already has a Knowledge Base version")
+        package_row = row_dict(package)
         item_rows = [row_dict(item) for item in items]
         fragment_rows = [row_dict(fragment) for fragment in fragments]
-        if not os.getenv("OPENAI_API_KEY"):
-            raise HTTPException(503, "Business Use Case generation requires OpenAI. OPENAI_API_KEY is not configured; add a valid key and retry. No local generation fallback is used.")
-        try:
-            rag = _try_retrieve_package_context(package_id, requested_by="Business Requirements")
-        except Exception as exc:
-            print(f"Business Use Case Knowledge Base retrieval unavailable for {package_id}; using BRD-only input: {safe_llm_error_message(exc)}")
-            rag = None
-        if rag and not rag.get("brd_fragments"):
-            # Without retrieved BRD evidence, use the explicit BRD-only path.
-            rag = None
-        try:
-            business_items = _business_requirements_with_timeout(row_dict(package), item_rows, fragment_rows, rag)
-        except HTTPException:
-            raise
-        except Exception as exc:
-            detail = safe_llm_error_message(exc)
-            if isinstance(exc, TimeoutError):
-                message = "OpenAI timed out while generating Business Use Cases. Check service availability and retry."
-            elif "api key" in detail.lower() or "invalid_api_key" in detail.lower():
-                message = "OpenAI rejected the configured API key. Check OPENAI_API_KEY and retry."
-            else:
-                message = f"OpenAI could not generate Business Use Cases: {detail}. No local fallback was used; review the OpenAI configuration and retry."
-            raise HTTPException(502, message)
-        contract = _business_requirements_to_review_contract(row_dict(package), item_rows, business_items, "openai", OPENAI_MODEL)
-        contract["rag_metadata"] = _rag_metadata_or_none(rag)
-        contract["rag_status"] = _rag_status(rag, required=False)
+    if not os.getenv("OPENAI_API_KEY"):
+        raise HTTPException(503, "Business Use Case generation requires OpenAI. OPENAI_API_KEY is not configured; add a valid key and retry. No local generation fallback is used.")
+    try:
+        # Business Use Cases are the approved rule input to the Knowledge Base,
+        # so they are extracted directly from the BRD before RAG is available.
+        business_items = _business_requirements_with_timeout(package_row, item_rows, fragment_rows, None)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        detail = safe_llm_error_message(exc)
+        if isinstance(exc, TimeoutError):
+            message = "OpenAI timed out while generating Business Use Cases. Check service availability and retry."
+        elif "api key" in detail.lower() or "invalid_api_key" in detail.lower():
+            message = "OpenAI rejected the configured API key. Check OPENAI_API_KEY and retry."
+        else:
+            message = f"OpenAI could not generate Business Use Cases: {detail}. No local fallback was used; review the OpenAI configuration and retry."
+        raise HTTPException(502, message) from exc
+    contract = _business_requirements_to_review_contract(package_row, item_rows, business_items, "openai", OPENAI_MODEL)
+    contract["source_stage"] = "brd_rule_extraction"
+    contract["knowledge_base_input"] = True
+    contract["rag_metadata"] = None
+    contract["rag_status"] = {"used": False, "required": False, "message": "Generated from BRD source evidence before Knowledge Base creation. Approved rules become Knowledge Base input."}
+    with connection() as conn:
+        _replace_package_rules_from_business_requirements(conn, package_id, contract.get("business_requirements", []))
         version = conn.execute("SELECT COALESCE(MAX(analysis_version),0)+1 AS v FROM requirement_analysis WHERE package_id=%s", (package_id,)).fetchone()["v"]
         analysis_id, timestamp = uid("req"), now()
-        conn.execute("INSERT INTO requirement_analysis (analysis_id,package_id,project_id,analysis_version,status,contract_json,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", (analysis_id, package_id, package["project_id"], version, "needs_review", json.dumps(contract), timestamp, timestamp))
-        discovery_count = _discovery_context_count(conn, package["project_id"], package_id)
+        conn.execute("INSERT INTO requirement_analysis (analysis_id,package_id,project_id,analysis_version,status,analysis_kind,contract_json,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)", (analysis_id, package_id, package_row["project_id"], version, "needs_review", "business", json.dumps(contract), timestamp, timestamp))
+        discovery_count = _discovery_context_count(conn, package_row["project_id"], package_id)
         return _analysis_response(conn.execute("SELECT * FROM requirement_analysis WHERE analysis_id=%s", (analysis_id,)).fetchone(), discovery_count)
 
 
@@ -2466,28 +2602,25 @@ def analyze_requirements(package_id: str):
         if not_ready: raise HTTPException(422,f"Requirements cannot be analyzed until extraction succeeds for: {', '.join(not_ready)}")
         ids = [x["revision_id"] for x in items]
         fragments = conn.execute(f"SELECT * FROM source_fragment WHERE revision_id IN ({','.join('%s' for _ in ids)}) ORDER BY revision_id,fragment_index", ids).fetchall()
+        package_row = row_dict(package)
         item_rows = [row_dict(x) for x in items]
         fragment_rows = [row_dict(x) for x in fragments]
-        rag = _try_retrieve_package_context(package["package_id"], requested_by="Requirements Analysis")
-        if os.getenv("OPENAI_API_KEY"):
-            try:
-                contract = _requirements_contract_with_timeout(row_dict(package), item_rows, fragment_rows, _rag_context_for_prompt(rag))
-            except Exception as exc:
-                contract = _requirement_contract(row_dict(package), item_rows, fragment_rows)
-                contract["generation_note"] = f"LLM Requirements Analysis failed; local fallback was used: {safe_llm_error_message(exc)}"
-                contract.setdefault("global_gaps", []).append("LLM Requirements Analysis was unavailable, so this contract was generated with the local fallback.")
-                contract.setdefault("gaps", contract["global_gaps"])
-        else:
-            # Keep local development usable without a key, while making the
-            # fallback explicit in the persisted contract.
-            contract = _requirement_contract(row_dict(package), item_rows, fragment_rows)
-            contract["generation_note"] = "LLM Requirements Analysis was not run because OPENAI_API_KEY is not configured."
-        contract["rag_metadata"] = _rag_metadata_or_none(rag)
-        contract["rag_status"] = _rag_status(rag, required=False)
+    if not os.getenv("OPENAI_API_KEY"):
+        raise HTTPException(503, "Requirements Analysis requires OpenAI and an approved Knowledge Base. Configure OPENAI_API_KEY and retry.")
+    rag = _require_package_context(package_row["package_id"], requested_by="Requirements Analysis")
+    if not rag.get("brd_fragments"):
+        raise HTTPException(422, "Requirements Analysis requires retrieved BRD evidence from the approved Knowledge Base")
+    try:
+        contract = _requirements_contract_with_timeout(package_row, item_rows, fragment_rows, _rag_context_for_prompt(rag))
+    except Exception as exc:
+        raise HTTPException(502, f"RAG-grounded Requirements Analysis failed: {safe_llm_error_message(exc)}") from exc
+    contract["rag_metadata"] = _rag_metadata_or_none(rag)
+    contract["rag_status"] = _rag_status(rag, required=True)
+    with connection() as conn:
         version = conn.execute("SELECT COALESCE(MAX(analysis_version),0)+1 AS v FROM requirement_analysis WHERE package_id=%s", (package_id,)).fetchone()["v"]
         analysis_id, timestamp = uid("req"), now()
-        conn.execute("INSERT INTO requirement_analysis (analysis_id,package_id,project_id,analysis_version,status,contract_json,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", (analysis_id, package_id, package["project_id"], version, "needs_review", json.dumps(contract), timestamp, timestamp))
-        discovery_count = _discovery_context_count(conn, package["project_id"], package_id)
+        conn.execute("INSERT INTO requirement_analysis (analysis_id,package_id,project_id,analysis_version,status,analysis_kind,contract_json,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)", (analysis_id, package_id, package_row["project_id"], version, "needs_review", "analysis", json.dumps(contract), timestamp, timestamp))
+        discovery_count = _discovery_context_count(conn, package_row["project_id"], package_id)
         return _analysis_response(conn.execute("SELECT * FROM requirement_analysis WHERE analysis_id=%s", (analysis_id,)).fetchone(), discovery_count)
 
 @app.get("/api/v1/packages/{package_id}/requirements")
@@ -2496,6 +2629,41 @@ def list_requirement_analyses(package_id: str):
         package = conn.execute("SELECT * FROM source_package_manifest WHERE package_id=%s", (package_id,)).fetchone()
         discovery_count = _discovery_context_count(conn, package["project_id"], package_id) if package else 0
         return [_analysis_response(x, discovery_count) for x in conn.execute("SELECT * FROM requirement_analysis WHERE package_id=%s ORDER BY analysis_version DESC",(package_id,)).fetchall()]
+
+@app.get("/api/v1/packages/{package_id}/requirements/latest-set")
+def get_latest_requirement_analyses(package_id: str):
+    """Return only the latest Business Use Case and Functional Requirement artifacts."""
+    with connection() as conn:
+        business = functional = None
+        rows = conn.execute(
+            """SELECT * FROM (
+                   SELECT requirement_analysis.*,
+                          ROW_NUMBER() OVER (
+                              PARTITION BY analysis_kind
+                              ORDER BY analysis_version DESC
+                          ) AS kind_rank
+                   FROM requirement_analysis
+                   WHERE package_id=%s
+                     AND analysis_kind IN ('business','functional')
+               ) latest
+               WHERE kind_rank=1
+               ORDER BY analysis_version DESC""",
+            (package_id,),
+        ).fetchall()
+        if not rows:
+            package = conn.execute(
+                "SELECT package_id FROM source_package_manifest WHERE package_id=%s",
+                (package_id,),
+            ).fetchone()
+            if not package:
+                raise HTTPException(404, "Resource Package not found")
+        for row in rows:
+            response = _analysis_response(row, 0)
+            if row["analysis_kind"] == "functional":
+                functional = response
+            elif row["analysis_kind"] == "business":
+                business = response
+        return {"package_id": package_id, "business": business, "functional": functional}
 
 @app.get("/api/v1/requirement-analyses/{analysis_id}")
 def get_requirement_analysis(analysis_id: str):
@@ -2567,6 +2735,9 @@ def review_requirement_analysis(analysis_id: str, request: RequirementReviewRequ
             "contract_version": reviewed_contract_version,
             "reviewed_contract_hash": reviewed_contract_hash,
         }
+        rule_summary = _sync_business_requirement_rule_review(conn, row["package_id"], contract, request.reviewer, timestamp)
+        if rule_summary:
+            contract["knowledge_base_rule_status"] = rule_summary
         conn.execute("UPDATE requirement_analysis SET status=%s,contract_json=%s,reviewer=%s,review_decision=%s,review_comments=%s,reviewed_at=%s,updated_at=%s WHERE analysis_id=%s",(status,json.dumps(contract),request.reviewer,decision,request.comments,timestamp,timestamp,analysis_id))
         conn.execute("INSERT INTO requirement_review_audit (audit_id,analysis_id,package_id,project_id,reviewer,decision,comments,analysis_version,contract_version,reviewed_contract_hash,approved_items_json,rejected_items_json,pending_items_json,accepted_assumptions_json,resolved_gaps_json,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (uid("raudit"), analysis_id, row["package_id"], row["project_id"], request.reviewer, decision, request.comments, row["analysis_version"], reviewed_contract_version, reviewed_contract_hash, json.dumps(contract.get("approved_items", [])), json.dumps(contract.get("rejected_items", [])), json.dumps(contract.get("pending_items", [])), json.dumps(contract.get("accepted_assumptions", [])), json.dumps(contract.get("resolved_gaps", [])), timestamp))
         discovery_count = _discovery_context_count(conn, row["project_id"], row["package_id"])
@@ -3110,7 +3281,7 @@ def _derive_test_data_templates_with_openai(case_ids, cases, rag_context):
         "approved_test_cases": selected_cases,
         "retrieved_knowledge_evidence": _rag_context_for_prompt(rag_context, max_evidence=18, max_fragment_characters=1100, max_rules=10, max_rule_characters=320),
     }
-    response = client.responses.create(
+    response = responses_create(client,
         model=OPENAI_MODEL,
         input="Derive Knowledge Base test data templates as JSON.\n" + json.dumps(prompt, ensure_ascii=False),
         store=False,
@@ -3449,7 +3620,7 @@ def _generate_test_data_with_openai(templates, rag_context=None):
             "approved_test_cases": [{key: case.get(key) for key in ("test_case_id", "title", "description", "scenario", "preconditions", "test_data_setup", "data_needs", "actions", "steps", "expected_results", "deterministic_inputs") if case.get(key) is not None} for case in case_batch],
             "retrieved_knowledge_evidence": _rag_context_for_prompt(rag_context),
         }
-        response = client.responses.create(
+        response = responses_create(client,
             model=OPENAI_MODEL,
             input="Generate template-based test data as JSON.\n" + json.dumps(prompt, ensure_ascii=False),
             store=False,

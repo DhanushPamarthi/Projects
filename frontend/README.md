@@ -7,12 +7,15 @@ React + Vite frontend for the TestIQ source-package and Requirements Analysis PO
 - Project workspace navigation
 - BRD upload with supporting-source registration
 - Source-package review and creation
+- Business-rule review with individual approve/reject, Approve All, save verification, and build progress
+- Persistent project Knowledge Base history with incremental reuse counts
+- Hybrid retrieval verification against an immutable package-pinned version
 - Extraction progress and validation feedback
 - Requirements Analysis version selection
 - Requirement, business-rule, acceptance-criteria, and expected-outcome review
 - Selective approval with reviewer comments and accepted assumptions
 
-Knowledge Fabric/GraphRAG is intentionally not included in this POC.
+The Knowledge Base and RAG flow are part of the main journey and use the existing Phase 3 UI system.
 
 ## Prerequisites
 
@@ -51,10 +54,10 @@ If the backend uses another URL, set `testiq_base_url` in browser local storage 
 2. Upload a BRD and wait for extraction to finish.
 3. Add optional supporting sources such as campaign rules, API specifications, database schemas, message templates, or UI descriptions.
 4. Select **Review package**, then create the immutable source package.
-5. Open **Requirements**.
-6. Select the package and run a new Requirements Analysis.
-7. Expand requirements to review only their related rules, acceptance criteria, and expected outcomes.
-8. Select the items needed for the journey and submit the reviewer decision.
+5. Open **Knowledge Base**, approve or reject every extracted rule, and save the decisions.
+6. Wait for the package-pinned Knowledge Base version to finish updating.
+7. Continue to **Business Use Cases** and **Functional Requirements**.
+8. Review requirements, then continue to Test Cases and Test Data.
 
 ## Scripts
 
@@ -71,6 +74,7 @@ npm run lint      # Run oxlint
 src/
   api/client.js                  Backend API client
   components/UploadStep.jsx      BRD and source-package workflow
+  components/KnowledgeBasePage.jsx Rule review, incremental KB versions, and retrieval verification
   components/RequirementsPage.jsx Requirements Analysis review UI
   App.jsx                        Workspace shell and navigation
   App.css                        Workspace styling
@@ -85,6 +89,10 @@ The important flow is:
 POST /api/v1/projects/{project_id}/sources
 GET  /api/v1/revisions/{revision_id}
 POST /api/v1/projects/{project_id}/manifests
+GET  /api/v1/packages/{package_id}/business-rules
+POST /api/v1/packages/{package_id}/business-rules/review
+POST /api/v1/packages/{package_id}/knowledge-index
+GET  /api/v1/projects/{project_id}/knowledge-versions
 POST /api/v1/packages/{package_id}/requirements/analyze
 GET  /api/v1/packages/{package_id}/requirements
 POST /api/v1/requirement-analyses/{analysis_id}/review

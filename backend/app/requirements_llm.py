@@ -5,6 +5,7 @@ import os
 import re
 
 from .config import OPENAI_MODEL, OPENAI_TIMEOUT_SECONDS
+from .openai_requests import responses_create
 
 
 PROMPT_VERSION = "approved-rag-requirements-v7"
@@ -260,7 +261,7 @@ def generate_grounded_contract(package: dict, items: list[dict], brd_fragments: 
             "previous_invalid_output": previous_result,
             "validation_error": validation_error,
         }
-        response = client.responses.create(
+        response = responses_create(client,
             model=model,
             instructions=INSTRUCTIONS if not repair else f"{INSTRUCTIONS}\n\n{REPAIR_INSTRUCTIONS}",
             input=json.dumps(request_input, ensure_ascii=False),

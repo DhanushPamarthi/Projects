@@ -1,4 +1,35 @@
+import { completeActivity, failActivity, startActivity } from "../activity/activityStore.js";
+
 const defaultBaseUrl = import.meta.env.DEV ? "/api" : "http://127.0.0.1:8001";
+const responseCache = new Map();
+const inFlightGets = new Map();
+const DEFAULT_GET_CACHE_MS = 15_000;
+let cacheGeneration = 0;
+
+export function invalidateApiCache() {
+  cacheGeneration += 1;
+  responseCache.clear();
+}
+
+function requestActivity(path, options) {
+  if ((options.method || "GET").toUpperCase() === "GET" || options.activity === false) return null;
+  const definitions = [
+    [/\/projects\/[^/]+\/sources$/, "Uploading source document", "sources"],
+    [/\/projects\/[^/]+\/manifests$/, "Creating Resource Package", "sources"],
+    [/\/packages\/[^/]+\/knowledge-index$/, "Building Knowledge Base", "knowledge-base"],
+    [/\/knowledge-indexes\/[^/]+\/retrieve$/, "Retrieving Knowledge Base evidence", "knowledge-base"],
+    [/\/business-requirements\/generate$/, "Generating Business Use Cases", "business-requirements"],
+    [/\/(requirements\/analyze|functional-requirements\/generate)$/, "Generating Functional Requirements", "requirements"],
+    [/\/requirement-analyses\/[^/]+\/test-cases$/, "Generating test cases", "test-cases"],
+    [/\/test-case-generations\/[^/]+\/regenerate$/, "Regenerating test cases", "test-cases"],
+    [/\/test-case-generations\/[^/]+\/test-data$/, "Generating test data", "test-data"],
+    [/\/execution-runs\/[^/]+\/execute$/, "Executing test run", "test-results"],
+  ];
+  const match = definitions.find(([pattern]) => pattern.test(path));
+  const supplied = options.activity && typeof options.activity === "object" ? options.activity : {};
+  if (!match && !supplied.label) return null;
+  return { label: supplied.label || match[1], section: supplied.section || match[2], detail: supplied.detail || "The operation continues if you open another section.", kind: supplied.kind || "api" };
+}
 
 export function getBaseUrl() {
   const storedUrl = localStorage.getItem("testiq_base_url");
@@ -21,24 +52,58 @@ async function request(path, options = {}) {
   const token = localStorage.getItem("testiq_auth_token");
   const headers = { ...(options.headers || {}) };
   if (token) headers.Authorization = `Bearer ${token}`;
-  const response = await fetch(url, { ...options, headers });
-  const text = await response.text();
-  let data = null;
+  const method = (options.method || "GET").toUpperCase();
+  const cacheEnabled = method === "GET" && options.cache !== "no-store";
+  const cacheKey = `${token || "anonymous"}:${url}`;
+  if (cacheEnabled) {
+    const cached = responseCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) return cached.data;
+    if (cached) responseCache.delete(cacheKey);
+    const pending = inFlightGets.get(cacheKey);
+    if (pending) return pending;
+  }
+  const activity = requestActivity(path, options);
+  const activityId = activity ? startActivity(activity) : null;
+  const { activity: _activity, cacheTtl: _cacheTtl, ...fetchOptions } = options;
+  const generation = cacheGeneration;
+  const operation = (async () => {
+    let response;
+    try {
+      response = await fetch(url, { ...fetchOptions, headers });
+    } catch (error) {
+      if (activityId) failActivity(activityId, error);
+      throw error;
+    }
+    const text = await response.text();
+    let data = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = { detail: text || `${response.status} ${response.statusText}` };
+    }
+    if (!response.ok) {
+      const detail = data?.detail;
+      const message = typeof detail === "string"
+        ? detail
+        : detail?.validation_messages?.join("; ") || data?.validation_messages?.join("; ") || detail?.message || `${response.status} ${response.statusText}`;
+      const error = new Error(message);
+      error.status = response.status;
+      if (activityId) failActivity(activityId, error);
+      throw error;
+    }
+    if (method !== "GET") invalidateApiCache();
+    if (activityId) completeActivity(activityId, "Completed successfully.");
+    if (cacheEnabled && generation === cacheGeneration) {
+      responseCache.set(cacheKey, { data, expiresAt: Date.now() + Number(options.cacheTtl || DEFAULT_GET_CACHE_MS) });
+    }
+    return data;
+  })();
+  if (cacheEnabled) inFlightGets.set(cacheKey, operation);
   try {
-    data = text ? JSON.parse(text) : null;
-  } catch {
-    data = { detail: text || `${response.status} ${response.statusText}` };
+    return await operation;
+  } finally {
+    if (cacheEnabled && inFlightGets.get(cacheKey) === operation) inFlightGets.delete(cacheKey);
   }
-  if (!response.ok) {
-    const detail = data?.detail;
-    const message = typeof detail === "string"
-      ? detail
-      : detail?.validation_messages?.join("; ") || data?.validation_messages?.join("; ") || detail?.message || `${response.status} ${response.statusText}`;
-    const error = new Error(message);
-    error.status = response.status;
-    throw error;
-  }
-  return data;
 }
 
 export async function loginUser(email, password) {
@@ -73,8 +138,8 @@ export async function getProject(projectId) {
   return request(`/api/v1/projects/${encodeURIComponent(projectId)}`);
 }
 
-export async function listProjects() {
-  return request("/api/v1/projects");
+export async function listProjects(options = {}) {
+  return request("/api/v1/projects", { cacheTtl: 30_000, ...options });
 }
 
 export async function uploadSource(projectId, file, sourceType = "brd", brdSourceId = "", requiredSections = "") {
@@ -86,6 +151,7 @@ export async function uploadSource(projectId, file, sourceType = "brd", brdSourc
   return request(`/api/v1/projects/${encodeURIComponent(projectId)}/sources`, {
     method: "POST",
     body: formData,
+    activity: { label: sourceType === "brd" ? "Uploading BRD" : "Uploading supporting source", section: "sources", detail: file.name },
   });
 }
 
@@ -105,8 +171,8 @@ export async function createManifest(sourceIds, packageName, scope, projectId) {
   });
 }
 
-export async function listManifests(projectId) {
-  return request(`/api/v1/projects/${encodeURIComponent(projectId)}/manifests`);
+export async function listManifests(projectId, options = {}) {
+  return request(`/api/v1/projects/${encodeURIComponent(projectId)}/manifests`, { cacheTtl: 30_000, ...options });
 }
 
 export async function buildKnowledgeIndex(packageId, options = {}) {
@@ -114,6 +180,12 @@ export async function buildKnowledgeIndex(packageId, options = {}) {
 }
 export async function listKnowledgeIndexes(packageId) {
   return request(`/api/v1/packages/${encodeURIComponent(packageId)}/knowledge-indexes`);
+}
+export async function getKnowledgeSummary(packageId, options = {}) {
+  return request(`/api/v1/packages/${encodeURIComponent(packageId)}/knowledge-summary`, options);
+}
+export async function listProjectKnowledgeVersions(projectId) {
+  return request(`/api/v1/projects/${encodeURIComponent(projectId)}/knowledge-versions`);
 }
 export async function getKnowledgeIndex(indexId) {
   return request(`/api/v1/knowledge-indexes/${encodeURIComponent(indexId)}`);
@@ -153,6 +225,10 @@ export async function generateFunctionalRequirements(packageId) {
 
 export async function listRequirementAnalyses(packageId) {
   return request(`/api/v1/packages/${encodeURIComponent(packageId)}/requirements`);
+}
+
+export async function getLatestRequirementAnalyses(packageId, options = {}) {
+  return request(`/api/v1/packages/${encodeURIComponent(packageId)}/requirements/latest-set`, options);
 }
 
 export async function getRequirementAnalysis(analysisId) {

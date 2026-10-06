@@ -1,9 +1,14 @@
 """Database access for the TestIQ PostgreSQL control plane."""
 import sqlite3
 import threading
+import re
 from contextlib import contextmanager
-from .config import DATABASE_URL, DB_PATH, DATA_DIR, PGVECTOR_DIMENSIONS, UPLOAD_DIR
+from .config import (DATABASE_URL, DB_PATH, DATA_DIR, PGVECTOR_DIMENSIONS, PGVECTOR_MODE,
+                     POSTGRES_LOCK_TIMEOUT_MS, POSTGRES_POOL_MAX_SIZE, POSTGRES_POOL_MIN_SIZE,
+                     POSTGRES_POOL_TIMEOUT_SECONDS, POSTGRES_STATEMENT_TIMEOUT_MS, UPLOAD_DIR)
 PGVECTOR_AVAILABLE = False
+_POSTGRES_POOL = None
+_POSTGRES_POOL_LOCK = threading.Lock()
 _INIT_DONE = False
 _INIT_LOCK = threading.Lock()
 
@@ -107,6 +112,7 @@ CREATE TABLE IF NOT EXISTS testiq.requirement_analysis (
   project_id TEXT NOT NULL,
   analysis_version INTEGER NOT NULL,
   status TEXT NOT NULL,
+  analysis_kind TEXT NOT NULL DEFAULT 'legacy',
   contract_json TEXT NOT NULL,
   reviewer TEXT,
   review_decision TEXT,
@@ -225,6 +231,9 @@ CREATE INDEX IF NOT EXISTS testiq_test_execution_result_case_idx ON testiq.test_
 CREATE TABLE IF NOT EXISTS testiq.knowledge_index (
   index_id TEXT PRIMARY KEY, package_id TEXT NOT NULL REFERENCES testiq.source_package_manifest(package_id),
   project_id TEXT NOT NULL REFERENCES testiq.project(project_id), manifest_hash TEXT NOT NULL,
+  knowledge_version INTEGER NOT NULL DEFAULT 1, parent_index_id TEXT,
+  build_mode TEXT NOT NULL DEFAULT 'full', reused_chunk_count INTEGER NOT NULL DEFAULT 0,
+  new_chunk_count INTEGER NOT NULL DEFAULT 0, retired_chunk_count INTEGER NOT NULL DEFAULT 0,
   config_hash TEXT NOT NULL, provider TEXT NOT NULL, embedding_model TEXT NOT NULL,
   graph_model TEXT NOT NULL, dimensions INTEGER NOT NULL, status TEXT NOT NULL,
   configuration_json TEXT NOT NULL, chunker_version TEXT NOT NULL, graph_prompt_version TEXT NOT NULL,
@@ -337,6 +346,15 @@ MIGRATIONS = [
     "ALTER TABLE knowledge_index ADD COLUMN progress_percent INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE knowledge_index ADD COLUMN progress_stage TEXT NOT NULL DEFAULT 'pending'",
     "ALTER TABLE knowledge_index ADD COLUMN progress_message TEXT",
+    "ALTER TABLE knowledge_index ADD COLUMN knowledge_version INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE knowledge_index ADD COLUMN parent_index_id TEXT",
+    "ALTER TABLE requirement_analysis ADD COLUMN analysis_kind TEXT NOT NULL DEFAULT 'legacy'",
+    "ALTER TABLE knowledge_index ADD COLUMN build_mode TEXT NOT NULL DEFAULT 'full'",
+    "ALTER TABLE knowledge_index ADD COLUMN reused_chunk_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE knowledge_index ADD COLUMN new_chunk_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE knowledge_index ADD COLUMN retired_chunk_count INTEGER NOT NULL DEFAULT 0",
+    "UPDATE knowledge_index SET knowledge_version=(SELECT package_version FROM source_package_manifest WHERE source_package_manifest.package_id=knowledge_index.package_id) WHERE knowledge_version=1 AND EXISTS (SELECT 1 FROM source_package_manifest WHERE source_package_manifest.package_id=knowledge_index.package_id)",
+    "CREATE INDEX IF NOT EXISTS testiq_knowledge_index_project_version_idx ON knowledge_index(project_id,knowledge_version)",
     "CREATE TABLE IF NOT EXISTS test_data_bronze_ref (bronze_ref_id TEXT PRIMARY KEY, record_id TEXT NOT NULL REFERENCES test_data_record(record_id), generation_id TEXT NOT NULL REFERENCES test_case_generation(generation_id), test_case_id TEXT NOT NULL, bronze_schema TEXT NOT NULL, bronze_table TEXT NOT NULL, bronze_id TEXT NOT NULL, bronze_load_id TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(record_id, bronze_schema, bronze_table, bronze_id))",
     "CREATE INDEX IF NOT EXISTS testiq_test_data_bronze_ref_record_idx ON test_data_bronze_ref(record_id)",
     "CREATE INDEX IF NOT EXISTS testiq_test_data_bronze_ref_case_idx ON test_data_bronze_ref(generation_id,test_case_id)",
@@ -372,41 +390,128 @@ def _init_db_uncached():
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     if DATABASE_URL:
         import psycopg
-        with psycopg.connect(DATABASE_URL) as conn:
+        with psycopg.connect(DATABASE_URL, options=_postgres_session_options()) as conn:
             global PGVECTOR_AVAILABLE
+            with conn.pipeline():
+                catalog_cursor = conn.execute(
+                    "SELECT n.nspname,c.relname FROM pg_namespace n "
+                    "LEFT JOIN pg_class c ON c.relnamespace=n.oid WHERE n.nspname='testiq'"
+                )
+                columns_cursor = conn.execute(
+                    "SELECT table_name,column_name FROM information_schema.columns WHERE table_schema='testiq'"
+                )
+                extension_cursor = conn.execute(
+                    "SELECT installed_version FROM pg_available_extensions WHERE name='vector'"
+                ) if PGVECTOR_MODE != "disabled" else None
+            catalog_rows = catalog_cursor.fetchall()
+            schema_exists = bool(catalog_rows)
+            existing_relations = {row[1] for row in catalog_rows if row[1]}
+            existing_columns = {
+                (row[0], row[1]) for row in columns_cursor.fetchall()
+            }
             for statement in SCHEMA.split(";"):
-                if statement.strip(): conn.execute(statement)
-            try:
-                conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
-                conn.execute(f"ALTER TABLE testiq.knowledge_chunk ADD COLUMN IF NOT EXISTS embedding_vector vector({PGVECTOR_DIMENSIONS})")
-                conn.execute("CREATE INDEX IF NOT EXISTS testiq_knowledge_chunk_embedding_hnsw_idx ON testiq.knowledge_chunk USING hnsw (embedding_vector vector_cosine_ops) WITH (m=16,ef_construction=64)")
-                PGVECTOR_AVAILABLE = True
-            except Exception:
-                PGVECTOR_AVAILABLE = False
-                conn.rollback()
-                for statement in SCHEMA.split(";"):
-                    if statement.strip(): conn.execute(statement)
-            if PGVECTOR_AVAILABLE:
-                conn.execute(f"ALTER TABLE testiq.knowledge_chunk ADD COLUMN IF NOT EXISTS embedding_vector vector({PGVECTOR_DIMENSIONS})")
-                conn.execute("CREATE INDEX IF NOT EXISTS testiq_knowledge_chunk_embedding_hnsw_idx ON testiq.knowledge_chunk USING hnsw (embedding_vector vector_cosine_ops) WITH (m=16,ef_construction=64)")
-            conn.execute("SET search_path TO testiq")
+                statement = statement.strip()
+                if not statement:
+                    continue
+                # PostgreSQL still takes relation locks for CREATE ... IF NOT
+                # EXISTS. Avoid touching objects that already exist so app
+                # startup is not blocked by unrelated long-running sessions.
+                if re.match(r"^CREATE\s+SCHEMA\s+IF\s+NOT\s+EXISTS\s+testiq$", statement, re.IGNORECASE):
+                    if schema_exists:
+                        continue
+                table_match = re.match(r"^CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+(?:testiq\.)?([A-Za-z_][A-Za-z0-9_]*)", statement, re.IGNORECASE)
+                if table_match and table_match.group(1) in existing_relations:
+                    continue
+                index_match = re.match(r"^CREATE\s+INDEX\s+IF\s+NOT\s+EXISTS\s+([A-Za-z_][A-Za-z0-9_]*)", statement, re.IGNORECASE)
+                if index_match and index_match.group(1) in existing_relations:
+                    continue
+                conn.execute(statement)
+                if table_match:
+                    existing_relations.add(table_match.group(1))
+                if index_match:
+                    existing_relations.add(index_match.group(1))
+                if re.match(r"^CREATE\s+SCHEMA", statement, re.IGNORECASE):
+                    schema_exists = True
+            PGVECTOR_AVAILABLE = False
+            if PGVECTOR_MODE != "disabled":
+                available = extension_cursor.fetchone()
+                if available:
+                    vector_index = "testiq_knowledge_chunk_embedding_hnsw_idx"
+                    vector_is_ready = bool(
+                        available[0]
+                        and ("knowledge_chunk", "embedding_vector") in existing_columns
+                        and vector_index in existing_relations
+                    )
+                    if vector_is_ready:
+                        PGVECTOR_AVAILABLE = True
+                    else:
+                        conn.execute("SAVEPOINT pgvector_setup")
+                        try:
+                            if not available[0]:
+                                conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                            if ("knowledge_chunk", "embedding_vector") not in existing_columns:
+                                conn.execute(f"ALTER TABLE testiq.knowledge_chunk ADD COLUMN IF NOT EXISTS embedding_vector vector({PGVECTOR_DIMENSIONS})")
+                                existing_columns.add(("knowledge_chunk", "embedding_vector"))
+                            if vector_index not in existing_relations:
+                                conn.execute("CREATE INDEX IF NOT EXISTS testiq_knowledge_chunk_embedding_hnsw_idx ON testiq.knowledge_chunk USING hnsw (embedding_vector vector_cosine_ops) WITH (m=16,ef_construction=64)")
+                                existing_relations.add(vector_index)
+                            conn.execute("RELEASE SAVEPOINT pgvector_setup")
+                            PGVECTOR_AVAILABLE = True
+                        except Exception:
+                            conn.execute("ROLLBACK TO SAVEPOINT pgvector_setup")
+                            conn.execute("RELEASE SAVEPOINT pgvector_setup")
+                if PGVECTOR_MODE == "required" and not PGVECTOR_AVAILABLE:
+                    raise RuntimeError("pgvector is required but is not installed or could not be enabled")
+            maintenance_statements = []
             for index, statement in enumerate(MIGRATIONS):
+                add_column = re.match(
+                    r"^ALTER TABLE\s+([A-Za-z_][A-Za-z0-9_]*)\s+ADD COLUMN\s+([A-Za-z_][A-Za-z0-9_]*)\s+",
+                    statement,
+                    re.IGNORECASE,
+                )
+                if add_column and (add_column.group(1), add_column.group(2)) in existing_columns:
+                    continue
+                create_table = re.match(r"^CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+([A-Za-z_][A-Za-z0-9_]*)", statement, re.IGNORECASE)
+                if create_table and create_table.group(1) in existing_relations:
+                    continue
+                create_index = re.match(r"^CREATE\s+INDEX\s+IF\s+NOT\s+EXISTS\s+([A-Za-z_][A-Za-z0-9_]*)", statement, re.IGNORECASE)
+                if create_index and create_index.group(1) in existing_relations:
+                    continue
+                if re.match(r"^UPDATE\s+", statement, re.IGNORECASE):
+                    maintenance_statements.append(statement)
+                    continue
                 savepoint = f"migration_{index}"
                 conn.execute(f"SAVEPOINT {savepoint}")
                 try:
                     conn.execute(statement)
                     conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                    if add_column:
+                        existing_columns.add((add_column.group(1), add_column.group(2)))
+                    if create_table:
+                        existing_relations.add(create_table.group(1))
+                    if create_index:
+                        existing_relations.add(create_index.group(1))
                 except Exception:
                     conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                     conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-            conn.execute("UPDATE source_document SET logical_source_id=source_id WHERE logical_source_id IS NULL")
-            conn.execute("UPDATE source_fragment f SET source_id=r.source_id FROM source_revision r WHERE f.revision_id=r.revision_id AND f.source_id IS NULL")
-            conn.execute("UPDATE source_fragment SET provenance_mode='local' WHERE provenance_mode IS NULL")
-            if conn.execute("SELECT to_regclass('testiq.test_data_template')").fetchone()[0]:
+            maintenance_statements.extend([
+                "UPDATE source_document SET logical_source_id=source_id WHERE logical_source_id IS NULL",
+                "UPDATE source_fragment f SET source_id=r.source_id FROM source_revision r WHERE f.revision_id=r.revision_id AND f.source_id IS NULL",
+                "UPDATE source_fragment SET provenance_mode='local' WHERE provenance_mode IS NULL",
+                "UPDATE requirement_analysis SET analysis_kind=CASE "
+                "WHEN contract_json LIKE '%\"functional_requirements_generation\"%true%' THEN 'functional' "
+                "WHEN contract_json LIKE '%\"business_requirements_generation\"%true%' THEN 'business' "
+                "ELSE analysis_kind END WHERE analysis_kind='legacy'",
+            ])
+            with conn.pipeline():
+                for statement in maintenance_statements:
+                    conn.execute(statement)
+                conn.execute("COMMIT")
+            if "test_data_template" in existing_relations:
                 conn.execute("UPDATE test_data_record r SET template_name=t.template_name FROM test_data_template t WHERE r.template_id=t.template_id AND r.template_name=''")
                 conn.execute("ALTER TABLE test_data_record DROP CONSTRAINT IF EXISTS test_data_record_template_id_fkey")
                 conn.execute("DROP TABLE test_data_template")
-            conn.commit()
+                conn.commit()
     else:
         with sqlite3.connect(DB_PATH) as conn:
             conn.executescript(SQLITE_SCHEMA)
@@ -417,6 +522,10 @@ def _init_db_uncached():
             conn.execute("UPDATE source_document SET logical_source_id=source_id WHERE logical_source_id IS NULL")
             conn.execute("UPDATE source_fragment SET source_id=(SELECT source_id FROM source_revision WHERE source_revision.revision_id=source_fragment.revision_id) WHERE source_id IS NULL")
             conn.execute("UPDATE source_fragment SET provenance_mode='local' WHERE provenance_mode IS NULL")
+            conn.execute("UPDATE requirement_analysis SET analysis_kind=CASE "
+                         "WHEN contract_json LIKE '%\"functional_requirements_generation\"%true%' THEN 'functional' "
+                         "WHEN contract_json LIKE '%\"business_requirements_generation\"%true%' THEN 'business' "
+                         "ELSE analysis_kind END WHERE analysis_kind='legacy'")
             conn.commit()
             _migrate_sqlite_test_data_templates(conn)
 
@@ -465,10 +574,10 @@ def _migrate_sqlite_test_data_templates(conn):
 def connection():
     init_db()
     if DATABASE_URL:
-        import psycopg
-        from psycopg.rows import dict_row
-        conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
-        conn.execute("SET search_path TO testiq")
+        pool = _get_postgres_pool()
+        with pool.connection(timeout=POSTGRES_POOL_TIMEOUT_SECONDS) as conn:
+            yield conn
+        return
     else:
         conn = _SQLiteConnection(sqlite3.connect(DB_PATH))
         conn._conn.row_factory = sqlite3.Row
@@ -481,3 +590,45 @@ def connection():
         raise
     finally:
         conn.close()
+
+
+def _postgres_session_options():
+    return (
+        f"-c lock_timeout={POSTGRES_LOCK_TIMEOUT_MS}ms "
+        f"-c statement_timeout={POSTGRES_STATEMENT_TIMEOUT_MS}ms "
+        "-c search_path=testiq"
+    )
+
+
+def _get_postgres_pool():
+    global _POSTGRES_POOL
+    if _POSTGRES_POOL is not None:
+        return _POSTGRES_POOL
+    with _POSTGRES_POOL_LOCK:
+        if _POSTGRES_POOL is None:
+            from psycopg.rows import dict_row
+            from psycopg_pool import ConnectionPool
+            _POSTGRES_POOL = ConnectionPool(
+                conninfo=DATABASE_URL,
+                min_size=max(1, POSTGRES_POOL_MIN_SIZE),
+                max_size=max(POSTGRES_POOL_MIN_SIZE, POSTGRES_POOL_MAX_SIZE),
+                timeout=POSTGRES_POOL_TIMEOUT_SECONDS,
+                kwargs={"row_factory": dict_row, "options": _postgres_session_options()},
+                open=True,
+                name="testiq-postgres",
+            )
+    return _POSTGRES_POOL
+
+
+def close_connection_pool():
+    global _POSTGRES_POOL
+    with _POSTGRES_POOL_LOCK:
+        if _POSTGRES_POOL is not None:
+            _POSTGRES_POOL.close()
+            _POSTGRES_POOL = None
+
+
+def warm_connection_pool():
+    init_db()
+    if DATABASE_URL:
+        _get_postgres_pool().wait(timeout=POSTGRES_POOL_TIMEOUT_SECONDS)

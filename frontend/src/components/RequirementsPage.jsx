@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
-import { AlertCircle, ArrowLeft, Check, CheckCircle2, ChevronLeft, ChevronRight, FileSearch, Pencil, Play, RefreshCw, RotateCcw, ShieldCheck, X } from "lucide-react";
-import { generateFunctionalRequirements, getProject, listManifests, listProjects, listRequirementAnalyses, reviewRequirementAnalysis } from "../api/client.js";
+import { AlertCircle, CheckCircle2, ChevronLeft, ChevronRight, Download, FileSearch, Pencil, Play, RefreshCw, RotateCcw, ShieldCheck } from "lucide-react";
+import { generateFunctionalRequirements, getLatestRequirementAnalyses, getRagReadiness, invalidateApiCache, listManifests, listProjects, reviewRequirementAnalysis } from "../api/client.js";
+import { useActivities } from "../activity/activityStore.js";
 import { LoadingSpinner } from "./LoadingSpinner.jsx";
 
 function statusText(status) {
@@ -18,7 +19,7 @@ function listText(value) {
 }
 
 function packageDisplayName(item) {
-  return item?.package_name?.trim() || item?.scope?.trim() || "Source package";
+  return item?.package_name?.trim() || item?.scope?.trim() || "Resource Package";
 }
 
 function sourceCountText(count) {
@@ -33,6 +34,12 @@ function packageOptionLabel(item) {
 
 function sourceReferences(value) {
   return Array.isArray(value) ? value.filter((item) => item?.source_reference || item?.fragment_id) : [];
+}
+
+function evidenceLabel(ref) {
+  const location = ref?.source_reference || ref?.fragment_id || "Source evidence";
+  const heading = ref?.heading ? ` · ${ref.heading}` : "";
+  return `${location}${heading}`;
 }
 
 function splitLines(value) {
@@ -84,7 +91,7 @@ function isGenericFallbackConflict(conflict) {
 const FUNCTIONAL_PAGE_SIZE = 5;
 const FUNCTIONAL_PROGRESS_MESSAGES = ["Reading approved business use cases", "Retrieving Knowledge Base evidence", "Writing acceptance criteria", "Checking traceability and readiness"];
 
-export function RequirementsPage({ onContinueToGeneration, onOpenBusinessRequirements }) {
+export function RequirementsPage({ onContinueToGeneration, onOpenBusinessRequirements, onOpenKnowledgeBase }) {
   const [project, setProject] = useState(() => JSON.parse(localStorage.getItem("testiq_current_project") || "null"));
   const [projects, setProjects] = useState([]);
   const [packages, setPackages] = useState([]);
@@ -92,7 +99,7 @@ export function RequirementsPage({ onContinueToGeneration, onOpenBusinessRequire
   const [analysis, setAnalysis] = useState(null);
   const [approvedBusinessRequirements, setApprovedBusinessRequirements] = useState([]);
   const [loading, setLoading] = useState(false);
-  const [running, setRunning] = useState(false);
+  const [requestRunning, setRequestRunning] = useState(false);
   const [reviewing, setReviewing] = useState(false);
   const [reviewer, setReviewer] = useState("Product Owner");
   const [comments, setComments] = useState("");
@@ -107,6 +114,10 @@ export function RequirementsPage({ onContinueToGeneration, onOpenBusinessRequire
   const [page, setPage] = useState(1);
   const [progressMessageIndex, setProgressMessageIndex] = useState(0);
   const [progressPercent, setProgressPercent] = useState(0);
+  const [knowledgeReadiness, setKnowledgeReadiness] = useState(null);
+  const activities = useActivities();
+  const functionalActivity = activities.find((item) => item.section === "requirements");
+  const running = requestRunning || functionalActivity?.status === "running";
 
   const selectedPackage = useMemo(() => packages.find((item) => item.package_id === packageId), [packages, packageId]);
   const contract = analysis?.contract;
@@ -117,14 +128,10 @@ export function RequirementsPage({ onContinueToGeneration, onOpenBusinessRequire
   const readinessChecks = readiness.checks || [];
   const readinessGapItems = (readiness.gaps || []).filter((gap) => !isAnalysisWarningText(gap));
   const passedReadinessCount = readinessChecks.filter((check) => check.status === "passed").length;
-  const analysisWarningItems = Array.from(new Set((contract?.global_gaps || []).map(reviewWarningText).filter((item) => !HIDDEN_ANALYSIS_NOTICE_TEXTS.has(item))));
   const conflictItems = (contract?.conflicting_requirements || contract?.conflicts || []).filter((conflict) => !isGenericFallbackConflict(conflict));
   const ragStatus = contract?.rag_status;
   const ragMetadata = contract?.rag_metadata;
   const knowledgeUsed = Boolean(ragStatus?.used ?? ragMetadata?.index_id);
-  const knowledgeContextMessage = knowledgeUsed
-    ? `Knowledge Base used${ragMetadata?.index_id ? ` · ${ragMetadata.index_id}` : ""}`
-    : "Knowledge Base not used for this run";
 
   const criteriaItems = requirements.flatMap((item) => (item.acceptance_criteria || []).map((criterion, index) => {
     const given = typeof criterion === "string" ? "The source-defined precondition is satisfied." : (Array.isArray(criterion.given) ? criterion.given.join("; ") : criterion.given) || "The source-defined precondition is satisfied.";
@@ -132,8 +139,17 @@ export function RequirementsPage({ onContinueToGeneration, onOpenBusinessRequire
     const then = typeof criterion === "string" ? criterion : criterion.then || criterion.text || "The expected behavior occurs.";
     const text = `Given: ${given}\nWhen: ${when}\nThen: ${then}`;
     const acceptanceId = typeof criterion === "string" ? `AC-${index + 1}` : criterion.acceptance_id || `AC-${index + 1}`;
-    return { id: `${item.requirement_id}:${acceptanceId}`, title: acceptanceId, text, source_references: sourceReferences(criterion?.source_references) };
+    const scenario = typeof criterion === "object" ? criterion.scenario : "";
+    return { id: `${item.requirement_id}:${acceptanceId}`, title: scenario ? `${acceptanceId} · ${scenario}` : acceptanceId, text, source_references: sourceReferences(criterion?.source_references) };
   }));
+
+  const outcomeItems = requirements.flatMap((item) => (item.expected_outcomes || []).map((outcome, index) => {
+    const outcomeId = typeof outcome === "string" ? `EO-${index + 1}` : outcome.outcome_id || `EO-${index + 1}`;
+    return { id: `${item.requirement_id}:${outcomeId}`, title: outcomeId, text: textValue(outcome), source_references: sourceReferences(outcome?.source_references) };
+  }));
+
+  const businessRuleCount = requirements.reduce((total, item) => total + (item.business_rules?.length || 0), 0);
+  const sourceReferenceCount = new Set(requirements.flatMap((item) => sourceReferences(item.source_references).map((ref) => ref.source_reference || ref.fragment_id))).size;
 
 
   const findings = requirements.flatMap((item) => (item.ambiguities || []).map((text) => ({ text, kind: `${item.requirement_id} clarification` })));
@@ -141,14 +157,18 @@ export function RequirementsPage({ onContinueToGeneration, onOpenBusinessRequire
   const selectableItems = [
     ...requirements.map((item) => ({ id: item.requirement_id, label: item.title })),
     ...criteriaItems.map((item) => ({ id: item.id, label: item.text })),
+    ...outcomeItems.map((item) => ({ id: item.id, label: item.text })),
   ];
 
   useEffect(() => {
     if (!running) return undefined;
+    const elapsedSeconds = functionalActivity?.startedAt ? Math.max(0, (Date.now() - new Date(functionalActivity.startedAt).getTime()) / 1000) : 0;
+    setProgressPercent(Math.min(94, Math.max(4, Math.round(4 + elapsedSeconds))));
+    setProgressMessageIndex(Math.floor(elapsedSeconds / 3) % FUNCTIONAL_PROGRESS_MESSAGES.length);
     const messageTimer = window.setInterval(() => setProgressMessageIndex((index) => (index + 1) % FUNCTIONAL_PROGRESS_MESSAGES.length), 1800);
     const progressTimer = window.setInterval(() => setProgressPercent((value) => Math.min(94, value + Math.max(1, Math.ceil((94 - value) / 10)))), 450);
     return () => { window.clearInterval(messageTimer); window.clearInterval(progressTimer); };
-  }, [running]);
+  }, [running, functionalActivity?.startedAt]);
 
   async function loadPackages(projectId = project?.project_id) {
     if (!projectId) return;
@@ -164,12 +184,16 @@ export function RequirementsPage({ onContinueToGeneration, onOpenBusinessRequire
   }
 
   async function loadAnalysis(id = packageId) {
-    if (!id) { setAnalysis(null); setApprovedBusinessRequirements([]); setLoading(false); return; }
+    if (!id) { setAnalysis(null); setApprovedBusinessRequirements([]); setKnowledgeReadiness(null); setLoading(false); return; }
     setLoading(true);
     try {
-      const items = await listRequirementAnalyses(id);
-      const generatedAnalysis = items.find((item) => item.contract?.functional_requirements_generation) || null;
-      const sourceAnalysis = items.find((item) => !item.contract?.functional_requirements_generation) || null;
+      const [latest, nextReadiness] = await Promise.all([
+        getLatestRequirementAnalyses(id),
+        getRagReadiness(id).catch(() => ({ ready: false, message: "The Knowledge Base has not been built for this Resource Package." })),
+      ]);
+      setKnowledgeReadiness(nextReadiness);
+      const generatedAnalysis = latest.functional || null;
+      const sourceAnalysis = latest.business || null;
       const approvedFromSource = sourceAnalysis?.contract?.approved_business_requirements;
       const approvedFromHistory = approvedFromSource?.length ? approvedFromSource : sourceAnalysis ? (() => {
         const contract = sourceAnalysis?.contract || {};
@@ -189,10 +213,13 @@ export function RequirementsPage({ onContinueToGeneration, onOpenBusinessRequire
       const next = generatedAnalysis && matchesApprovedScope ? generatedAnalysis : null;
       setAnalysis(next);
       if (next) {
-        setSelectedItems(next.contract?.approved_items?.length ? next.contract.approved_items : []);
-        setReviewStatuses(getReviewStatuses(next.contract));
-        setReviewSaved(Boolean(next.contract?.approved_items?.length));
-        setAssumptions((next.contract?.accepted_assumptions || []).join("\n"));
+        let savedDraft = null;
+        try { savedDraft = JSON.parse(localStorage.getItem(`testiq_functional_review_draft:${next.analysis_id}`) || "null"); } catch { savedDraft = null; }
+        setSelectedItems(savedDraft?.selectedItems ?? (next.contract?.approved_items?.length ? next.contract.approved_items : []));
+        setReviewStatuses(savedDraft?.reviewStatuses ?? getReviewStatuses(next.contract));
+        setReviewSaved(savedDraft?.reviewSaved ?? Boolean(next.contract?.approved_items?.length));
+        setAssumptions(savedDraft?.assumptions ?? (next.contract?.accepted_assumptions || []).join("\n"));
+        setComments(savedDraft?.comments ?? "");
       }
     } catch (err) { setError(err.message); } finally { setLoading(false); }
   }
@@ -200,7 +227,8 @@ export function RequirementsPage({ onContinueToGeneration, onOpenBusinessRequire
   async function selectProject(id) {
     setApprovedBusinessRequirements([]); setAnalysis(null);
     if (!id) { setProject(null); setPackages([]); setPackageId(""); return; }
-    const selected = await getProject(id);
+    const selected = projects.find((item) => item.project_id === id);
+    if (!selected) { setError("Selected project was not found."); return; }
     setProject(selected); setAnalysis(null);
     localStorage.setItem("testiq_current_project", JSON.stringify(selected));
     await loadPackages(selected.project_id);
@@ -208,6 +236,7 @@ export function RequirementsPage({ onContinueToGeneration, onOpenBusinessRequire
 
   function selectPackage(id) {
     setPackageId(id); setAnalysis(null); setError("");
+    setKnowledgeReadiness(null);
     setPage(1);
     setApprovedBusinessRequirements([]); setLoading(Boolean(id));
     const selected = packages.find((item) => item.package_id === id);
@@ -215,11 +244,16 @@ export function RequirementsPage({ onContinueToGeneration, onOpenBusinessRequire
     else localStorage.removeItem("testiq_current_package");
   }
 
+  async function refreshWorkspace() {
+    invalidateApiCache();
+    await Promise.all([loadPackages(project?.project_id), loadAnalysis(packageId)]);
+  }
+
   async function runAnalysis() {
-    if (!packageId) return;
+    if (!packageId || running || !knowledgeReadiness?.ready) return;
     setProgressMessageIndex(0);
     setProgressPercent(0);
-    setRunning(true); setError("");
+    setRequestRunning(true); setError("");
     try {
       const next = await generateFunctionalRequirements(packageId);
       setAnalysis(next);
@@ -230,18 +264,45 @@ export function RequirementsPage({ onContinueToGeneration, onOpenBusinessRequire
       setAssumptions("");
       setProgressPercent(100);
       await new Promise((resolve) => window.setTimeout(resolve, 300));
-    } catch (err) { setError(err.message); } finally { setRunning(false); }
+    } catch (err) { setError(err.message); } finally { setRequestRunning(false); }
+  }
+
+  function downloadJson() {
+    if (!contract) return;
+    const selectedRequirementIds = new Set(requirements.filter((item) => selectedItems.includes(item.requirement_id)).map((item) => item.requirement_id));
+    if (!selectedRequirementIds.size) return;
+    const exported = structuredClone(contract);
+    exported.requirements = (exported.requirements || []).filter((item) => selectedRequirementIds.has(item.requirement_id)).map((item) => ({
+      ...item,
+      acceptance_criteria: (item.acceptance_criteria || []).filter((criterion, index) => selectedItems.includes(`${item.requirement_id}:${criterion.acceptance_id || `AC-${index + 1}`}`)),
+      expected_outcomes: (item.expected_outcomes || []).filter((outcome, index) => selectedItems.includes(`${item.requirement_id}:${outcome.outcome_id || `EO-${index + 1}`}`)),
+    }));
+    const selectedBusinessIds = new Set(exported.requirements.flatMap((item) => item.business_requirement_ids || (item.business_rules || []).map((rule) => rule.rule_id)));
+    exported.approved_business_requirements = (exported.approved_business_requirements || []).filter((item) => selectedBusinessIds.has(item.business_requirement_id));
+    exported.export_selection = { requirement_ids: [...selectedRequirementIds], exported_at: new Date().toISOString() };
+    const blob = new Blob([JSON.stringify(exported, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const anchor = window.document.createElement("a");
+    anchor.href = url;
+    anchor.download = `functional-requirements-v${analysis.analysis_version}.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
   }
 
   async function approve() {
     if (!analysis?.analysis_id || !reviewer.trim()) return;
     setReviewing(true); setError("");
     try {
-      const items = (analysis.contract?.requirements || []).flatMap((item) => [
-        { item_id: item.requirement_id, approved: selectedItems.includes(item.requirement_id), review_status: reviewStatuses[item.requirement_id] || "pending", title: item.title, statement: item.statement },
-        ...(item.business_rules || []).map((rule, index) => { const itemId = `${item.requirement_id}:${rule.rule_id || `RULE-${index + 1}`}`; const parentStatus = reviewStatuses[item.requirement_id] || "pending"; return { item_id: itemId, approved: selectedItems.includes(item.requirement_id) && parentStatus === "approved", review_status: parentStatus, text: textValue(rule) }; }),
-        ...(item.acceptance_criteria || []).map((criterion, index) => { const itemId = `${item.requirement_id}:${criterion.acceptance_id || `AC-${index + 1}`}`; return { item_id: itemId, approved: selectedItems.includes(itemId), review_status: reviewStatuses[item.requirement_id] || "pending", text: criterion.text, scenario: criterion.scenario, given: criterion.given, when: criterion.when, then: criterion.then }; }),
-      ]);
+      const items = (analysis.contract?.requirements || []).flatMap((item) => {
+        const parentStatus = reviewStatuses[item.requirement_id] || "pending";
+        const childStatus = (itemId) => parentStatus === "approved" ? (selectedItems.includes(itemId) ? "approved" : "rejected") : parentStatus;
+        return [
+          { item_id: item.requirement_id, approved: parentStatus === "approved", review_status: parentStatus, title: item.title, statement: item.statement },
+          ...(item.business_rules || []).map((rule, index) => { const itemId = `${item.requirement_id}:${rule.rule_id || `RULE-${index + 1}`}`; return { item_id: itemId, approved: parentStatus === "approved", review_status: parentStatus, text: textValue(rule) }; }),
+          ...(item.acceptance_criteria || []).map((criterion, index) => { const itemId = `${item.requirement_id}:${criterion.acceptance_id || `AC-${index + 1}`}`; const status = childStatus(itemId); return { item_id: itemId, approved: status === "approved", review_status: status, text: criterion.text, scenario: criterion.scenario, given: criterion.given, when: criterion.when, then: criterion.then }; }),
+          ...(item.expected_outcomes || []).map((outcome, index) => { const itemId = `${item.requirement_id}:${outcome.outcome_id || `EO-${index + 1}`}`; const status = childStatus(itemId); return { item_id: itemId, approved: status === "approved", review_status: status, text: textValue(outcome) }; }),
+        ];
+      });
       const next = await reviewRequirementAnalysis(analysis.analysis_id, {
         reviewer: reviewer.trim(),
         decision: Object.values(reviewStatuses).some((status) => status === "rejected") ? "needs_changes" : "approved",
@@ -264,6 +325,7 @@ export function RequirementsPage({ onContinueToGeneration, onOpenBusinessRequire
   function toggleRequirement(item) {
     const childIds = criteriaItems
       .filter((entry) => entry.id.startsWith(`${item.requirement_id}:`))
+      .concat(outcomeItems.filter((entry) => entry.id.startsWith(`${item.requirement_id}:`)))
       .map((entry) => entry.id);
     const allIds = [item.requirement_id, ...childIds];
     setSelectedItems((items) => {
@@ -306,7 +368,8 @@ export function RequirementsPage({ onContinueToGeneration, onOpenBusinessRequire
       for (const requirementItem of next.contract.requirements || []) {
         if (requirementItem.requirement_id === id) requirementItem.statement = editingValue.trim();
         for (const rule of requirementItem.business_rules || []) if (`${requirementItem.requirement_id}:${rule.rule_id}` === id || rule.rule_id === id) rule.text = editingValue.trim();
-        for (const criterion of requirementItem.acceptance_criteria || []) if (`${requirementItem.requirement_id}:${criterion.acceptance_id}` === id || criterion.acceptance_id === id) criterion.text = editingValue.trim();
+        for (const criterion of requirementItem.acceptance_criteria || []) if (`${requirementItem.requirement_id}:${criterion.acceptance_id}` === id || criterion.acceptance_id === id) { criterion.text = editingValue.trim(); criterion.then = editingValue.trim(); }
+        for (const outcome of requirementItem.expected_outcomes || []) if (`${requirementItem.requirement_id}:${outcome.outcome_id}` === id || outcome.outcome_id === id) outcome.text = editingValue.trim();
       }
       return next;
     });
@@ -314,15 +377,16 @@ export function RequirementsPage({ onContinueToGeneration, onOpenBusinessRequire
     setEditingValue("");
   }
 
-  function selectionRow(id, title, text) {
+  function selectionRow(id, title, text, references = []) {
     return <div className={`selection-item ${selectedItems.includes(id) ? "selected" : ""}`} key={id}>
       <input type="checkbox" checked={selectedItems.includes(id)} onChange={() => toggleItem(id)} />
-      <span className="selection-item-content"><b>{title}</b>{editingItemId === id ? <textarea className="inline-edit" value={editingValue} onChange={(event) => setEditingValue(event.target.value)} /> : <small className="expanded">{text}</small>}{editingItemId === id ? <span className="item-actions"><button type="button" className="secondary-button compact-button" onClick={() => saveEdit(id)}>Save</button><button type="button" className="text-button" onClick={() => setEditingItemId("")}>Cancel</button></span> : <span className="item-actions"><button type="button" className="item-icon-button item-edit" title="Edit item" aria-label={`Edit ${title}`} onClick={(event) => { event.preventDefault(); event.stopPropagation(); startEdit(id, text); }}><Pencil size={14} /></button></span>}</span>
+      <span className="selection-item-content"><b>{title}</b>{editingItemId === id ? <textarea className="inline-edit" value={editingValue} onChange={(event) => setEditingValue(event.target.value)} /> : <><small className="expanded">{text}</small>{references.length > 0 && <small className="source-reference-line">Evidence: {references.map(evidenceLabel).join("; ")}</small>}</>}{editingItemId === id ? <span className="item-actions"><button type="button" className="secondary-button compact-button" onClick={() => saveEdit(id)}>Save</button><button type="button" className="text-button" onClick={() => setEditingItemId("")}>Cancel</button></span> : <span className="item-actions"><button type="button" className="item-icon-button item-edit" title="Edit item" aria-label={`Edit ${title}`} onClick={(event) => { event.preventDefault(); event.stopPropagation(); startEdit(id, text); }}><Pencil size={14} /></button></span>}</span>
     </div>;
   }
 
   function requirementGroup(item, bucketStatus = "pending") {
     const criteria = criteriaItems.filter((entry) => entry.id.startsWith(`${item.requirement_id}:`));
+    const outcomes = outcomeItems.filter((entry) => entry.id.startsWith(`${item.requirement_id}:`));
     const canReview = hasSelectedReviewItem(item);
     const groupKey = `requirement:${item.requirement_id}`;
     const expanded = expandedItems.includes(groupKey);
@@ -331,7 +395,7 @@ export function RequirementsPage({ onContinueToGeneration, onOpenBusinessRequire
         <input className="requirement-group-select" type="checkbox" checked={selectedItems.includes(item.requirement_id)} aria-label={`Select ${item.requirement_id}`} onChange={() => toggleRequirement(item)} />
         <details className="requirement-group-disclosure" open={expanded} onToggle={(event) => { const isOpen = event.currentTarget.open; setExpandedItems((items) => isOpen ? [...new Set([...items, groupKey])] : items.filter((entry) => entry !== groupKey)); }}>
           <summary><div className="requirement-group-summary"><span><div className="requirement-title-row"><b>{item.requirement_id} - {item.title}</b><span className="priority-inline">{item.priority || "Not specified"}</span></div><small>{item.statement}</small><div className="requirement-meta"><div className="meta-badges"><span className="meta-badge">{item.type || "Functional"}</span></div><div className="meta-fact"><strong>Actors</strong><span>{listText(item.actors)}</span></div><div className="meta-fact"><strong>Entities</strong><span>{listText(item.entities)}</span></div></div>{item.ambiguities?.length > 0 && <small className="requirement-warning">Ambiguity: {item.ambiguities.join(" ")}</small>}{item.assumptions?.length > 0 && <small className="requirement-assumption">Assumption: {item.assumptions.join(" ")}</small>}</span></div></summary>
-          <div className="requirement-group-body"><div className="requirement-group-grid"><div><h4>Acceptance criteria</h4>{criteria.length ? criteria.map((entry) => selectionRow(entry.id, entry.title, entry.text)) : <p className="muted">No acceptance criteria extracted.</p>}</div></div></div>
+          <div className="requirement-group-body"><div className="requirement-group-grid"><div><h4>Acceptance criteria</h4>{criteria.length ? criteria.map((entry) => selectionRow(entry.id, entry.title, entry.text, entry.source_references)) : <p className="muted">No acceptance criteria extracted.</p>}</div><div className="requirement-outcomes"><h4>Expected outcomes</h4>{outcomes.length ? outcomes.map((entry) => selectionRow(entry.id, entry.title, entry.text, entry.source_references)) : <p className="muted">No expected outcomes extracted.</p>}</div><div className="requirement-rules"><h4>Approved Business Use Cases</h4>{(item.business_rules || []).length ? <div className="trace-detail-list">{item.business_rules.map((rule, index) => <div className="trace-detail-item" key={`${item.requirement_id}-${rule.rule_id || index}`}><strong>{rule.rule_id || `BR-${index + 1}`}</strong><p>{textValue(rule)}</p>{rule.mapping_basis && <small>{rule.mapping_basis}</small>}{sourceReferences(rule.source_references).length > 0 && <small className="source-reference-line">Evidence: {sourceReferences(rule.source_references).map(evidenceLabel).join("; ")}</small>}</div>)}</div> : <p className="muted">No approved Business Use Case was mapped.</p>}</div><div><h4>Functional flow</h4>{(item.flow_steps || []).length ? <ol>{item.flow_steps.map((step, index) => <li key={`${item.requirement_id}-step-${index}`}>{step}</li>)}</ol> : <p className="muted">No flow steps extracted.</p>}</div><div><h4>Requirement evidence</h4>{sourceReferences(item.source_references).length ? <ul>{sourceReferences(item.source_references).map((ref, index) => <li key={`${ref.fragment_id || ref.source_reference}-${index}`}>{evidenceLabel(ref)}</li>)}</ul> : <p className="muted">No source evidence attached.</p>}</div></div></div>
         </details>
         <span className="requirement-review-actions">{bucketStatus !== "approved" && <button type="button" className="item-icon-button item-approve review-label-button" disabled={!canReview} title={canReview ? "Mark requirement as approved" : "Select an acceptance criterion first"} aria-label={`Mark ${item.title} as approved`} onClick={() => setRequirementReviewStatus(item.requirement_id, "approved")}>Approve</button>}{bucketStatus !== "rejected" && <button type="button" className="item-icon-button item-reject review-label-button" disabled={!canReview} title={canReview ? "Mark requirement as rejected" : "Select an acceptance criterion first"} aria-label={`Mark ${item.title} as rejected`} onClick={() => setRequirementReviewStatus(item.requirement_id, "rejected")}>Reject</button>}{bucketStatus !== "pending" && <button type="button" className="item-icon-button item-reset" title="Return requirement to pending review" aria-label={`Return ${item.title} to pending review`} onClick={() => setRequirementReviewStatus(item.requirement_id, "pending")}><RotateCcw size={14} /></button>}</span>
       </div>
@@ -342,23 +406,52 @@ export function RequirementsPage({ onContinueToGeneration, onOpenBusinessRequire
     return <section className={`review-bucket ${status}`}><div className="review-bucket-header"><h3>{label}</h3><span>{items.length}</span></div>{items.length ? items.map((item) => requirementGroup(item, status)) : <p className="muted">No requirements in this section.</p>}</section>;
   }
 
-  useEffect(() => { listProjects().then((items) => { setProjects(items); if (!project?.project_id && items[0]) selectProject(items[0].project_id); }).catch((err) => setError(err.message)); }, []);
-  useEffect(() => { if (project?.project_id) loadPackages(project.project_id); }, [project?.project_id]);
-  useEffect(() => { if (packageId) loadAnalysis(packageId); }, [packageId]);
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      setLoading(true);
+      try {
+        const items = await listProjects();
+        if (!active) return;
+        setProjects(items);
+        const selectedProject = items.find((item) => item.project_id === project?.project_id) || items[0] || null;
+        setProject(selectedProject);
+        if (!selectedProject) { setPackages([]); setPackageId(""); return; }
+        localStorage.setItem("testiq_current_project", JSON.stringify(selectedProject));
+        const packageItems = await listManifests(selectedProject.project_id);
+        if (!active) return;
+        setPackages(packageItems);
+        const saved = JSON.parse(localStorage.getItem("testiq_current_package") || "null");
+        const selectedPackage = packageItems.find((item) => item.package_id === packageId) || packageItems.find((item) => item.package_id === saved?.package_id) || packageItems[0] || null;
+        setPackageId(selectedPackage?.package_id || "");
+        if (selectedPackage) localStorage.setItem("testiq_current_package", JSON.stringify(selectedPackage));
+      } catch (err) { if (active) setError(err.message); }
+      finally { if (active) setLoading(false); }
+    })();
+    return () => { active = false; };
+  }, []);
+  useEffect(() => { if (packageId && packages.some((item) => item.package_id === packageId)) loadAnalysis(packageId); }, [packageId, packages]);
+  useEffect(() => {
+    if (!analysis?.analysis_id) return;
+    localStorage.setItem(`testiq_functional_review_draft:${analysis.analysis_id}`, JSON.stringify({
+      selectedItems, reviewStatuses, reviewSaved, reviewer, comments, assumptions,
+    }));
+  }, [analysis?.analysis_id, selectedItems, reviewStatuses, reviewSaved, reviewer, comments, assumptions]);
 
   return <div className="requirements-page">
-    <div className="page-heading"><div><div className="eyebrow">APPROVED BUSINESS USE CASES</div><h1>Functional Requirements</h1><p>Generate testable system behavior from approved Business Use Cases, a ready Knowledge Base, and the configured LLM.</p></div><button className="secondary-button" onClick={() => loadPackages()} disabled={loading}>{loading ? <LoadingSpinner variant="inline" label="Refreshing" /> : <><RefreshCw size={16} /> Refresh</>}</button></div>
-    <div className="requirements-toolbar"><div><label>Project</label><select value={project?.project_id || ""} onChange={(event) => selectProject(event.target.value)} disabled={running}><option value="">Select project</option>{projects.map((item) => <option key={item.project_id} value={item.project_id}>{item.project_name}</option>)}</select></div><div><label>Source package</label><select value={packageId} onChange={(event) => selectPackage(event.target.value)} disabled={!packages.length || running}><option value="">Select package</option>{packages.map((item) => <option key={item.package_id} value={item.package_id}>{packageOptionLabel(item)}</option>)}</select></div>{running ? <section className="generation-progress generation-progress--toolbar" role="status" aria-live="polite"><div className="generation-progress-track" role="progressbar" aria-label="Functional requirements generation progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow={progressPercent}><span style={{ width: `${progressPercent}%` }} /></div><b className="generation-progress-value">{progressPercent}%</b><div className="generation-progress-copy"><strong>Generating Functional Requirements</strong><span>{FUNCTIONAL_PROGRESS_MESSAGES[progressMessageIndex]}...</span></div></section> : <button className="primary-button requirements-run-button" onClick={runAnalysis} disabled={!packageId || loading || !approvedBusinessRequirements.length}>{analysis ? <><RefreshCw size={16} /> Regenerate Functional Requirements</> : <><Play size={16} /> Generate Functional Requirements</>}</button>}</div>
+    <div className="page-heading"><div><div className="eyebrow">REQUIREMENT ANALYSIS</div><h1>Functional Requirements</h1><p>Create detailed, testable requirements from approved Business Use Cases and evidence retrieved from the Knowledge Base.</p></div><button className="secondary-button" onClick={refreshWorkspace} disabled={loading}>{loading ? <LoadingSpinner variant="inline" label="Refreshing" /> : <><RefreshCw size={16} /> Refresh</>}</button></div>
+    <div className="requirements-toolbar"><div><label>Project</label><select value={project?.project_id || ""} onChange={(event) => selectProject(event.target.value)} disabled={running}><option value="">Select project</option>{projects.map((item) => <option key={item.project_id} value={item.project_id}>{item.project_name}</option>)}</select></div><div><label>Resource Package</label><select value={packageId} onChange={(event) => selectPackage(event.target.value)} disabled={!packages.length || running}><option value="">Select Resource Package</option>{packages.map((item) => <option key={item.package_id} value={item.package_id}>{packageOptionLabel(item)}</option>)}</select></div>{running ? <section className="generation-progress generation-progress--toolbar" role="status" aria-live="polite"><div className="generation-progress-track" role="progressbar" aria-label="Functional requirements generation progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow={progressPercent}><span style={{ width: `${progressPercent}%` }} /></div><b className="generation-progress-value">{progressPercent}%</b><div className="generation-progress-copy"><strong>Generating Functional Requirements</strong><span>{FUNCTIONAL_PROGRESS_MESSAGES[progressMessageIndex]}...</span></div></section> : <button className="primary-button requirements-run-button" onClick={runAnalysis} disabled={!packageId || loading || !approvedBusinessRequirements.length || !knowledgeReadiness?.ready}>{analysis ? <><RefreshCw size={16} /> Regenerate Functional Requirements</> : <><Play size={16} /> Generate Functional Requirements</>}</button>}</div>
     {error && <div className="error-message"><AlertCircle size={17} /> {error}</div>}
-    {loading && !running && <LoadingSpinner variant="page" label="Loading functional requirements" detail="Retrieving approved use cases and the latest analysis." />}
-    {!loading && !selectedPackage && <section className="requirements-empty"><div className="empty-state-icon"><FileSearch size={25} /></div><h2>Select an existing source package</h2><p>Your uploaded BRD and created package will appear here.</p></section>}
-    {!loading && selectedPackage && !analysis && <section className="requirements-empty"><div className="empty-state-icon"><FileSearch size={25} /></div><h2>{approvedBusinessRequirements.length ? "Approved business use cases are ready" : "Approve business use cases first"}</h2><p>{approvedBusinessRequirements.length ? `${approvedBusinessRequirements.length} approved use case(s) will be used with the selected package's ready Knowledge Base and configured LLM. Generation requires both.` : "Generate business use cases, review them, and approve at least one before generating Functional Requirements."}</p>{!approvedBusinessRequirements.length && <button type="button" className="primary-button business-back-button" aria-label="Go to Business Use Cases" data-tooltip="Go to Business Use Cases" onClick={() => onOpenBusinessRequirements?.()} disabled={!onOpenBusinessRequirements}><ArrowLeft size={17} /></button>}</section>}
+    {loading && !running && <LoadingSpinner variant="page" label="Loading Functional Requirements" detail="Checking approved Business Use Cases, Knowledge Base readiness, and the latest requirement version." />}
+    {!loading && !selectedPackage && <section className="requirements-empty"><div className="empty-state-icon"><FileSearch size={25} /></div><h2>Select a Resource Package</h2><p>Select the package containing the BRD you want to analyze.</p></section>}
+    {!loading && selectedPackage && !analysis && <section className="requirements-empty"><div className="empty-state-icon"><FileSearch size={25} /></div><h2>{!approvedBusinessRequirements.length ? "Approve Business Use Cases first" : !knowledgeReadiness?.ready ? "Build the Knowledge Base first" : "Ready to generate Functional Requirements"}</h2><p>{!approvedBusinessRequirements.length ? "Generate the Business Use Cases and complete every approval or rejection decision." : !knowledgeReadiness?.ready ? "The approved Business Use Cases are ready. Build the Knowledge Base so requirement generation can retrieve supporting evidence." : `${approvedBusinessRequirements.length} approved Business Use Case${approvedBusinessRequirements.length === 1 ? "" : "s"} and the Knowledge Base are ready.`}</p>{!approvedBusinessRequirements.length ? <button type="button" className="primary-button business-back-button" onClick={() => onOpenBusinessRequirements?.()} disabled={!onOpenBusinessRequirements}>Open Business Use Cases</button> : !knowledgeReadiness?.ready ? <button type="button" className="primary-button business-back-button" onClick={() => onOpenKnowledgeBase?.()} disabled={!onOpenKnowledgeBase}>Open Knowledge Base</button> : null}</section>}
     {!loading && analysis && <>
-      <section className="requirements-status-card"><div className="requirements-status-icon"><CheckCircle2 size={22} /></div><div><div className="eyebrow">FUNCTIONAL REQUIREMENTS · VERSION {analysis.analysis_version}</div><h4>Generated from approved business use cases</h4><p>{knowledgeUsed ? `Generated from approved use cases and retrieved Knowledge Base evidence with ${analysis.contract?.generation_model || "the configured LLM"}.` : "This saved analysis predates the required Knowledge Base retrieval. Regenerate after the package Knowledge Base is ready."}</p></div><span className={`requirements-status ${analysis.status}`}>{statusText(analysis.status)}</span></section>
-      <div className="requirements-summary-grid"><div><span>Functional requirements</span><strong>{requirements.length}</strong></div><div><span>Acceptance criteria</span><strong>{criteriaItems.length}</strong></div></div>
+      <section className="requirements-status-card"><div className="requirements-status-icon"><CheckCircle2 size={22} /></div><div><div className="eyebrow">FUNCTIONAL REQUIREMENTS · VERSION {analysis.analysis_version}</div><h4>Generated from approved Business Use Cases</h4><p>{knowledgeUsed ? "The analysis used approved Business Use Cases and supporting evidence retrieved from the Knowledge Base." : "This version does not contain Knowledge Base evidence. Generate a new version after the Knowledge Base is ready."}</p></div><div className="requirements-document-actions"><span className={`requirements-status ${analysis.status}`}>{statusText(analysis.status)}</span><button type="button" className="secondary-button compact-button" onClick={downloadJson} disabled={!requirements.some((item) => selectedItems.includes(item.requirement_id))}><Download size={14} /> Export selected JSON</button></div></section>
+      <div className="requirements-summary-grid requirement-review-summary"><div><span>Functional requirements</span><strong>{requirements.length}</strong></div><div><span>Approved rule mappings</span><strong>{businessRuleCount}</strong></div><div><span>Acceptance criteria</span><strong>{criteriaItems.length}</strong></div><div><span>Expected outcomes</span><strong>{outcomeItems.length}</strong></div><div><span>Source citations</span><strong>{sourceReferenceCount}</strong></div></div>
       {readinessChecks.length > 0 && <details className="requirements-panel readiness-panel readiness-dropdown-panel" open={(readiness.status || "needs_review") !== "ready"}><summary className="readiness-summary"><div><h2>Readiness for test generation</h2><p className="panel-helper">Checks whether the approved requirement detail is enough for reliable test design.</p></div><span className="readiness-summary-meta"><span className={`readiness-status ${readiness.status || "needs_review"}`}>{statusText(readiness.status || "needs_review")}</span>{passedReadinessCount} of {readinessChecks.length} passed · View details</span></summary><div className="readiness-list">{readinessChecks.map((check) => <div className={`readiness-check-row ${check.status}`} key={check.check_id}><span className="readiness-check-icon"><CheckCircle2 size={15} /></span><div><strong>{check.label}</strong><p>{check.details}</p></div><span>{statusText(check.status)}</span></div>)}</div>{readinessGapItems.length > 0 && <ul className="readiness-gaps">{readinessGapItems.map((gap) => <li key={gap}>{gap}</li>)}</ul>}</details>}
       {conflictItems.length > 0 && <details className="requirements-panel clarification-panel"><summary className="clarification-summary"><div><h2><AlertCircle size={18} /> Review questions detected</h2><p className="panel-helper">Some terms may need confirmation during requirement review. These are not package errors.</p></div><span>{conflictItems.length} questions · View details</span></summary><ul className="clarification-list">{conflictItems.map((conflict) => <li key={conflict.conflict_id || conflict.description}><strong>{conflict.conflict_id || "Question"}: </strong>{conflictDescriptionText(conflict)}<small>{conflict.severity ? `Severity: ${conflict.severity}` : ""}</small></li>)}</ul></details>}
       {contract?.global_assumptions?.length > 0 && <section className="requirements-panel assumptions-panel"><div className="panel-title-row"><h2>Package-level assumptions</h2><span>{contract.global_assumptions.length}</span></div><ul>{contract.global_assumptions.map((assumption) => <li key={assumption}>{assumption}</li>)}</ul></section>}
+      {contract?.technical_gaps?.length > 0 && <details className="requirements-panel warning-panel"><summary className="clarification-summary"><div><h2><AlertCircle size={18} /> Technical gaps</h2><p className="panel-helper">Implementation details that need clarification before complete test coverage is possible.</p></div><span>{contract.technical_gaps.length} gaps · View details</span></summary><ul>{contract.technical_gaps.map((gap, index) => <li key={gap.gap_id || index}><strong>{gap.gap_id || `Technical gap ${index + 1}`}: </strong>{gap.text}<small>Evidence: {sourceReferences(gap.source_references).map(evidenceLabel).join("; ") || gap.technical_reference}</small></li>)}</ul></details>}
       <section className="requirements-panel nested-requirements-panel"><div className="panel-title-row"><div><h2>Requirements and related evidence</h2><p className="panel-helper">Select requirements and their acceptance criteria before approving or rejecting them.</p></div><span>{selectedItems.filter((id) => requirements.some((item) => item.requirement_id === id)).length} selected</span></div><div className="selection-actions"><label className="select-all"><input type="checkbox" checked={selectableItems.length > 0 && selectableItems.every((item) => selectedItems.includes(item.id))} onChange={(event) => toggleAll(event.target.checked)} /> Select all</label><div className="review-move-actions"><button type="button" className="review-icon-action review-label-action approved-action" disabled={!requirements.some((item) => selectedItems.includes(item.requirement_id) && hasSelectedReviewItem(item))} title="Mark selected requirements as approved" aria-label="Mark selected requirements as approved" onClick={() => moveSelectedRequirements("approved")}>Approve</button><button type="button" className="review-icon-action review-label-action rejected-action" disabled={!requirements.some((item) => selectedItems.includes(item.requirement_id) && hasSelectedReviewItem(item))} title="Mark selected requirements as rejected" aria-label="Mark selected requirements as rejected" onClick={() => moveSelectedRequirements("rejected")}>Reject</button><button className="text-button" onClick={() => toggleAll(false)}>Clear all</button></div></div><div className="review-buckets"><div className="pending-bucket">{requirementBucket("Pending review", "pending", visibleRequirements.filter((item) => (reviewStatuses[item.requirement_id] || "pending") === "pending"))}</div><div className="review-bucket-columns">{requirementBucket("Approved requirements", "approved", visibleRequirements.filter((item) => reviewStatuses[item.requirement_id] === "approved"))}{requirementBucket("Rejected requirements", "rejected", visibleRequirements.filter((item) => reviewStatuses[item.requirement_id] === "rejected"))}</div></div><div className="requirements-pagination"><span>Showing {(page - 1) * FUNCTIONAL_PAGE_SIZE + 1}-{Math.min(page * FUNCTIONAL_PAGE_SIZE, requirements.length)} of {requirements.length}</span><div><button type="button" className="secondary-button" aria-label="Previous functional requirements page" disabled={page === 1} onClick={() => setPage((current) => current - 1)}><ChevronLeft size={15} /> Previous</button><span>Page {page} of {pageCount}</span><button type="button" className="secondary-button" aria-label="Next functional requirements page" disabled={page === pageCount} onClick={() => setPage((current) => current + 1)}>Next <ChevronRight size={15} /></button></div></div></section>
       {findings.length > 0 && <section className="requirements-panel"><div className="panel-title-row"><h2><AlertCircle size={18} /> Review notes</h2><span>{findings.length} found</span></div><ul>{findings.map((item, index) => <li key={`${item.text}-${index}`}><strong>{item.kind}: </strong>{item.text}</li>)}</ul></section>}
       {!reviewSaved ? <section className="requirements-review-card"><div><div className="eyebrow">HUMAN REVIEW</div><h2>Finalize requirement review</h2><p>Save the review decision and notes. Only approved requirements continue to test-case generation.</p></div><div className="review-fields"><label>Reviewer<input value={reviewer} onChange={(event) => setReviewer(event.target.value)} /></label><label>Accepted assumptions <span>(optional, one per line)</span><textarea value={assumptions} onChange={(event) => setAssumptions(event.target.value)} placeholder="Example: SMS provider response is treated as the observable delivery outcome" /></label><label>Review comments<textarea value={comments} onChange={(event) => setComments(event.target.value)} placeholder="Add review notes" /></label><button className="primary-button" onClick={approve} disabled={reviewing || selectedItems.length === 0}>{reviewing ? <LoadingSpinner variant="inline" label="Saving review" /> : <><ShieldCheck size={16} /> Save review</>}</button></div></section> : <section className="review-complete-card"><div className="review-complete-icon"><CheckCircle2 size={22} /></div><div><div className="eyebrow">REVIEW SAVED</div><h2>Approved requirements are ready</h2><p>{requirements.filter((item) => reviewStatuses[item.requirement_id] === "approved").length} requirement{requirements.filter((item) => reviewStatuses[item.requirement_id] === "approved").length === 1 ? "" : "s"} will be used for test-case generation. Pending and rejected requirements are excluded.</p></div><button className="primary-button" onClick={() => onContinueToGeneration?.(analysis)} disabled={!onContinueToGeneration}><Play size={16} /> Continue to Test Case Generation</button></section>}

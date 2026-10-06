@@ -2,6 +2,7 @@ import base64, hashlib, io, json, os, re
 from pathlib import Path
 from typing import Any
 from .config import OPENAI_MODEL, OPENAI_TIMEOUT_SECONDS
+from .openai_requests import responses_create
 
 OPENAI_PROMPT_TEMPLATE = (
     "You are extracting a business requirements document for audit and test design.\n\n"
@@ -261,7 +262,7 @@ def extract_openai(text: str) -> tuple[str, list[dict[str, Any]]]:
         "required": ["text", "sections"],
     }
     prompt = OPENAI_PROMPT_TEMPLATE + text
-    response = client.responses.create(
+    response = responses_create(client,
         model=OPENAI_MODEL,
         input=prompt,
         store=False,
@@ -313,7 +314,7 @@ def extract_openai_file(content: bytes, filename: str) -> tuple[str, list[dict[s
         "properties": {"text": {"type": "string"}},
         "required": ["text"],
     }
-    response = client.responses.create(
+    response = responses_create(client,
         model=OPENAI_MODEL,
         input=[{
             "role": "user",

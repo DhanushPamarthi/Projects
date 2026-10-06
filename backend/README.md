@@ -9,10 +9,14 @@ FastAPI service for BRD ingestion, source-package creation, and Requirements Ana
 - Extracts traceable fragments with paragraph, table, page, or line references.
 - Uses OpenAI file extraction for BRDs and supporting sources, with local extraction as a documented fallback when the OpenAI call fails.
 - Creates immutable source-package manifests.
+- Extracts BRD business rules for explicit approve/reject review before indexing.
+- Maintains an immutable, project-level Knowledge Base version for every reviewed resource package.
+- Reuses unchanged chunks, embeddings, and graph facts across compatible versions; only new or changed content is reprocessed.
+- Uses hybrid vector, keyword, and graph retrieval with reciprocal-rank fusion and semantic reranking.
 - Generates versioned Requirements Analysis contracts from the selected package.
 - Supports reviewer decisions, comments, accepted assumptions, ambiguity/conflict findings, and readiness status.
 
-Knowledge Fabric/GraphRAG is intentionally not part of this POC. Requirements Analysis reads the frozen source-package fragments directly.
+Downstream LLM generation is grounded with the package-pinned Knowledge Base version. Retrieval selects evidence; the LLM analyzes and structures that evidence.
 
 ## Prerequisites
 
@@ -56,11 +60,23 @@ TESTIQ_DB_PATH=./data/testiq.db
 OPENAI_API_KEY=
 OPENAI_MODEL=gpt-4o-mini
 OPENAI_TIMEOUT_SECONDS=90
+OPENAI_PROMPT_CACHING_MODE=disabled
+TESTIQ_PGVECTOR_MODE=auto
+TESTIQ_POSTGRES_LOCK_TIMEOUT_MS=5000
+TESTIQ_POSTGRES_STATEMENT_TIMEOUT_MS=90000
 MAX_UPLOAD_BYTES=26214400
 # REQUIRED_BRD_SECTIONS=Scope,Requirements,Acceptance Criteria
 ```
 
 `DATABASE_URL` overrides the individual `TESTIQ_POSTGRES_*` values. If neither `DATABASE_URL` nor `TESTIQ_POSTGRES_HOST` is set, the service uses local SQLite at `TESTIQ_DB_PATH`. The application creates the `testiq` schema tables at startup. Original uploads are stored under `TESTIQ_DATA_DIR/uploads`.
+
+`TESTIQ_PGVECTOR_MODE` supports `auto`, `disabled`, and `required`. `auto` uses pgvector when the server provides it and otherwise uses the PostgreSQL-backed Python cosine fallback. `disabled` explicitly selects that fallback; embeddings remain persisted in PostgreSQL, keyword retrieval preselects a broad vector candidate pool, and cosine scoring, graph expansion, reciprocal-rank fusion, and semantic reranking remain active. `required` stops startup when pgvector cannot be enabled.
+
+### OpenAI prompt-caching cost control
+
+Prompt caching applies to input tokens, not generated output tokens. Cached reads are normally cheaper, but cache writes for GPT-5.6+ can cost more. Caching also requires a repeated prompt prefix; exceeding 1,024 tokens alone is not sufficient.
+
+The current TestIQ `.env` uses `gpt-4o-mini`, not GPT-5.6, so GPT-5.6 explicit-cache controls do not apply directly to that model. TestIQ defaults `OPENAI_PROMPT_CACHING_MODE=disabled`: it adds a unique per-request marker to prevent repeated prompts from reusing the cache, and applies explicit-only mode when GPT-5.6+ is configured. Set the mode to `explicit` to use GPT-5.6+ explicit-only caching, or `implicit` to retain the provider default. Refer to the [OpenAI Prompt Caching documentation](https://developers.openai.com/api/docs/guides/prompt-caching) for current model behavior and pricing.
 
 The shared database already has the `testiq` database and `testiq` schema. To create or update the TestIQ control-plane tables in that schema without starting the API, run:
 
@@ -73,8 +89,10 @@ uv run python scripts/init_testiq_schema.py
 From this directory:
 
 ```powershell
-uv run python -m uvicorn app.main:app --reload --env-file .env --host 127.0.0.1 --port 8001
+uv run python -m uvicorn app.main:app --reload --reload-dir app --env-file .env --host 127.0.0.1 --port 8001
 ```
+
+Use `--reload-dir app` during development. It prevents test files, temporary data, and generated artifacts from triggering backend reloads and avoids interrupted child-process imports during rapid file changes.
 
 Endpoints:
 
@@ -95,9 +113,10 @@ Expected health response:
 3. Poll `GET /api/v1/revisions/{revision_id}` until `extraction.status` is `succeeded`, `failed`, or `skipped`.
 4. Upload optional supporting sources. Every supporting source must include the BRD's `brd_source_id`.
 5. Create a frozen package with `POST /api/v1/projects/{project_id}/manifests`.
-6. Start Requirements Analysis with `POST /api/v1/packages/{package_id}/requirements/analyze`.
-7. Review the resulting contract with `POST /api/v1/requirement-analyses/{analysis_id}/review`.
-8. Use the approved contract as the input to the future Test Case Generation step.
+6. Review all extracted business rules with `POST /api/v1/packages/{package_id}/business-rules/review`.
+7. Build the next persistent Knowledge Base version with `POST /api/v1/packages/{package_id}/knowledge-index`.
+8. Generate Business Use Cases and Functional Requirements from retrieved knowledge.
+9. Review the resulting requirements and continue to RAG-grounded Test Case and Test Data generation.
 
 ## API endpoints
 
@@ -117,6 +136,11 @@ Expected health response:
 | POST   | `/api/v1/projects/{project_id}/manifests`                     | Create an immutable source package                 |
 | GET    | `/api/v1/projects/{project_id}/manifests`                     | List package versions                              |
 | GET    | `/api/v1/manifests/{package_id}`                              | Read exact package revisions                       |
+| GET    | `/api/v1/packages/{package_id}/business-rules`                 | List source-derived business rules                 |
+| POST   | `/api/v1/packages/{package_id}/business-rules/review`          | Save and verify rule decisions                     |
+| POST   | `/api/v1/packages/{package_id}/knowledge-index`                | Build an immutable Knowledge Base version          |
+| GET    | `/api/v1/packages/{package_id}/knowledge-indexes`              | List package Knowledge Base indexes                |
+| GET    | `/api/v1/projects/{project_id}/knowledge-versions`             | List project Knowledge Base history                |
 | POST   | `/api/v1/packages/{package_id}/requirements/analyze`          | Generate a Requirements Analysis version           |
 | GET    | `/api/v1/packages/{package_id}/requirements`                  | List analysis versions                             |
 | GET    | `/api/v1/requirement-analyses/{analysis_id}`                  | Read an analysis contract                          |
@@ -179,6 +203,10 @@ The tests cover upload validation, extraction fallback, duplicate and changed re
 ### PostgreSQL connection failure
 
 Confirm PostgreSQL is running, the role/database exist, and `DATABASE_URL` uses the correct host, port, user, password, and database.
+
+### pgvector is unavailable
+
+Set `TESTIQ_PGVECTOR_MODE=disabled` temporarily. This keeps PostgreSQL as the system of record and uses Python cosine similarity for vector scoring. After a database administrator installs pgvector and runs `CREATE EXTENSION IF NOT EXISTS vector`, set the mode back to `auto` and restart the backend.
 
 ### Extraction remains pending
 

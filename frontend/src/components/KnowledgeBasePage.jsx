@@ -1,16 +1,26 @@
 import { useEffect, useMemo, useState } from "react";
-import { BookOpen, CheckCircle2, Database, LoaderCircle, RefreshCw, Search } from "lucide-react";
-import { buildKnowledgeIndex, evaluateKnowledgeIndex, getRagReadiness, listKnowledgeIndexes, listManifests, listProjects, retrieveKnowledge } from "../api/client.js";
+import { BookOpen, CheckCircle2, Database, History, LoaderCircle, RefreshCw, Search } from "lucide-react";
+import {
+  buildKnowledgeIndex, evaluateKnowledgeIndex, getKnowledgeSummary, listManifests,
+  listProjects, retrieveKnowledge,
+} from "../api/client.js";
 import { LoadingSpinner } from "./LoadingSpinner.jsx";
 
-export function KnowledgeBasePage({ onContinueToBusinessRequirements }) {
+function editableRules(payload) {
+  return (payload?.rules || []).map((rule) => ({ ...rule, decision: rule.status || rule.decision || "pending", review_comment: rule.review_comment || "" }));
+}
+
+export function KnowledgeBasePage({ onContinueToFunctional, onOpenBusinessRequirements }) {
   const [projects, setProjects] = useState([]);
   const [project, setProject] = useState(() => JSON.parse(localStorage.getItem("testiq_current_project") || "null"));
   const [packages, setPackages] = useState([]);
   const [packageId, setPackageId] = useState(() => JSON.parse(localStorage.getItem("testiq_current_package") || "null")?.package_id || "");
   const [indexes, setIndexes] = useState([]);
+  const [versions, setVersions] = useState([]);
   const [readiness, setReadiness] = useState(null);
   const [selectedIndex, setSelectedIndex] = useState(null);
+  const [ruleState, setRuleState] = useState(null);
+  const [ruleDrafts, setRuleDrafts] = useState([]);
   const [query, setQuery] = useState("");
   const [retrieval, setRetrieval] = useState(null);
   const [evaluation, setEvaluation] = useState(null);
@@ -19,55 +29,36 @@ export function KnowledgeBasePage({ onContinueToBusinessRequirements }) {
   const [notice, setNotice] = useState("");
 
   function clearSelectedPackage() {
-    setPackageId("");
-    setIndexes([]);
-    setReadiness(null);
-    setSelectedIndex(null);
-    setRetrieval(null);
-    setEvaluation(null);
-    localStorage.removeItem("testiq_current_package");
+    setPackageId(""); setIndexes([]); setReadiness(null); setSelectedIndex(null); setRuleState(null); setRuleDrafts([]);
+    setRetrieval(null); setEvaluation(null); localStorage.removeItem("testiq_current_package");
   }
 
   async function loadPackage(id = packageId, options = {}) {
     const silent = Boolean(options.silent);
-    if (!id) {
-      setIndexes([]);
-      setReadiness(null);
-      setSelectedIndex(null);
-      if (!silent) setWorking("");
-      return;
-    }
-    if (!silent) {
-      setWorking("load");
-      setError("");
-    }
+    if (!id) return;
+    if (!silent) { setWorking("load"); setError(""); }
     try {
-      const [nextIndexes, nextReadiness] = await Promise.all([listKnowledgeIndexes(id), getRagReadiness(id)]);
+      const summary = await getKnowledgeSummary(id, silent || options.refresh ? { cache: "no-store" } : {});
+      const nextIndexes = summary.indexes || [];
+      const nextReadiness = summary.readiness || null;
+      const nextRules = summary.business_rules || null;
+      const nextVersions = summary.versions || [];
       const list = Array.isArray(nextIndexes) ? nextIndexes : nextIndexes?.indexes || [];
-      setIndexes(list);
-      setReadiness(nextReadiness);
-      setSelectedIndex((current) => list.find((item) => item.index_id === current?.index_id) || list[0] || null);
-      if (!silent) {
-        setRetrieval(null);
-        setEvaluation(null);
-      }
+      setIndexes(list); setVersions(Array.isArray(nextVersions) ? nextVersions : []); setReadiness(nextReadiness);
+      setRuleState(nextRules); setRuleDrafts(editableRules(nextRules));
+      setSelectedIndex((current) => list.find((item) => item.index_id === current?.index_id)
+        || list.find((item) => item.index_id === nextReadiness?.index_id) || list[0] || null);
+      if (!silent) { setRetrieval(null); setEvaluation(null); }
     } catch (err) {
-      if (err.status === 404) {
-        clearSelectedPackage();
-        setError("Selected source package was not found. Choose an available source package or create a new one.");
-      } else if (!silent) {
-        setError(err.message);
-      }
-    } finally {
-      if (!silent) setWorking("");
-    }
+      if (err.status === 404) { clearSelectedPackage(); setError("Selected Resource Package was not found."); }
+      else if (!silent) setError(err.message);
+    } finally { if (!silent) setWorking(""); }
   }
 
   useEffect(() => {
     let active = true;
     async function initialize() {
-      setWorking("projects");
-      setError("");
+      setWorking("projects"); setError("");
       try {
         const allProjects = await listProjects();
         if (!active) return;
@@ -75,259 +66,121 @@ export function KnowledgeBasePage({ onContinueToBusinessRequirements }) {
         const storedProject = JSON.parse(localStorage.getItem("testiq_current_project") || "null");
         const storedPackage = JSON.parse(localStorage.getItem("testiq_current_package") || "null");
         const chosenProject = allProjects.find((item) => item.project_id === project?.project_id)
-          || allProjects.find((item) => item.project_id === storedProject?.project_id)
-          || allProjects[0]
-          || null;
+          || allProjects.find((item) => item.project_id === storedProject?.project_id) || allProjects[0] || null;
         setProject(chosenProject);
-        if (!chosenProject) {
-          setPackages([]);
-          clearSelectedPackage();
-          localStorage.removeItem("testiq_current_project");
-          return;
-        }
+        if (!chosenProject) { setPackages([]); clearSelectedPackage(); return; }
         localStorage.setItem("testiq_current_project", JSON.stringify(chosenProject));
         const projectPackages = await listManifests(chosenProject.project_id);
         if (!active) return;
         setPackages(projectPackages);
         const chosenPackage = projectPackages.find((item) => item.package_id === packageId)
-          || projectPackages.find((item) => item.package_id === storedPackage?.package_id)
-          || projectPackages[0]
-          || null;
+          || projectPackages.find((item) => item.package_id === storedPackage?.package_id) || projectPackages[0] || null;
         setPackageId(chosenPackage?.package_id || "");
-        if (chosenPackage) {
-          localStorage.setItem("testiq_current_package", JSON.stringify(chosenPackage));
-        } else {
-          clearSelectedPackage();
-        }
-      } catch (err) {
-        if (active) setError(err.message);
-      } finally {
-        if (active) setWorking("");
-      }
+        if (chosenPackage) localStorage.setItem("testiq_current_package", JSON.stringify(chosenPackage));
+      } catch (err) { if (active) setError(err.message); }
+      finally { if (active) setWorking(""); }
     }
     initialize();
     return () => { active = false; };
   }, []);
 
-  useEffect(() => {
-    if (packageId && packages.some((item) => item.package_id === packageId)) loadPackage(packageId);
-  }, [packageId, packages]);
+  useEffect(() => { if (packageId && packages.some((item) => item.package_id === packageId)) loadPackage(packageId); }, [packageId, packages]);
 
   const chosenPackage = useMemo(() => packages.find((item) => item.package_id === packageId), [packages, packageId]);
-  const statusLabel = readiness?.ready ? "Ready" : selectedIndex?.status || readiness?.status || "Not built";
-  const hasReadyIndex = selectedIndex?.status === "ready" && readiness?.ready !== false;
   const latestIndex = useMemo(() => indexes.find((item) => item.index_id === readiness?.index_id) || indexes[0] || null, [indexes, readiness?.index_id]);
   const progressIndex = latestIndex || selectedIndex;
+  const hasReadyIndex = Boolean(readiness?.ready && indexes.some((item) => item.index_id === readiness.index_id));
+  const approvedCount = ruleDrafts.filter((rule) => rule.decision === "approved").length;
+  const rejectedCount = ruleDrafts.filter((rule) => rule.decision === "rejected").length;
+  const pendingCount = ruleDrafts.length - approvedCount - rejectedCount;
+  const reviewComplete = ruleState?.review_status === "approved" && Number(ruleState?.counts?.approved || 0) > 0;
   const storedProgress = Number(readiness?.progress_percent ?? progressIndex?.progress_percent ?? 0);
   const knowledgeProgress = Math.max(0, Math.min(100, working === "build" ? Math.max(5, storedProgress) : storedProgress));
-  const knowledgeStage = readiness?.progress_stage || progressIndex?.progress_stage || progressIndex?.status || statusLabel;
-  const knowledgeMessage = readiness?.progress_message || progressIndex?.progress_message || readiness?.message || "Knowledge Base status is checked from the latest package index.";
-  const isKnowledgeBuilding = working === "build" || readiness?.index_status === "building" || readiness?.status === "building" || progressIndex?.status === "building";
+  const knowledgeStage = readiness?.progress_stage || progressIndex?.progress_stage || progressIndex?.status || "Not built";
+  const knowledgeMessage = readiness?.progress_message || progressIndex?.progress_message || readiness?.message || "Complete the Business Use Case review before building the Knowledge Base.";
+  const isKnowledgeBuilding = working === "build" || readiness?.index_status === "building" || progressIndex?.status === "building";
   const isLoadingWorkspace = working === "projects";
   const isLoadingKnowledge = working === "load" && Boolean(chosenPackage);
 
   useEffect(() => {
     if (!packageId || !isKnowledgeBuilding) return undefined;
-    const timer = window.setInterval(() => loadPackage(packageId, { silent: true }), 2500);
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") loadPackage(packageId, { silent: true });
+    }, 5000);
     return () => window.clearInterval(timer);
   }, [packageId, isKnowledgeBuilding]);
 
   async function selectProject(id) {
-    setWorking("projects");
-    setError("");
-    const chosen = projects.find((item) => item.project_id === id);
-    const storedPackage = JSON.parse(localStorage.getItem("testiq_current_package") || "null");
-    setProject(chosen || null);
-    setPackages([]);
-    clearSelectedPackage();
+    setWorking("projects"); setError(""); setNotice("");
+    const chosen = projects.find((item) => item.project_id === id) || null;
+    setProject(chosen); setPackages([]); setVersions([]); clearSelectedPackage();
     try {
-      if (chosen) {
-        localStorage.setItem("testiq_current_project", JSON.stringify(chosen));
-        const rows = await listManifests(id);
-        setPackages(rows);
-        const chosenPackage = rows.find((item) => item.package_id === storedPackage?.package_id) || rows[0] || null;
-        setPackageId(chosenPackage?.package_id || "");
-        if (chosenPackage) localStorage.setItem("testiq_current_package", JSON.stringify(chosenPackage));
-        else clearSelectedPackage();
-      } else {
-        localStorage.removeItem("testiq_current_project");
-        clearSelectedPackage();
-      }
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setWorking("");
-    }
+      if (!chosen) return;
+      localStorage.setItem("testiq_current_project", JSON.stringify(chosen));
+      const rows = await listManifests(id); setPackages(rows);
+      const first = rows[0] || null; setPackageId(first?.package_id || "");
+      if (first) localStorage.setItem("testiq_current_package", JSON.stringify(first));
+    } catch (err) { setError(err.message); }
+    finally { setWorking(""); }
+  }
+
+  async function performBuild() {
+    setWorking("build"); setError("");
+    const built = await buildKnowledgeIndex(packageId);
+    setNotice(built.reused ? `Knowledge Base version ${built.knowledge_version} was already current.`
+      : `Knowledge Base version ${built.knowledge_version} is ready: ${built.reused_chunk_count || 0} chunks reused and ${built.new_chunk_count || 0} added or changed.`);
+    await loadPackage(packageId, { silent: true });
+    if (built.index_id) setSelectedIndex(built);
+    return built;
   }
 
   async function buildIndex() {
-    if (!packageId) return;
-    setWorking("build");
-    setError("");
-    setNotice("");
-    try {
-      const built = await buildKnowledgeIndex(packageId);
-      setNotice(built.reused ? "Knowledge Base is already ready for this package." : "Knowledge Base is ready for this package.");
-      await loadPackage(packageId, { silent: true });
-      if (built.index_id) setSelectedIndex(built);
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setWorking("");
-    }
+    try { await performBuild(); } catch (err) { setError(err.message); } finally { setWorking(""); }
   }
 
   async function runRetrieval(event) {
-    event.preventDefault();
-    if (!selectedIndex || !query.trim()) return;
-    setWorking("retrieve");
-    setError("");
-    setRetrieval(null);
-    try {
-      setRetrieval(await retrieveKnowledge(selectedIndex.index_id, { query: query.trim(), requested_by: "TestIQ user", purpose: "workspace_exploration" }));
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setWorking("");
-    }
+    event.preventDefault(); if (!selectedIndex || !query.trim()) return;
+    setWorking("retrieve"); setError(""); setRetrieval(null);
+    try { setRetrieval(await retrieveKnowledge(selectedIndex.index_id, { query: query.trim(), requested_by: "TestIQ user", purpose: "workspace_exploration" })); }
+    catch (err) { setError(err.message); } finally { setWorking(""); }
   }
 
   async function runEvaluation() {
-    if (!selectedIndex) return;
-    setWorking("evaluate");
-    setError("");
-    setEvaluation(null);
-    try {
-      setEvaluation(await evaluateKnowledgeIndex(selectedIndex.index_id));
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setWorking("");
-    }
+    if (!selectedIndex) return; setWorking("evaluate"); setError(""); setEvaluation(null);
+    try { setEvaluation(await evaluateKnowledgeIndex(selectedIndex.index_id)); } catch (err) { setError(err.message); } finally { setWorking(""); }
   }
 
   return <div className="packages-page knowledge-page">
-    <div className="page-heading">
-      <div>
-        <div className="eyebrow">WORKSPACE TOOLS</div>
-        <h1>Knowledge Base</h1>
-        <p>Prepare package evidence in the background so generation can use it when it is available.</p>
-      </div>
-      <button className="secondary-button" onClick={() => loadPackage()} disabled={!chosenPackage || Boolean(working)}>
-        {isLoadingKnowledge ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />} Refresh
-      </button>
-    </div>
-
+    <div className="page-heading"><div><div className="eyebrow">PROJECT KNOWLEDGE</div><h1>Knowledge Base</h1><p>Build reusable project knowledge from approved Business Use Cases and their supporting source documents.</p></div><button className="secondary-button" onClick={() => loadPackage(packageId, { refresh: true })} disabled={!chosenPackage || Boolean(working)}>{isLoadingKnowledge ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />} Refresh</button></div>
     <section className="knowledge-toolbar">
-      <label>
-        <span>Project</span>
-        <select value={project?.project_id || ""} onChange={(event) => selectProject(event.target.value)} disabled={isLoadingWorkspace}>
-          <option value="">Choose project</option>
-          {projects.map((item) => <option key={item.project_id} value={item.project_id}>{item.project_name}</option>)}
-        </select>
-      </label>
-      <label>
-        <span>Source package</span>
-        <select value={packageId} onChange={(event) => {
-          const id = event.target.value;
-          const chosen = packages.find((item) => item.package_id === id);
-          setPackageId(id);
-          if (chosen) localStorage.setItem("testiq_current_package", JSON.stringify(chosen));
-          else clearSelectedPackage();
-        }} disabled={!packages.length || isLoadingWorkspace}>
-          <option value="">Choose source package</option>
-          {packages.map((item) => <option key={item.package_id} value={item.package_id}>v{item.package_version} · {item.package_name || item.scope || "Source package"}</option>)}
-        </select>
-      </label>
+      <label><span>Project</span><select value={project?.project_id || ""} onChange={(event) => selectProject(event.target.value)} disabled={isLoadingWorkspace}><option value="">Choose project</option>{projects.map((item) => <option key={item.project_id} value={item.project_id}>{item.project_name}</option>)}</select></label>
+      <label><span>Resource Package</span><select value={packageId} onChange={(event) => { const id = event.target.value; const chosen = packages.find((item) => item.package_id === id); setPackageId(id); if (chosen) localStorage.setItem("testiq_current_package", JSON.stringify(chosen)); }} disabled={!packages.length || isLoadingWorkspace}><option value="">Choose a Resource Package</option>{packages.map((item) => <option key={item.package_id} value={item.package_id}>v{item.package_version} · {item.package_name || item.scope || "Resource Package"}</option>)}</select></label>
     </section>
-
     {error && <div className="error-message">{error}</div>}
     {notice && <div className="toast-message"><CheckCircle2 size={16} />{notice}</div>}
-
-    {isLoadingWorkspace && <LoadingSpinner variant="section" label="Loading workspace" detail="Checking projects and source packages." />}
-    {!isLoadingWorkspace && !project && <div className="packages-empty"><BookOpen size={24} /><h2>Select a project</h2><p>Choose the project that contains the source package to prepare its Knowledge Base.</p></div>}
-    {!isLoadingWorkspace && project && !packages.length && <div className="packages-empty"><Database size={24} /><h2>No source packages</h2><p>Create a source package before building its Knowledge Base.</p></div>}
+    {isLoadingWorkspace && <LoadingSpinner variant="section" label="Loading workspace" detail="Checking projects and Resource Packages." />}
+    {!isLoadingWorkspace && !project && <div className="packages-empty"><BookOpen size={24} /><h2>Select a project</h2><p>Choose the project whose Knowledge Base you want to update.</p></div>}
+    {!isLoadingWorkspace && project && !packages.length && <div className="packages-empty"><Database size={24} /><h2>No Resource Packages</h2><p>Create a Resource Package before updating project knowledge.</p></div>}
 
     {chosenPackage && <>
-      <section className="packages-card">
-        <div className="packages-card-head">
-          <div>
-            <h2>Automatic Knowledge Base</h2>
-            <p>The source package documents are indexed automatically. Main flow generation uses this context when it is ready and continues with the current stage input when it is not ready.</p>
-          </div>
-          <span className={`health-badge ${hasReadyIndex ? "" : "pending"}`}>{statusLabel}</span>
-        </div>
-        <div className="source-list-card">
-          <strong>{chosenPackage.package_name || chosenPackage.scope || "Source package"}</strong>
-          <span> · v{chosenPackage.package_version} · {chosenPackage.source_count || chosenPackage.items?.length || 0} source(s)</span>
-          <p>{readiness?.message || "Knowledge Base status is checked from the latest package index."}</p>
-        </div>
-        {(progressIndex || readiness) && <div className={`knowledge-progress-card ${isKnowledgeBuilding ? "building" : hasReadyIndex ? "ready" : "pending"}`}>
-          <div className="knowledge-progress-head">
-            <div>
-              <strong>{isKnowledgeBuilding ? "Building Knowledge Base" : hasReadyIndex ? "Knowledge Base ready" : "Knowledge Base status"}</strong>
-              <span>{knowledgeStage}</span>
-            </div>
-            <b>{knowledgeProgress}%</b>
-          </div>
-          <div className="knowledge-progress-track" role="progressbar" aria-label="Knowledge Base build progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow={knowledgeProgress}>
-            <span style={{ width: `${knowledgeProgress}%` }} />
-          </div>
-          <p>{knowledgeMessage}</p>
-        </div>}
-        <div className="review-actions">
-          <label className="package-selector">
-            <span>Index version</span>
-            <select value={selectedIndex?.index_id || ""} onChange={(event) => setSelectedIndex(indexes.find((item) => item.index_id === event.target.value) || null)}>
-              <option value="">No index</option>
-              {indexes.map((item) => <option key={item.index_id} value={item.index_id}>{item.status} · {item.created_at ? new Date(item.created_at).toLocaleString() : item.index_id}</option>)}
-            </select>
-          </label>
-          <button className="primary-button" onClick={buildIndex} disabled={!packageId || Boolean(working)}>
-            {working === "build" ? <LoaderCircle className="spin" size={16} /> : <BookOpen size={16} />} {indexes.length ? "Rebuild Knowledge Base" : "Build Knowledge Base"}
-          </button>
-        </div>
-        {selectedIndex && <div className="source-list-card">
-          <strong>{selectedIndex.chunk_count ?? 0} evidence chunks</strong>
-          <span> · {selectedIndex.node_count ?? 0} knowledge nodes · {selectedIndex.edge_count ?? 0} relationships</span>
-          <p>Index: {selectedIndex.index_id}</p>
-          {selectedIndex.error && <div className="error-message">{selectedIndex.error}</div>}
-        </div>}
+      <section className="packages-card knowledge-rule-summary">
+        <div className="packages-card-head"><div><h2>Approved Business Use Cases</h2><p>Only approved Business Use Cases are included in this Knowledge Base version.</p></div><span className={`health-badge ${reviewComplete ? "" : "pending"}`}>{reviewComplete ? `${approvedCount} approved · ${rejectedCount} rejected` : `${pendingCount} decisions remaining`}</span></div>
+        {!reviewComplete && <div className="success-actions"><span>Complete all Business Use Case decisions before building the Knowledge Base.</span><button className="primary-button" onClick={() => onOpenBusinessRequirements?.()} disabled={!onOpenBusinessRequirements}>Review Business Use Cases</button></div>}
       </section>
 
-      {selectedIndex?.status === "ready" && <section className="packages-card">
-        <div className="packages-card-head">
-          <div>
-            <h2>Explore indexed evidence</h2>
-            <p>Search package context and inspect source citations.</p>
-          </div>
-        </div>
-        <form className="review-actions" onSubmit={runRetrieval}>
-          <input className="search-input" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Ask about requirements, eligibility, schema, or API behavior" />
-          <button className="secondary-button" type="submit" disabled={Boolean(working) || !query.trim()}>
-            {working === "retrieve" ? <LoaderCircle className="spin" size={16} /> : <Search size={16} />} Retrieve
-          </button>
-          <button className="secondary-button" type="button" onClick={runEvaluation} disabled={Boolean(working)}>
-            {working === "evaluate" ? <LoaderCircle className="spin" size={16} /> : null} Evaluate
-          </button>
-        </form>
-        {retrieval && <div className="knowledge-results">
-          <h3>{retrieval.hits?.length || 0} evidence matches</h3>
-          {retrieval.hits?.map((hit) => <article className="source-list-card" key={hit.chunk_id}>
-            <strong>{hit.source_reference}</strong>
-            <p>{hit.chunk_text}</p>
-            <small>{hit.source_type} · score {Number(hit.retrieval_score || 0).toFixed(3)} · {hit.chunk_id}</small>
-          </article>)}
-        </div>}
-        {evaluation && <div className="toast-message">Evaluation {evaluation.passed ? "passed" : "needs review"}: {evaluation.results?.filter((item) => item.passed).length || 0} of {evaluation.results?.length || 0} questions passed.</div>}
-      </section>}
+      <section className="packages-card">
+        <div className="packages-card-head"><div><h2>Knowledge Base version</h2><p>Each Resource Package creates a traceable version. Unchanged source sections and knowledge records are reused automatically.</p></div><span className={`health-badge ${hasReadyIndex ? "" : "pending"}`}>{hasReadyIndex ? "Ready" : isKnowledgeBuilding ? "Building" : reviewComplete ? "Ready to build" : "Waiting for review"}</span></div>
+        {(progressIndex || readiness) && <div className={`knowledge-progress-card ${isKnowledgeBuilding ? "building" : hasReadyIndex ? "ready" : "pending"}`}><div className="knowledge-progress-head"><div><strong>{isKnowledgeBuilding ? "Updating Knowledge Base" : hasReadyIndex ? `Knowledge Base version ${progressIndex?.knowledge_version || 1} ready` : "Knowledge Base status"}</strong><span>{knowledgeStage}</span></div><b>{knowledgeProgress}%</b></div><div className="knowledge-progress-track" role="progressbar" aria-label="Knowledge Base build progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow={knowledgeProgress}><span style={{ width: `${knowledgeProgress}%` }} /></div><p>{knowledgeMessage}</p></div>}
+        <div className="review-actions"><label className="package-selector"><span>Knowledge Base version</span><select value={selectedIndex?.index_id || ""} onChange={(event) => setSelectedIndex(indexes.find((item) => item.index_id === event.target.value) || null)}><option value="">Not built yet</option>{indexes.map((item) => <option key={item.index_id} value={item.index_id}>Version {item.knowledge_version || 1} · {item.status}</option>)}</select></label><button className="primary-button" onClick={buildIndex} disabled={!reviewComplete || Boolean(working)}>{working === "build" ? <LoaderCircle className="spin" size={16} /> : <BookOpen size={16} />} {indexes.length ? "Retry Knowledge Base build" : "Build Knowledge Base"}</button></div>
+        {selectedIndex && <div className="knowledge-summary-grid"><div><span>Version</span><strong>{selectedIndex.knowledge_version || 1}</strong></div><div><span>Reused source sections</span><strong>{selectedIndex.reused_chunk_count || 0}</strong></div><div><span>New or changed</span><strong>{selectedIndex.new_chunk_count ?? selectedIndex.chunk_count ?? 0}</strong></div><div><span>Removed</span><strong>{selectedIndex.retired_chunk_count || 0}</strong></div></div>}
+        {selectedIndex && <div className="source-list-card"><strong>{selectedIndex.chunk_count ?? 0} indexed source sections</strong><span> · {selectedIndex.node_count ?? 0} knowledge items · {selectedIndex.edge_count ?? 0} relationships</span><p>{selectedIndex.build_mode === "incremental" ? `Updated from Knowledge Base version ${versions.find((item) => item.index_id === selectedIndex.parent_index_id)?.knowledge_version || "previous"}.` : "Initial Knowledge Base version."}</p>{selectedIndex.error && <div className="error-message">{selectedIndex.error}</div>}</div>}
+      </section>
 
-      {hasReadyIndex && <div className="success-actions knowledge-next-step">
-        <span>Knowledge Base is ready to support Business Use Cases, Functional Requirements, Test Cases, and Test Data generation.</span>
-        <button className="primary-button" onClick={() => onContinueToBusinessRequirements?.()} disabled={!onContinueToBusinessRequirements}>Open Business Use Cases</button>
-      </div>}
+      {versions.length > 0 && <section className="packages-card"><div className="packages-card-head"><div><h2>Knowledge Base history</h2><p>Previous versions remain available for audit and traceability.</p></div><History size={20} /></div><div className="knowledge-version-list">{versions.map((item) => <div className="knowledge-version-row" key={item.index_id}><span className="package-version large">v{item.knowledge_version || 1}</span><div><strong>{item.package_name || `Resource Package ${item.package_version}`}</strong><small>{item.status} · {item.chunk_count || 0} source sections</small></div><span>{item.created_at ? new Date(item.created_at).toLocaleString() : ""}</span></div>)}</div></section>}
+
+      {selectedIndex?.status === "ready" && <section className="packages-card"><div className="packages-card-head"><div><h2>Search the Knowledge Base</h2><p>Search this version and view the source references supporting each result.</p></div></div><form className="review-actions" onSubmit={runRetrieval}><input className="search-input" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Ask about requirements, eligibility, database fields, or API behavior" /><button className="secondary-button" type="submit" disabled={Boolean(working) || !query.trim()}>{working === "retrieve" ? <LoaderCircle className="spin" size={16} /> : <Search size={16} />} Search</button><button className="secondary-button" type="button" onClick={runEvaluation} disabled={Boolean(working)}>{working === "evaluate" ? <LoaderCircle className="spin" size={16} /> : null} Run quality check</button></form>{retrieval && <div className="knowledge-results"><h3>{retrieval.hits?.length || 0} matching source sections</h3>{retrieval.hits?.map((hit) => <article className="source-list-card" key={hit.chunk_id}><strong>{hit.source_reference}</strong><p>{hit.chunk_text}</p><small>{hit.source_type} · match {Number(hit.retrieval_score || 0).toFixed(3)}</small></article>)}</div>}{evaluation && <div className="toast-message">Quality check {evaluation.passed ? "passed" : "needs review"}: {evaluation.results?.filter((item) => item.passed).length || 0} of {evaluation.results?.length || 0} questions passed.</div>}</section>}
+      {hasReadyIndex && <div className="success-actions knowledge-next-step"><span>Knowledge Base version {progressIndex?.knowledge_version || 1} is ready to support Functional Requirement generation.</span><button className="primary-button" onClick={() => onContinueToFunctional?.()} disabled={!onContinueToFunctional}>Open Functional Requirements</button></div>}
     </>}
-
-    {isLoadingKnowledge && <LoadingSpinner variant="section" label="Loading Knowledge Base" detail="Checking package index status." />}
+    {isLoadingKnowledge && <LoadingSpinner variant="section" label="Loading Knowledge Base" detail="Checking rules, version history, and index status." />}
   </div>;
 }

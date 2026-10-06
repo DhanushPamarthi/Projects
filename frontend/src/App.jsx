@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Activity, Bell, BookOpen, ChevronDown, ChevronLeft, ChevronRight, CircleHelp, ClipboardCheck, Database, FileCheck2, FileStack, FlaskConical, LayoutDashboard, ListChecks, LogOut, Menu, PackageOpen, Settings, ShieldCheck, X } from "lucide-react";
+import { Activity, Bell, BookOpen, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, CircleAlert, CircleHelp, ClipboardCheck, Database, FileCheck2, FileStack, FlaskConical, LayoutDashboard, ListChecks, LoaderCircle, LogOut, Menu, PackageOpen, Settings, ShieldCheck, X } from "lucide-react";
 import { LoginPage } from "./components/LoginPage.jsx";
 import { RegisterPage } from "./components/RegisterPage.jsx";
 import { UploadStep } from "./components/UploadStep.jsx";
@@ -14,24 +14,31 @@ import { KnowledgeBasePage } from "./components/KnowledgeBasePage.jsx";
 import { logoutUser } from "./api/client.js";
 import { ToastContainer } from "react-toastify";
 import { toast } from "react-toastify";
+import { clearFinishedActivities, dismissActivity, reconcileStaleActivities, useActivities } from "./activity/activityStore.js";
 
 function displayNameFromEmail(email) { return String(email || "").split("@")[0].replace(/[._-]+/g, " ").trim().split(/\s+/).filter(Boolean).map((part) => part[0].toUpperCase() + part.slice(1).toLowerCase()).join(" "); }
 
 const ACTIVE_NAV_KEY = "testiq_active_nav";
 const GENERATION_ANALYSIS_KEY = "testiq_generation_analysis";
+const WORKSPACE_STATE_VERSION_KEY = "testiq_workspace_state_version";
+const WORKSPACE_STATE_VERSION = "phase3-postgres-v1";
+if (localStorage.getItem(WORKSPACE_STATE_VERSION_KEY) !== WORKSPACE_STATE_VERSION) {
+  ["testiq_current_project", "testiq_current_package", GENERATION_ANALYSIS_KEY].forEach((key) => localStorage.removeItem(key));
+  localStorage.setItem(WORKSPACE_STATE_VERSION_KEY, WORKSPACE_STATE_VERSION);
+}
 const VALID_NAV_ITEMS = new Set(["overview", "sources", "packages", "business-requirements", "requirements", "test-cases", "test-data", "test-results", "activity", "traceability", "knowledge-base"]);
 const NAV_ITEMS = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
-  { id: "sources", label: "Source Package", icon: FileStack },
+  { id: "sources", label: "Upload & Resource Package", icon: FileStack },
   { id: "packages", label: "Packages", icon: PackageOpen },
   { id: "business-requirements", label: "Business Use Cases", icon: ListChecks },
+  { id: "knowledge-base", label: "Knowledge Base", icon: BookOpen },
   { id: "requirements", label: "Functional Requirements", icon: ListChecks },
   { id: "test-cases", label: "Test cases", icon: ClipboardCheck },
   { id: "test-data", label: "Test data", icon: Database },
   { id: "test-results", label: "Test Results", icon: FileCheck2 },
   { id: "activity", label: "Activity", icon: Activity },
   { id: "traceability", label: "Traceability", icon: ShieldCheck, section: "Workspace tools" },
-  { id: "knowledge-base", label: "Knowledge Base", icon: BookOpen, section: "Workspace tools" },
   { id: "settings", label: "Settings", icon: Settings, section: "Workspace tools", disabled: true },
 ];
 
@@ -44,9 +51,9 @@ function canAccessNavItem(user, item) {
 function Navigation({ items, activeNav, onNavigate, onLogout, user, initials, expanded, mobile = false }) {
   const primaryItems = items.filter((item) => !item.section);
   const toolItems = items.filter((item) => item.section === "Workspace tools");
-  const renderItem = ({ id, label, icon: Icon, badge, badgeLabel, disabled }) => (
+  const renderItem = ({ id, label, icon: Icon, badge, badgeLabel, disabled, running }) => (
     <button key={id} type="button" className={`sidebar-nav-item ${activeNav === id ? "selected" : ""}`} aria-label={label} aria-current={activeNav === id ? "page" : undefined} aria-disabled={disabled || undefined} title={expanded ? undefined : label} onClick={() => !disabled && onNavigate(id)}>
-      <Icon size={18} aria-hidden="true" /><span className="sidebar-nav-label">{label}</span>{badge && <span className="nav-badge" aria-label={badgeLabel}>{badge}</span>}
+      <Icon size={18} aria-hidden="true" /><span className="sidebar-nav-label">{label}</span>{running && <LoaderCircle className="spin nav-runner" size={16} aria-label={`${label} is running`} />}{badge && <span className="nav-badge" aria-label={badgeLabel}>{badge}</span>}
     </button>
   );
   return <>
@@ -76,13 +83,44 @@ function storedGenerationAnalysis() {
   return analysis;
 }
 
+function activityTime(value) {
+  if (!value) return "";
+  return new Date(value).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function ActivityIcon({ status }) {
+  if (status === "running") return <LoaderCircle className="spin" size={17} />;
+  if (status === "completed") return <CheckCircle2 size={17} />;
+  return <CircleAlert size={17} />;
+}
+
+function ActivityPage({ activities, onNavigate }) {
+  const running = activities.filter((item) => item.status === "running").length;
+  return <div className="activity-page"><div className="page-heading"><div><div className="eyebrow">WORKSPACE OPERATIONS</div><h1>Activity</h1><p>Follow uploads, Knowledge Base processing, and generation work across the complete workflow.</p></div>{activities.some((item) => item.status !== "running") && <button type="button" className="secondary-button" onClick={clearFinishedActivities}>Clear finished</button>}</div>
+    <section className="activity-summary"><div><strong>{running}</strong><span>Running</span></div><div><strong>{activities.filter((item) => item.status === "completed").length}</strong><span>Completed</span></div><div><strong>{activities.filter((item) => item.status === "failed").length}</strong><span>Needs attention</span></div></section>
+    {!activities.length ? <section className="requirements-empty"><div className="empty-state-icon"><Activity size={24} /></div><h2>No recorded activity</h2><p>Operations will appear here when you upload documents or start generation.</p></section> : <section className="activity-list">{activities.map((item) => <article className={`activity-row ${item.status}`} key={item.id}><span className="activity-row-icon"><ActivityIcon status={item.status} /></span><div className="activity-row-main"><div><strong>{item.label}</strong><span className={`activity-status ${item.status}`}>{item.status === "running" ? "Running" : item.status === "completed" ? "Completed" : "Failed"}</span></div><p>{item.detail || "Processing"}</p>{item.status === "running" && <div className={`activity-progress ${item.progress == null ? "indeterminate" : ""}`}><span style={item.progress == null ? undefined : { width: `${item.progress}%` }} /></div>}<small>Started {activityTime(item.startedAt)}{item.updatedAt ? ` · Updated ${activityTime(item.updatedAt)}` : ""}</small></div><div className="activity-row-actions"><button type="button" className="text-button" onClick={() => onNavigate(item.section || "activity")}>Open</button>{item.status !== "running" && <button type="button" className="icon-button" aria-label={`Dismiss ${item.label}`} onClick={() => dismissActivity(item.id)}><X size={15} /></button>}</div></article>)}</section>}
+  </div>;
+}
+
 export default function App() {
   const [user, setUser] = useState(() => { const saved = localStorage.getItem("testiq_current_user"); const authenticated = localStorage.getItem("testiq_auth_token") || localStorage.getItem("testiq_local_session") === "true"; return saved && authenticated ? JSON.parse(saved) : null; });
   const [authView, setAuthView] = useState("login"); const [activeNav, setActiveNav] = useState(() => { const saved = localStorage.getItem(ACTIVE_NAV_KEY); return VALID_NAV_ITEMS.has(saved) ? saved : "sources"; }); const [generationAnalysis, setGenerationAnalysisState] = useState(storedGenerationAnalysis);
   const [sidebarExpanded, setSidebarExpanded] = useState(() => localStorage.getItem("testiq_sidebar_expanded") === "true");
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const workspaceContentRef = useRef(null);
-  const availableNavItems = NAV_ITEMS.filter((item) => canAccessNavItem(user, item));
+  const activities = useActivities();
+  useEffect(() => {
+    reconcileStaleActivities();
+    const timer = window.setInterval(reconcileStaleActivities, 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
+  const runningActivityCount = activities.filter((item) => item.status === "running").length;
+  const navigationItems = NAV_ITEMS.map((item) => {
+    const running = activities.some((activity) => activity.status === "running" && activity.section === item.id);
+    if (item.id === "activity" && runningActivityCount) return { ...item, running, badge: runningActivityCount, badgeLabel: `${runningActivityCount} running activities` };
+    return running ? { ...item, running: true } : item;
+  });
+  const availableNavItems = navigationItems.filter((item) => canAccessNavItem(user, item));
   const visibleNavItems = availableNavItems.filter((item) => !item.disabled);
   const authorizedNav = visibleNavItems.find((item) => item.id === activeNav) || visibleNavItems[0];
   const currentNav = authorizedNav?.id;
@@ -123,6 +161,6 @@ export default function App() {
       <button type="button" className="mobile-sidebar-close" aria-label="Close navigation menu" onClick={() => setMobileMenuOpen(false)}><X size={20} /></button>
       <Navigation items={visibleNavItems} activeNav={currentNav} onNavigate={navigate} onLogout={handleLogout} user={{ ...user, name }} initials={initials} expanded mobile />
     </aside>
-    <main className="workspace-main"><header className="workspace-topbar"><div className="topbar-leading"><button type="button" className="mobile-menu-button" aria-label="Open navigation menu" aria-controls="mobile-navigation" aria-expanded={mobileMenuOpen} onClick={() => setMobileMenuOpen(true)}><Menu size={20} /></button><div className="breadcrumb"><span>Workspace</span><span className="breadcrumb-slash">/</span><strong>{activeLabel}</strong></div></div><div className="topbar-actions"><button className="icon-button" aria-label="Notifications"><Bell size={18} /><span className="notification-dot" /></button><div className="topbar-user"><span className="avatar">{initials}</span><span>{name}</span><ChevronDown size={15} /></div></div></header><div className="workspace-content" ref={workspaceContentRef}>{!authorizedNav ? <div className="empty-state-panel"><h2>No workspace sections available</h2><p>Your account does not have access to any workspace sections.</p></div> : currentNav === "sources" ? <UploadStep onContinueToBusinessUseCases={() => navigate("business-requirements")} /> : currentNav === "packages" ? <PackagesPage onOpenBusinessRequirements={() => navigate("business-requirements")} /> : currentNav === "business-requirements" ? <BusinessRequirementsPage onContinueToFunctional={() => navigate("requirements")} /> : currentNav === "traceability" ? <TraceabilityPage /> : currentNav === "knowledge-base" ? <KnowledgeBasePage onContinueToBusinessRequirements={() => navigate("business-requirements")} /> : currentNav === "requirements" ? <RequirementsPage onContinueToGeneration={openTestCaseGeneration} onOpenBusinessRequirements={() => navigate("business-requirements")} /> : currentNav === "test-cases" ? <TestCaseGenerationPage analysis={currentGenerationAnalysis} onBack={() => setActiveNav("requirements")} onContinueToTestData={() => setActiveNav("test-data")} onReviewSaved={() => { toast.success("Test case review saved."); setActiveNav("test-data"); }} onAnalysisUnavailable={clearGenerationAnalysis} /> : currentNav === "test-data" ? <TestDataGenerationPage analysis={currentGenerationAnalysis} onGoToTestCases={() => setActiveNav("test-cases")} /> : currentNav === "test-results" ? <TestResultsPage /> : <div className="empty-state-panel"><div className="empty-state-icon"><Activity size={25} /></div><h2>{currentNav === "overview" ? "Your workspace at a glance" : "Workspace activity"}</h2><p>This view is ready for the next stage of your source-to-test-data workflow. Manage source packages from the sidebar.</p><button className="primary-button" onClick={() => navigate("sources")}>Open sources</button></div>}</div></main>
+    <main className="workspace-main"><header className="workspace-topbar"><div className="topbar-leading"><button type="button" className="mobile-menu-button" aria-label="Open navigation menu" aria-controls="mobile-navigation" aria-expanded={mobileMenuOpen} onClick={() => setMobileMenuOpen(true)}><Menu size={20} /></button><div className="breadcrumb"><span>Workspace</span><span className="breadcrumb-slash">/</span><strong>{activeLabel}</strong></div></div><div className="topbar-actions"><button className="icon-button" aria-label="Notifications"><Bell size={18} /><span className="notification-dot" /></button><div className="topbar-user"><span className="avatar">{initials}</span><span>{name}</span><ChevronDown size={15} /></div></div></header><div className="workspace-content" ref={workspaceContentRef}>{!authorizedNav ? <div className="empty-state-panel"><h2>No workspace sections available</h2><p>Your account does not have access to any workspace sections.</p></div> : currentNav === "sources" ? <UploadStep onContinueToBusinessUseCases={() => navigate("business-requirements")} /> : currentNav === "packages" ? <PackagesPage onOpenBusinessRequirements={() => navigate("business-requirements")} /> : currentNav === "business-requirements" ? <BusinessRequirementsPage onContinueToKnowledgeBase={() => navigate("knowledge-base")} /> : currentNav === "traceability" ? <TraceabilityPage /> : currentNav === "knowledge-base" ? <KnowledgeBasePage onContinueToFunctional={() => navigate("requirements")} onOpenBusinessRequirements={() => navigate("business-requirements")} /> : currentNav === "requirements" ? <RequirementsPage onContinueToGeneration={openTestCaseGeneration} onOpenBusinessRequirements={() => navigate("business-requirements")} onOpenKnowledgeBase={() => navigate("knowledge-base")} /> : currentNav === "test-cases" ? <TestCaseGenerationPage analysis={currentGenerationAnalysis} onBack={() => setActiveNav("requirements")} onContinueToTestData={() => setActiveNav("test-data")} onReviewSaved={() => { toast.success("Test case review saved."); setActiveNav("test-data"); }} onAnalysisUnavailable={clearGenerationAnalysis} /> : currentNav === "test-data" ? <TestDataGenerationPage analysis={currentGenerationAnalysis} onGoToTestCases={() => setActiveNav("test-cases")} /> : currentNav === "test-results" ? <TestResultsPage /> : currentNav === "activity" ? <ActivityPage activities={activities} onNavigate={navigate} /> : <div className="empty-state-panel"><div className="empty-state-icon"><Activity size={25} /></div><h2>{currentNav === "overview" ? "Your workspace at a glance" : "Workspace activity"}</h2><p>This view is ready for the next stage of your source-to-test-data workflow. Manage Resource Packages from the sidebar.</p><button className="primary-button" onClick={() => navigate("sources")}>Open sources</button></div>}</div></main>
   </div></>;
 }

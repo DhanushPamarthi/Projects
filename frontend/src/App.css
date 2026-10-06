@@ -148,7 +148,7 @@
 .generation-controls input { width: 8rem; padding: .62rem .7rem; border: 1px solid #dfe3eb; border-radius: 7px; color: #182033; background: #fff; font: inherit; }
 @media (max-width: 800px) { .generation-controls { width: 100%; margin-left: 0; } .generation-controls input { flex: 1; } }
 @media (max-width: 800px) { .review-complete-card, .generation-ready-card, .generation-next-card { align-items: flex-start; flex-wrap: wrap; } .review-complete-card .primary-button, .generation-ready-card .requirements-status, .generation-next-card .primary-button { margin-left: 0; } }
-.requirements-summary-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: .9rem; }
+.requirements-summary-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: .9rem; }
 .requirements-summary-grid > div { padding: 1rem; background: #fff; border: 1px solid #e5e8ef; border-radius: 10px; }
 .requirements-summary-grid span, .requirements-summary-grid strong { display: block; }
 .requirements-summary-grid span { color: #697386; font-size: .78rem; }
@@ -191,6 +191,12 @@
 .requirement-group-grid { display: grid; grid-template-columns: 1fr; gap: 1rem; }
 .requirement-rules { margin-top: 1rem; padding-top: .8rem; border-top: 1px solid #edf0f4; }
 .requirement-group-grid .requirement-rules, .requirement-group-grid .requirement-outcomes { margin-top: 0; padding-top: 0; border-top: 0; }
+.requirements-document-actions { display: flex; flex: 0 0 auto; align-items: flex-end; flex-direction: column; gap: .55rem; margin-left: auto; }
+.trace-detail-list { display: grid; gap: .5rem; }
+.trace-detail-item { padding: .65rem .75rem; border: 1px solid #e5e8ef; border-radius: 8px; background: #fff; }
+.trace-detail-item strong { color: #26364d; font-size: .76rem; }
+.trace-detail-item p { margin: .2rem 0; font-size: .8rem; }
+.trace-detail-item small { display: block; color: #718096; font-size: .7rem; line-height: 1.4; }
 .requirements-panel { padding: 1.25rem; background: #fff; border: 1px solid #e5e8ef; border-radius: 12px; }
 .requirements-panel h2 { margin: 0; color: #182033; font-size: .95rem; }
 .requirements-panel h3 { margin: 1.25rem 0 .4rem; color: #182033; font-size: 1.1rem; }
@@ -467,7 +473,7 @@
 .review-fields label span { font-weight: 400; text-transform: none; }
 .review-fields textarea { min-height: 76px; resize: vertical; }
 .muted { color: #8993a4 !important; }
-@media (max-width: 1000px) { .requirements-columns, .criteria-outcome-grid, .requirement-group-grid, .review-fields, .readiness-list { grid-template-columns: 1fr; } .readiness-summary { align-items: flex-start; flex-direction: column; } .readiness-summary-meta { white-space: normal; } .requirement-meta { grid-template-columns: 1fr 1fr; } .meta-badges { grid-column: 1 / -1; } .requirements-summary-grid { grid-template-columns: repeat(2, 1fr); } .requirements-toolbar { flex-wrap: wrap; } .requirements-run-button { margin-left: 0; } }
+@media (max-width: 1000px) { .requirements-columns, .criteria-outcome-grid, .requirement-group-grid, .review-fields, .readiness-list { grid-template-columns: 1fr; } .readiness-summary { align-items: flex-start; flex-direction: column; } .readiness-summary-meta { white-space: normal; } .requirement-meta { grid-template-columns: 1fr 1fr; } .meta-badges { grid-column: 1 / -1; } .requirements-summary-grid { grid-template-columns: repeat(2, 1fr); } .requirements-toolbar { flex-wrap: wrap; } .requirements-run-button { margin-left: 0; } .requirements-document-actions { width: 100%; align-items: flex-start; margin-left: 0; } }
 
 
 

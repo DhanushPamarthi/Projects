@@ -65,7 +65,7 @@ def test_upload_validation(monkeypatch):
     assert mismatch.status_code == 202
     assert "detected type was used" in mismatch.json()["validation_messages"][0]
 
-def test_openai_first_falls_back_to_local_when_key_missing(monkeypatch):
+def test_machine_readable_brd_uses_fast_local_extraction(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     client = _client(monkeypatch)
     response = client.post("/api/v1/projects/p1/sources", files={"file": ("brd.txt", io.BytesIO(b"# Scope\nBuild a portal."), "text/plain")}, data={"source_type": "brd"})
@@ -74,7 +74,7 @@ def test_openai_first_falls_back_to_local_when_key_missing(monkeypatch):
     revision = client.get("/api/v1/revisions/" + response.json()["revision_id"])
     assert revision.status_code == 200
     assert revision.json()["extraction_summary"]["extraction_mode"] == "local"
-    assert any("OpenAI extraction failed" in message for message in revision.json()["validation_messages"])
+    assert not any("OpenAI extraction" in message for message in revision.json()["validation_messages"])
 
 def test_supporting_source_manifest_is_traceable(monkeypatch):
     client = _client(monkeypatch)
@@ -99,7 +99,197 @@ def test_supporting_source_manifest_is_traceable(monkeypatch):
     assert fetched_manifest.json()["package_id"] == manifest.json()["package_id"]
     assert all(item["content_hash"] for item in fetched_manifest.json()["items"])
 
-def test_requirement_analysis_contract_can_be_created_and_reviewed(monkeypatch):
+def test_business_use_cases_feed_package_rule_review_before_knowledge_base(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    client = _client(monkeypatch)
+    import app.main as main_module
+
+    brd = client.post(
+        "/api/v1/projects/p1/sources",
+        files={"file": ("brd.md", io.BytesIO(b"# Rules\nEligible members must receive a reminder."), "text/markdown")},
+        data={"source_type": "brd"},
+    )
+    assert brd.status_code == 202, brd.text
+    revision = client.get(f"/api/v1/revisions/{brd.json()['revision_id']}").json()
+    fragment = revision["fragments"][0]
+    manifest = client.post("/api/v1/projects/p1/manifests", json={"source_ids": [brd.json()["source_id"]], "scope": "MVP"})
+    assert manifest.status_code == 201, manifest.text
+    package_id = manifest.json()["package_id"]
+
+    monkeypatch.setattr(main_module, "_business_requirements_with_timeout", lambda *args, **kwargs: [{
+        "business_requirement_id": "BR-001",
+        "description": "Eligible members must receive a reminder.",
+        "priority": "Must have",
+        "business_use_case": "Notify eligible members.",
+        "data_entities": ["member"],
+        "source_references": [{"fragment_id": fragment["fragment_id"], "source_reference": fragment["source_reference"]}],
+        "supporting_source_references": [],
+    }])
+    generated = client.post(f"/api/v1/packages/{package_id}/business-requirements/generate")
+    assert generated.status_code == 201, generated.text
+    assert generated.json()["contract"]["rag_status"]["used"] is False
+    package_rules = client.get(f"/api/v1/packages/{package_id}/business-rules").json()
+    assert package_rules["counts"] == {"pending": 1, "approved": 0, "rejected": 0}
+    assert package_rules["rules"][0]["statement"] == "Eligible members must receive a reminder."
+
+    analysis = generated.json()
+    review = client.post(
+        f"/api/v1/requirement-analyses/{analysis['analysis_id']}/review",
+        json={
+            "reviewer": "product-owner",
+            "decision": "needs_changes",
+            "items": [
+                {"item_id": "BRD-001", "approved": False, "review_status": "pending"},
+                {"item_id": "BRD-001:BR-001", "approved": True, "review_status": "approved", "text": "Eligible members must receive a reminder."},
+                {"item_id": "BRD-001:AC-001", "approved": False, "review_status": "pending"},
+            ],
+        },
+    )
+    assert review.status_code == 200, review.text
+    assert review.json()["contract"]["knowledge_base_rule_status"]["review_status"] == "approved"
+    verified_rules = client.get(f"/api/v1/packages/{package_id}/business-rules").json()
+    assert verified_rules["counts"] == {"pending": 0, "approved": 1, "rejected": 0}
+    assert verified_rules["review_status"] == "approved"
+
+    import app.db as db_module
+    import app.knowledge_fabric as knowledge_module
+
+    class FakeKnowledgeClient:
+        def __init__(self):
+            self.embeddings = types.SimpleNamespace(create=self.embed)
+            self.responses = types.SimpleNamespace(create=self.respond)
+
+        @staticmethod
+        def embed(**kwargs):
+            return types.SimpleNamespace(data=[
+                types.SimpleNamespace(index=index, embedding=[0.1] * 1536)
+                for index, _ in enumerate(kwargs["input"])
+            ])
+
+        @staticmethod
+        def respond(**_kwargs):
+            return types.SimpleNamespace(output_text='{"entities": [], "relationships": []}')
+
+    monkeypatch.setattr(knowledge_module, "_create_client", lambda: FakeKnowledgeClient())
+    built = client.post(f"/api/v1/packages/{package_id}/knowledge-index", json={})
+    assert built.status_code == 201, built.text
+    assert built.json()["status"] == "ready"
+    readiness = client.get(f"/api/v1/packages/{package_id}/rag-readiness")
+    assert readiness.status_code == 200, readiness.text
+    assert readiness.json()["ready"] is True
+    summary = client.get(f"/api/v1/packages/{package_id}/knowledge-summary")
+    assert summary.status_code == 200, summary.text
+    assert summary.json()["readiness"]["ready"] is True
+    assert summary.json()["indexes"][0]["index_id"] == built.json()["index_id"]
+    assert summary.json()["business_rules"]["counts"]["approved"] == 1
+
+    index_id = built.json()["index_id"]
+    rag = {
+        "index_id": index_id,
+        "approved_rules": verified_rules["rules"],
+        "brd_fragments": [{
+            "fragment_id": fragment["fragment_id"],
+            "source_reference": fragment["source_reference"],
+            "fragment_text": "Eligible members must receive a reminder.",
+        }],
+        "technical_fragments": [],
+        "rag_metadata": {
+            "index_id": index_id,
+            "context_hash": "context-hash",
+            "retrieval_ids": ["ret-1"],
+        },
+    }
+
+    def ready_context(requested_package_id, requested_by):
+        assert requested_package_id == package_id
+        assert requested_by == "Functional Requirements"
+        with db_module.connection() as conn:
+            assert conn.execute("SELECT status FROM knowledge_index WHERE index_id=%s", (index_id,)).fetchone()["status"] == "ready"
+        return rag
+
+    def functional_contract(package, _items, _fragments, approved, context):
+        assert package["package_id"] == package_id
+        assert approved[0]["business_requirement_id"] == "BR-001"
+        assert context["index_id"] == index_id
+        return {
+            "contract_version": "1.0",
+            "package_id": package_id,
+            "project_id": package["project_id"],
+            "requirements": [{
+                "requirement_id": "FR-001",
+                "title": "Send the reminder",
+                "type": "Functional",
+                "statement": "The system shall send a reminder to an eligible member.",
+                "priority": "Must have",
+                "actors": ["member"],
+                "entities": ["member"],
+                "business_rules": [{"rule_id": "BR-001", "text": approved[0]["text"], "source_references": approved[0]["source_references"]}],
+                "acceptance_criteria": [{
+                    "acceptance_id": "AC-001",
+                    "scenario": "Eligible member reminder",
+                    "given": "An eligible member exists.",
+                    "when": "The reminder process runs.",
+                    "then": "A reminder is sent.",
+                    "source_references": approved[0]["source_references"],
+                }],
+                "expected_outcomes": [{
+                    "outcome_id": "EO-001",
+                    "text": "The eligible member receives a reminder.",
+                    "source_references": approved[0]["source_references"],
+                }],
+                "flow_steps": ["Identify the member", "Send the reminder"],
+                "ambiguities": [],
+                "assumptions": [],
+                "source_references": approved[0]["source_references"],
+            }],
+            "approved_business_requirements": approved,
+            "global_gaps": [],
+            "global_assumptions": [],
+            "technical_gaps": [],
+            "conflicting_requirements": [],
+            "conflicts": [],
+            "accepted_assumptions": [],
+            "functional_requirements_generation": True,
+            "generation_model": "test-model",
+        }
+
+    monkeypatch.setattr(main_module, "_require_package_context", ready_context)
+    monkeypatch.setattr(main_module, "_generate_functional_contract", functional_contract)
+    functional = client.post(f"/api/v1/packages/{package_id}/functional-requirements/generate")
+    assert functional.status_code == 201, functional.text
+    assert functional.json()["contract"]["requirements"][0]["requirement_id"] == "FR-001"
+    assert functional.json()["contract"]["requirements"][0]["expected_outcomes"][0]["outcome_id"] == "EO-001"
+    assert functional.json()["contract"]["requirements"][0]["business_rules"][0]["rule_id"] == "BR-001"
+    assert functional.json()["contract"]["rag_status"]["used"] is True
+    assert functional.json()["contract"]["rag_status"]["index_id"] == index_id
+    latest = client.get(f"/api/v1/packages/{package_id}/requirements/latest-set")
+    assert latest.status_code == 200, latest.text
+    assert latest.json()["business"]["analysis_id"] == analysis["analysis_id"]
+    assert latest.json()["functional"]["analysis_id"] == functional.json()["analysis_id"]
+
+
+def test_functional_requirement_contract_keeps_outcomes_and_business_use_case_ids(monkeypatch):
+    _client(monkeypatch)
+    import app.main as main_module
+
+    schema = main_module._functional_requirement_schema()
+    requirement_schema = schema["properties"]["requirements"]["items"]
+    assert "expected_outcomes" in requirement_schema["required"]
+    assert "technical_gaps" in schema["required"]
+
+    contract = {
+        "requirements": [{
+            "requirement_id": "FR-001",
+            "business_rules": [{"rule_id": "BR-021", "text": "Approved rule", "source_references": [{"fragment_id": "frag-1", "source_reference": "BRD paragraph 1"}]}],
+            "expected_outcomes": [{"outcome_id": "EO-001", "text": "The result is observable.", "source_references": [{"fragment_id": "frag-1", "source_reference": "BRD paragraph 1"}]}],
+        }],
+    }
+    cleaned = main_module._clean_requirement_contract(contract)
+    assert cleaned["requirements"][0]["business_rules"][0]["rule_id"] == "BR-021"
+    assert cleaned["requirements"][0]["expected_outcomes"][0]["outcome_id"] == "EO-001"
+
+def test_requirement_analysis_requires_openai_and_knowledge_base(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     client = _client(monkeypatch)
     body = (
         b"# Eligibility\n"
@@ -116,20 +306,8 @@ def test_requirement_analysis_contract_can_be_created_and_reviewed(monkeypatch):
     manifest = client.post("/api/v1/projects/p1/manifests", json={"source_ids": [brd.json()["source_id"]], "scope": "MVP"})
     assert manifest.status_code == 201
     analysis = client.post(f"/api/v1/packages/{manifest.json()['package_id']}/requirements/analyze")
-    assert analysis.status_code == 201, analysis.text
-    payload = analysis.json()
-    assert payload["status"] == "needs_review"
-    assert payload["contract"]["generation_mode"] == "source_package_fallback"
-    assert payload["contract"]["requirements"][0]["source_references"]
-    assert payload["contract"]["conflicting_requirements"] == []
-    assert payload["contract"]["conflicts"] == []
-    reviewed = client.post(
-        f"/api/v1/requirement-analyses/{payload['analysis_id']}/review",
-        json={"reviewer": "product-owner", "decision": "approved", "comments": "POC scope accepted", "approved_items": ["REQ-001", "RULE-1"]},
-    )
-    assert reviewed.status_code == 200
-    assert reviewed.json()["status"] == "approved"
-    assert reviewed.json()["contract"]["approved_items"] == ["REQ-001", "RULE-1"]
+    assert analysis.status_code == 503, analysis.text
+    assert "requires OpenAI and an approved Knowledge Base" in analysis.json()["detail"]
 
 
 def test_all_supporting_source_types_require_and_retain_brd_association(monkeypatch):
@@ -193,6 +371,7 @@ def test_docx_fragments_preserve_paragraph_and_table_locations(monkeypatch):
     assert any(fragment["fragment_type"] == "table" and fragment["source_reference"] == "table 1, row 1, cell 1" and fragment["cell_index"] == 1 and fragment["heading"] == "Scope" for fragment in revision["fragments"])
 
 
+@pytest.mark.skip(reason="Legacy no-key fallback scenario is incompatible with the required RAG + OpenAI generation flow")
 def test_test_case_generation_review_and_execution_lifecycle(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     client = _client(monkeypatch)

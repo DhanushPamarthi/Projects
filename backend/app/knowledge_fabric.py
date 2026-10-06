@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from . import db as db_module
 from .config import OPENAI_EMBEDDING_DIMENSIONS, OPENAI_TIMEOUT_SECONDS, PGVECTOR_DIMENSIONS
 from .db import connection
+from .openai_requests import responses_create
 
 
 router = APIRouter()
@@ -29,7 +30,7 @@ _ACTIVE_KNOWLEDGE_BUILDS = set()
 CHUNKER_VERSION = "fragment-window-1200-v1"
 GRAPH_PROMPT_VERSION = "knowledge-graph-evidence-v3"
 RETRIEVAL_VERSION = "hybrid-bm25-vector-graph-rrf-rerank-v2"
-RAG_BUILD_VERSION = "rag-batched-unbounded-v3"
+RAG_BUILD_VERSION = "rag-persistent-incremental-v4"
 GRAPH_INSTRUCTIONS = (
     "Extract only explicit, useful campaign and technical entities and relationships from these cited chunks. "
     "BRD statements are business authority; technical sources describe implementation. Do not infer missing thresholds or precedence. "
@@ -238,7 +239,7 @@ def _request_graph_payloads(client, model, schema, batch):
     failure = None
     for _ in range(attempts):
         try:
-            response = client.responses.create(model=model, instructions=GRAPH_INSTRUCTIONS,
+            response = responses_create(client, model=model, instructions=GRAPH_INSTRUCTIONS,
                 input=json.dumps(prompt_data, ensure_ascii=False), store=False,
                 text={"format": {"type": "json_schema", "name": "testiq_knowledge_graph", "strict": True, "schema": schema}},
                 max_output_tokens=GRAPH_MAX_OUTPUT_TOKENS)
@@ -258,7 +259,39 @@ def _request_graph_payloads(client, model, schema, batch):
     return [], [f"OpenAI graph augmentation was skipped for {chunk_id}: {type(failure).__name__}: {failure}"]
 
 
-def _extract_graph(client, index_id, package_id, chunks, model, progress_callback=None):
+def _load_reusable_graph(conn, parent_index_id, index_id, old_to_new_chunk_ids):
+    """Clone graph facts whose cited evidence still exists in the new version."""
+    nodes, edges, old_node_keys = {}, {}, {}
+    for row in conn.execute("SELECT * FROM knowledge_node WHERE index_id=%s", (parent_index_id,)).fetchall():
+        canonical = row["canonical_id"]
+        old_node_keys[row["node_id"]] = canonical
+        evidence = {old_to_new_chunk_ids[item] for item in json.loads(row["evidence_chunk_ids_json"] or "[]") if item in old_to_new_chunk_ids}
+        if not evidence:
+            continue
+        nodes[canonical] = {
+            "node_id": "node_" + _hash(index_id + ":" + canonical)[:32],
+            "canonical_id": canonical,
+            "label": row["label"],
+            "entity_type": row["entity_type"],
+            "aliases": set(json.loads(row["aliases_json"] or "[]")),
+            "evidence": evidence,
+        }
+    for row in conn.execute("SELECT * FROM knowledge_edge WHERE index_id=%s", (parent_index_id,)).fetchall():
+        source, target = old_node_keys.get(row["source_node_id"]), old_node_keys.get(row["target_node_id"])
+        evidence = {old_to_new_chunk_ids[item] for item in json.loads(row["evidence_chunk_ids_json"] or "[]") if item in old_to_new_chunk_ids}
+        relation = row["relationship_type"]
+        if source in nodes and target in nodes and evidence:
+            edges[(source, target, relation)] = {
+                "source": source,
+                "target": target,
+                "relationship_type": relation,
+                "evidence": evidence,
+                "confidence": float(row["confidence"]),
+            }
+    return nodes, edges
+
+
+def _extract_graph(client, index_id, package_id, chunks, model, progress_callback=None, seed_nodes=None, seed_edges=None, graph_chunks=None):
     entity_types = ["actor", "business_rule", "scenario", "entity", "api", "table", "column", "constraint",
         "requirement", "outcome", "message_template", "brd", "section", "database_schema", "test_case", "recipe", "evidence"]
     schema = {"type": "object", "additionalProperties": False, "properties": {
@@ -270,13 +303,14 @@ def _extract_graph(client, index_id, package_id, chunks, model, progress_callbac
                 "evidence_chunk_id": {"type": "string"}, "confidence": {"type": "number"}},
             "required": ["source", "target", "type", "evidence_chunk_id", "confidence"]}},
     }, "required": ["entities", "relationships"]}
-    nodes, edges, warnings = {}, {}, []
+    nodes, edges, warnings = seed_nodes or {}, seed_edges or {}, []
     _seed_structured_graph(nodes, edges, index_id, chunks)
     # Schema and OpenAPI chunks already receive deterministic table/operation
     # nodes and remain fully searchable by embeddings. Restrict generative graph
     # augmentation to narrative business sources to avoid redundant, oversized
     # structured output for large technical catalogs.
-    llm_chunks = [item for item in chunks if item["source_type"] not in {"database_schema", "api_spec"}]
+    augmentation_chunks = chunks if graph_chunks is None else graph_chunks
+    llm_chunks = [item for item in augmentation_chunks if item["source_type"] not in {"database_schema", "api_spec"}]
     total_batches = max(1, math.ceil(len(llm_chunks) / GRAPH_BATCH_SIZE))
     for batch_number, offset in enumerate(range(0, len(llm_chunks), GRAPH_BATCH_SIZE), 1):
         batch = llm_chunks[offset:offset + GRAPH_BATCH_SIZE]
@@ -317,7 +351,8 @@ def _serialize_index(index):
     value["warnings"] = value.get("error", "").splitlines() if value.get("status") == "ready" and value.get("error") else []
     if value.get("status") == "ready":
         value["error"] = None
-    for key in ("node_count", "edge_count", "chunk_count", "dimensions", "progress_percent"):
+    for key in ("node_count", "edge_count", "chunk_count", "dimensions", "progress_percent", "knowledge_version",
+                "reused_chunk_count", "new_chunk_count", "retired_chunk_count"):
         value[key] = int(value[key] or 0)
     if value.get("status") == "ready":
         value["progress_percent"] = 100
@@ -403,12 +438,15 @@ def _assert_approved(conn, index):
     return review
 
 
-def _latest_ready_index(conn, indexes):
+def _latest_ready_index(conn, indexes, *, verify_integrity=True):
     for index in indexes:
         if index["status"] != "ready":
             continue
-        _ensure_system_approval(conn, index["index_id"])
-        _assert_approved(conn, index)
+        review = _latest_review(conn, index["index_id"])
+        if not review or review["decision"] != "approved":
+            review = _ensure_system_approval(conn, index["index_id"])
+        if verify_integrity:
+            _assert_approved(conn, index)
         return index
     return None
 
@@ -493,7 +531,7 @@ def _rerank_candidates(client, model, query, candidates):
         "Rerank cited evidence for the query. Score only explicit relevance from 0 to 1. "
         "Keep every supplied chunk_id exactly once, never add an id, and prefer passages that directly answer the query."
     )
-    response = client.responses.create(model=model, instructions=instructions, input=json.dumps(prompt, ensure_ascii=False), store=False,
+    response = responses_create(client, model=model, instructions=instructions, input=json.dumps(prompt, ensure_ascii=False), store=False,
         text={"format": {"type": "json_schema", "name": "testiq_semantic_rerank", "strict": True, "schema": schema}},
         max_output_tokens=min(7000, 500 + len(candidates) * 90))
     payload = json.loads(response.output_text or "{}")
@@ -582,14 +620,15 @@ def _create_client():
     return OpenAI(api_key=api_key, timeout=OPENAI_TIMEOUT_SECONDS)
 
 
-def _retrieve_with_client(index, request, client):
+def _retrieve_with_client(index, request, client, query_vector=None):
     source_types = set(request.source_types)
     unknown = source_types - SOURCE_TYPES
     if unknown:
         raise HTTPException(422, f"Unsupported source types: {', '.join(sorted(unknown))}")
-    response = client.embeddings.create(model=index["embedding_model"], input=[request.query.strip()],
-        encoding_format="float", dimensions=int(index["dimensions"]))
-    query_vector = response.data[0].embedding
+    if query_vector is None:
+        response = client.embeddings.create(model=index["embedding_model"], input=[request.query.strip()],
+            encoding_format="float", dimensions=int(index["dimensions"]))
+        query_vector = response.data[0].embedding
     with connection() as conn:
         scope = "index_id=%s"
         params = [index["index_id"]]
@@ -608,6 +647,11 @@ def _retrieve_with_client(index, request, client):
             item["vector_score"] = 0.0
             item["graph_expanded"] = False
             scored[item["chunk_id"]] = item
+        lexical_scores = _bm25_scores(request.query, {key: f"{value.get('heading_path') or ''} {value['chunk_text']}" for key, value in scored.items()})
+        for chunk_id, score in lexical_scores.items():
+            scored[chunk_id]["lexical_score"] = score
+        lexical_ranked = sorted(scored.values(), key=lambda item: (-item["lexical_score"], item["chunk_id"]))
+        lexical_candidates = lexical_ranked[:request.candidate_k]
         use_pgvector = bool(db_module.PGVECTOR_AVAILABLE) and int(index["dimensions"]) == PGVECTOR_DIMENSIONS
         vector_backend = "pgvector-hnsw" if use_pgvector else "python-cosine"
         vector_candidates = []
@@ -624,17 +668,25 @@ def _retrieve_with_client(index, request, client):
                 item["vector_score"] = float(row["vector_score"])
                 vector_candidates.append(item)
         if not vector_candidates:
-            vector_backend = "python-cosine" if not use_pgvector else "python-cosine-fallback"
-            embedding_rows = conn.execute(f"SELECT chunk_id,embedding_json FROM knowledge_chunk WHERE {scope}", tuple(params)).fetchall()
+            # Without pgvector, avoid transferring every large JSON embedding
+            # across a remote PostgreSQL connection. BM25 supplies a broad,
+            # deterministic candidate pool and cosine similarity then provides
+            # the vector ordering before graph expansion and RRF fusion.
+            vector_backend = "python-cosine-prefiltered" if not use_pgvector else "python-cosine-prefiltered-fallback"
+            prefilter_count = min(len(lexical_ranked), max(request.candidate_k * 10, 200))
+            prefilter_ids = [item["chunk_id"] for item in lexical_ranked[:prefilter_count]]
+            placeholders = ",".join(["%s"] * len(prefilter_ids))
+            embedding_rows = conn.execute(
+                f"SELECT chunk_id,embedding_json FROM knowledge_chunk WHERE {scope} AND chunk_id IN ({placeholders})",
+                tuple([*params, *prefilter_ids]),
+            ).fetchall()
             for row in embedding_rows:
                 vector = json.loads(row["embedding_json"] or "[]")
                 scored[row["chunk_id"]]["vector_score"] = _cosine(query_vector, vector)
-            vector_candidates = sorted(scored.values(), key=lambda item: (-item["vector_score"], item["chunk_id"]))[:request.candidate_k]
-        lexical_scores = _bm25_scores(request.query, {key: f"{value.get('heading_path') or ''} {value['chunk_text']}" for key, value in scored.items()})
-        for chunk_id, score in lexical_scores.items():
-            scored[chunk_id]["lexical_score"] = score
-        lexical_ranked = sorted(scored.values(), key=lambda item: (-item["lexical_score"], item["chunk_id"]))
-        lexical_candidates = lexical_ranked[:request.candidate_k]
+            vector_candidates = sorted(
+                (scored[chunk_id] for chunk_id in prefilter_ids),
+                key=lambda item: (-item["vector_score"], item["chunk_id"]),
+            )[:request.candidate_k]
         seeds = {item["chunk_id"] for item in vector_candidates[:min(8, request.candidate_k)]}
         graph_evidence, graph_paths = _graph_expansion(conn, index["index_id"], seeds, request.graph_depth)
         graph_ranked_ids = []
@@ -685,7 +737,7 @@ def _retrieve_with_client(index, request, client):
     return hits, graph_paths, context, reranker, warnings, len(candidates), vector_backend
 
 
-def retrieve_knowledge(index_id, request, client=None):
+def retrieve_knowledge(index_id, request, client=None, query_vector=None):
     with connection() as conn:
         index = conn.execute("SELECT * FROM knowledge_index WHERE index_id=%s", (index_id,)).fetchone()
         if not index:
@@ -696,7 +748,9 @@ def retrieve_knowledge(index_id, request, client=None):
             _assert_approved(conn, index)
         index_data = _dict(index)
     client = client or _create_client()
-    hits, graph_paths, context, reranker, warnings, candidate_count, vector_backend = _retrieve_with_client(index_data, request, client)
+    hits, graph_paths, context, reranker, warnings, candidate_count, vector_backend = _retrieve_with_client(
+        index_data, request, client, query_vector=query_vector
+    )
     retrieval_id, created_at = _uid("ret"), _now()
     context_hash = _hash(context)
     configuration = {"retrieval_version": RETRIEVAL_VERSION, "embedding_model": index_data["embedding_model"],
@@ -749,12 +803,21 @@ def retrieve_package_context(package_id, requested_by="Requirements Analysis"):
             "Database tables, fields, relationships, API operations, request contracts, message templates, data templates, and implementation gaps",
             technical_source_types,
         ))
+    embedding_response = client.embeddings.create(
+        model=selected["embedding_model"],
+        input=[query for query, _ in query_specs],
+        encoding_format="float",
+        dimensions=int(selected["dimensions"]),
+    )
+    query_vectors = [item.embedding for item in embedding_response.data]
+    if len(query_vectors) != len(query_specs):
+        raise RuntimeError("OpenAI returned an incomplete batch of retrieval query embeddings")
     retrievals, unique_hits = [], {}
-    for query, source_types in query_specs:
+    for (query, source_types), query_vector in zip(query_specs, query_vectors):
         result = retrieve_knowledge(selected["index_id"], RetrievalRequest(query=query, top_k=10, candidate_k=30, graph_depth=1,
             source_types=source_types, max_context_characters=16_000, requested_by=requested_by,
             purpose=str(requested_by).strip().lower().replace(" ", "_"), require_approved=True,
-            use_reranker=False), client=client)
+            use_reranker=True), client=client, query_vector=query_vector)
         retrievals.append(result)
         for hit in result["hits"]:
             unique_hits.setdefault(hit["chunk_id"], hit)
@@ -785,7 +848,8 @@ def retrieve_package_context(package_id, requested_by="Requirements Analysis"):
         "index_approval": {"reviewer": approval["reviewer"], "decision": approval["decision"],
                            "object_hash": approval["object_hash"], "reviewed_at": approval["reviewed_at"]},
     }
-    return {"index_id": selected["index_id"], "index_config_hash": selected["config_hash"],
+    return {"index_id": selected["index_id"], "knowledge_version": int(selected.get("knowledge_version") or 1),
+        "parent_index_id": selected.get("parent_index_id"), "index_config_hash": selected["config_hash"],
         "retrieval_ids": [result["retrieval_id"] for result in retrievals],
         "context_hash": rag_metadata["context_hash"], "rag_metadata": rag_metadata,
         "approved_rules": approved_rules,
@@ -801,8 +865,14 @@ def build_knowledge_index(package_id: str, request: BuildIndexRequest):
             raise HTTPException(404, "Source package not found")
         if package["lifecycle_status"] not in {"ready", "published"} or not package["manifest_hash"]:
             raise HTTPException(422, "Only a ready, hash-verified source package can be indexed")
+        if package["rule_review_status"] != "approved" or not package["rule_set_hash"]:
+            raise HTTPException(409, "Complete every Business Use Case decision before building the Knowledge Base")
+        if db_module.DATABASE_URL:
+            conn.execute("SELECT project_id FROM project WHERE project_id=%s FOR UPDATE", (package["project_id"],)).fetchone()
         approved_rules = conn.execute("SELECT rule_id FROM package_business_rule WHERE package_id=%s AND status='approved'", (package_id,)).fetchall()
         approved_rule_count = len(approved_rules)
+        if not approved_rule_count:
+            raise HTTPException(422, "At least one approved Business Use Case is required to build the Knowledge Base")
         items, fragments = _load_package_inputs(conn, package_id)
         fragment_set_hash = _hash(json.dumps([{"fragment_id": row["fragment_id"], "content_hash": row["content_hash"], "extractor_version": row["extractor_version"]} for row in fragments], sort_keys=True, separators=(",", ":")))
         configuration = {"manifest_hash": package["manifest_hash"], "provider": request.provider,
@@ -812,8 +882,9 @@ def build_knowledge_index(package_id: str, request: BuildIndexRequest):
             "graph_engine": f"networkx-{nx.__version__}",
             "chunker_version": CHUNKER_VERSION, "graph_prompt_version": GRAPH_PROMPT_VERSION,
             "graph_prompt_hash": _hash(GRAPH_INSTRUCTIONS), "fragment_set_hash": fragment_set_hash,
-            "approved_rule_set": {"hash": package["rule_set_hash"] or "auto-source-package", "count": approved_rule_count, "mode": "automatic"},
+            "approved_rule_set": {"hash": package["rule_set_hash"], "count": approved_rule_count, "mode": "reviewed"},
             "rag_build_version": RAG_BUILD_VERSION,
+            "update_policy": "project-versioned-incremental",
             "build_limits": {"chunks": MAX_INDEX_CHUNKS or None, "characters": MAX_INDEX_CHARACTERS or None},
             "graph_llm_source_types": ["brd", "campaign_rules", "message_template", "ui_description"],
             "package_resolution": {
@@ -829,36 +900,59 @@ def build_knowledge_index(package_id: str, request: BuildIndexRequest):
             return {**_serialize_index(existing), "reused": True}
         if existing and existing["status"] == "building" and package_id in _ACTIVE_KNOWLEDGE_BUILDS:
             raise HTTPException(409, "A Knowledge Base build with this package and configuration is already running")
+        index_id = existing["index_id"] if existing else _uid("kidx")
+        parent = conn.execute(
+            "SELECT * FROM knowledge_index WHERE project_id=%s AND status='ready' AND index_id<>%s "
+            "ORDER BY knowledge_version DESC,created_at DESC LIMIT 1",
+            (package["project_id"], index_id),
+        ).fetchone()
+        embedding_parent_compatible = bool(parent and parent["embedding_model"] == request.embedding_model
+            and int(parent["dimensions"] or 0) == OPENAI_EMBEDDING_DIMENSIONS
+            and parent["chunker_version"] == CHUNKER_VERSION)
+        graph_parent_compatible = bool(embedding_parent_compatible and parent["graph_model"] == request.graph_model
+            and parent["graph_prompt_version"] == GRAPH_PROMPT_VERSION
+            and parent["graph_prompt_hash"] == configuration["graph_prompt_hash"])
         if existing:
-            index_id = existing["index_id"]
+            knowledge_version = int(existing["knowledge_version"] or 1)
+        else:
+            latest_version = conn.execute("SELECT COALESCE(MAX(knowledge_version),0) AS version FROM knowledge_index WHERE project_id=%s", (package["project_id"],)).fetchone()["version"]
+            knowledge_version = int(latest_version or 0) + 1
+        if existing:
             conn.execute("DELETE FROM knowledge_evaluation_run WHERE index_id=%s", (index_id,))
             conn.execute("DELETE FROM knowledge_retrieval_run WHERE index_id=%s", (index_id,))
             conn.execute("DELETE FROM knowledge_index_review WHERE index_id=%s", (index_id,))
             conn.execute("DELETE FROM knowledge_edge WHERE index_id=%s", (index_id,))
             conn.execute("DELETE FROM knowledge_node WHERE index_id=%s", (index_id,))
             conn.execute("DELETE FROM knowledge_chunk WHERE index_id=%s", (index_id,))
-            conn.execute("UPDATE knowledge_index SET status=%s,error=NULL,chunk_count=0,node_count=0,edge_count=0,progress_percent=%s,progress_stage=%s,progress_message=%s,created_at=%s WHERE index_id=%s",
-                ("building", 5, "preparing", "Preparing package evidence.", _now(), index_id))
+            conn.execute("UPDATE knowledge_index SET status=%s,error=NULL,chunk_count=0,node_count=0,edge_count=0,parent_index_id=%s,build_mode=%s,reused_chunk_count=0,new_chunk_count=0,retired_chunk_count=0,progress_percent=%s,progress_stage=%s,progress_message=%s,created_at=%s WHERE index_id=%s",
+                ("building", parent["index_id"] if parent else None, "full", 5, "preparing", "Preparing package evidence.", _now(), index_id))
         else:
-            index_id = _uid("kidx")
-            conn.execute("INSERT INTO knowledge_index (index_id,package_id,project_id,manifest_hash,config_hash,provider,embedding_model,graph_model,dimensions,status,configuration_json,chunker_version,graph_prompt_version,graph_prompt_hash,progress_percent,progress_stage,progress_message,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                (index_id, package_id, package["project_id"], package["manifest_hash"], config_hash, request.provider,
+            conn.execute("INSERT INTO knowledge_index (index_id,package_id,project_id,manifest_hash,knowledge_version,parent_index_id,build_mode,reused_chunk_count,new_chunk_count,retired_chunk_count,config_hash,provider,embedding_model,graph_model,dimensions,status,configuration_json,chunker_version,graph_prompt_version,graph_prompt_hash,progress_percent,progress_stage,progress_message,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (index_id, package_id, package["project_id"], package["manifest_hash"], knowledge_version,
+                 parent["index_id"] if parent else None, "full", 0, 0, 0, config_hash, request.provider,
                  request.embedding_model, request.graph_model, OPENAI_EMBEDDING_DIMENSIONS,
                  "building", configuration_json, CHUNKER_VERSION, GRAPH_PROMPT_VERSION, configuration["graph_prompt_hash"],
                  5, "preparing", "Preparing package evidence.", _now()))
         chunk_rows = []
+        fingerprint_occurrences = Counter()
         for fragment in fragments:
             for part, (body, start, end) in enumerate(_chunks(fragment), 1):
-                chunk_id = "chk_" + _hash(index_id + ":" + fragment["fragment_id"] + ":" + str(part))[:32]
+                fingerprint_base = _hash(json.dumps({"source_id": fragment["source_id"], "source_type": fragment["source_type"],
+                    "heading_path": fragment["heading_path"] or fragment["heading"] or "", "text": body}, sort_keys=True, separators=(",", ":")))
+                fingerprint_occurrences[fingerprint_base] += 1
+                fingerprint = _hash(f"{fingerprint_base}:{fingerprint_occurrences[fingerprint_base]}")
+                chunk_id = "chk_" + _hash(index_id + ":" + fingerprint)[:32]
                 source_ref = f"{fragment['logical_name']}@v{fragment['revision']} | {fragment['source_reference']}"
                 metadata = {"fragment_id": fragment["fragment_id"], "fragment_type": fragment["fragment_type"],
                     "source_id": fragment["source_id"], "revision_id": fragment["revision_id"], "source_type": fragment["source_type"],
                     "source_reference": source_ref, "heading": fragment["heading"], "heading_path": fragment["heading_path"],
                     "page_number": fragment["page_number"], "paragraph_index": fragment["paragraph_index"],
                     "table_index": fragment["table_index"], "row_index": fragment["row_index"], "cell_index": fragment["cell_index"],
-                    "char_start": start, "char_end": end, "fragment_content_hash": fragment["content_hash"]}
+                    "char_start": start, "char_end": end, "fragment_content_hash": fragment["content_hash"],
+                    "chunk_fingerprint": fingerprint, "chunk_part": part}
                 chunk_rows.append({"chunk_id": chunk_id, "source_type": fragment["source_type"], "source_reference": source_ref,
-                    "heading_path": fragment["heading_path"] or fragment["heading"], "text": body, "metadata": metadata})
+                    "heading_path": fragment["heading_path"] or fragment["heading"], "text": body, "content_hash": _hash(body),
+                    "fingerprint": fingerprint, "metadata": metadata, "vector": None, "reused_from_chunk_id": None})
         if not chunk_rows:
             raise HTTPException(422, "No readable source fragments were found in this package")
         character_count = sum(len(item["text"]) for item in chunk_rows)
@@ -868,25 +962,67 @@ def build_knowledge_index(package_id: str, request: BuildIndexRequest):
             chunk_limit = f"{MAX_INDEX_CHUNKS:,}" if MAX_INDEX_CHUNKS else "unlimited"
             character_limit = f"{MAX_INDEX_CHARACTERS:,}" if MAX_INDEX_CHARACTERS else "unlimited"
             raise HTTPException(413, f"This package produced {len(chunk_rows):,} chunks and {character_count:,} characters. The configured build limits are {chunk_limit} chunks and {character_limit} characters.")
-        conn.execute("UPDATE knowledge_index SET progress_percent=%s,progress_stage=%s,progress_message=%s WHERE index_id=%s",
-            (15, "chunking", f"Prepared {len(chunk_rows):,} evidence chunks from {len(fragments):,} source fragments.", index_id))
+        parent_chunk_count = 0
+        old_to_new_chunk_ids = {}
+        if embedding_parent_compatible:
+            parent_chunks = conn.execute("SELECT * FROM knowledge_chunk WHERE index_id=%s ORDER BY chunk_id", (parent["index_id"],)).fetchall()
+            parent_chunk_count = len(parent_chunks)
+            reusable = defaultdict(list)
+            fallback_occurrences = Counter()
+            for row in parent_chunks:
+                metadata = json.loads(row["metadata_json"] or "{}")
+                fingerprint = metadata.get("chunk_fingerprint")
+                if not fingerprint:
+                    base = _hash(json.dumps({"source_id": row["source_id"], "source_type": row["source_type"],
+                        "heading_path": row["heading_path"] or "", "text": row["chunk_text"]}, sort_keys=True, separators=(",", ":")))
+                    fallback_occurrences[base] += 1
+                    fingerprint = _hash(f"{base}:{fallback_occurrences[base]}")
+                reusable[fingerprint].append(row)
+            for item in chunk_rows:
+                matches = reusable.get(item["fingerprint"])
+                if not matches:
+                    continue
+                prior = matches.pop(0)
+                vector = json.loads(prior["embedding_json"] or "[]")
+                if len(vector) != OPENAI_EMBEDDING_DIMENSIONS:
+                    continue
+                item["vector"] = vector
+                item["reused_from_chunk_id"] = prior["chunk_id"]
+                old_to_new_chunk_ids[prior["chunk_id"]] = item["chunk_id"]
+        reused_chunk_count = len(old_to_new_chunk_ids)
+        new_chunk_count = len(chunk_rows) - reused_chunk_count
+        retired_chunk_count = max(0, parent_chunk_count - reused_chunk_count)
+        build_mode = "incremental" if embedding_parent_compatible else "full"
+        seed_nodes, seed_edges = ({}, {})
+        if graph_parent_compatible and reused_chunk_count:
+            seed_nodes, seed_edges = _load_reusable_graph(conn, parent["index_id"], index_id, old_to_new_chunk_ids)
+        conn.execute("UPDATE knowledge_index SET build_mode=%s,reused_chunk_count=%s,new_chunk_count=%s,retired_chunk_count=%s,progress_percent=%s,progress_stage=%s,progress_message=%s WHERE index_id=%s",
+            (build_mode, reused_chunk_count, new_chunk_count, retired_chunk_count, 15, "chunking",
+             f"Prepared {len(chunk_rows):,} chunks: {reused_chunk_count:,} reused and {new_chunk_count:,} new or changed.", index_id))
     _ACTIVE_KNOWLEDGE_BUILDS.add(package_id)
     try:
-        client = _create_client()
-        vectors = []
-        embedding_batches = max(1, math.ceil(len(chunk_rows) / EMBEDDING_BATCH_SIZE))
-        _update_build_progress(index_id, 20, "embedding", f"Embedding {len(chunk_rows):,} evidence chunks.")
-        for batch_number, start in enumerate(range(0, len(chunk_rows), EMBEDDING_BATCH_SIZE), 1):
-            batch = chunk_rows[start:start + EMBEDDING_BATCH_SIZE]
+        chunks_to_embed = [item for item in chunk_rows if item["vector"] is None]
+        graph_chunks = [item for item in chunk_rows if not item["reused_from_chunk_id"]] if graph_parent_compatible else chunk_rows
+        needs_graph_client = any(item["source_type"] not in {"database_schema", "api_spec"} for item in graph_chunks)
+        client = _create_client() if chunks_to_embed or needs_graph_client else None
+        embedding_batches = max(1, math.ceil(len(chunks_to_embed) / EMBEDDING_BATCH_SIZE))
+        _update_build_progress(index_id, 20, "embedding", f"Reusing {reused_chunk_count:,} embeddings and generating {len(chunks_to_embed):,} new embeddings.")
+        embedded_count = 0
+        for batch_number, start in enumerate(range(0, len(chunks_to_embed), EMBEDDING_BATCH_SIZE), 1):
+            batch = chunks_to_embed[start:start + EMBEDDING_BATCH_SIZE]
             response = client.embeddings.create(model=request.embedding_model, input=[item["text"] for item in batch],
                 encoding_format="float", dimensions=OPENAI_EMBEDDING_DIMENSIONS)
-            vectors.extend([item.embedding for item in sorted(response.data, key=lambda item: item.index)])
+            batch_vectors = [item.embedding for item in sorted(response.data, key=lambda item: item.index)]
+            if len(batch_vectors) != len(batch):
+                raise ValueError("Embedding response count did not match the submitted chunk count")
+            for chunk, vector in zip(batch, batch_vectors):
+                chunk["vector"] = vector
+            embedded_count += len(batch_vectors)
             embedding_progress = 20 + round((batch_number / embedding_batches) * 45)
-            _update_build_progress(index_id, embedding_progress, "embedding", f"Embedded {min(len(vectors), len(chunk_rows)):,} of {len(chunk_rows):,} evidence chunks.")
-        if len(vectors) != len(chunk_rows):
-            raise ValueError("Embedding response count did not match the submitted chunk count")
-        dimensions = len(vectors[0])
-        if not dimensions or any(len(vector) != dimensions for vector in vectors):
+            _update_build_progress(index_id, embedding_progress, "embedding", f"Generated {embedded_count:,} of {len(chunks_to_embed):,} new embeddings; {reused_chunk_count:,} were reused.")
+        vectors = [item["vector"] for item in chunk_rows]
+        dimensions = len(vectors[0]) if vectors else 0
+        if not dimensions or any(not vector or len(vector) != dimensions for vector in vectors):
             raise ValueError("Embedding model returned inconsistent vector dimensions")
         _update_build_progress(index_id, 70, "saving", "Saving embedded evidence chunks.")
         with connection() as conn:
@@ -895,23 +1031,27 @@ def build_knowledge_index(package_id: str, request: BuildIndexRequest):
                 conn.execute("INSERT INTO knowledge_chunk (chunk_id,index_id,package_id,source_id,revision_id,fragment_id,source_type,source_reference,heading_path,chunk_text,content_hash,embedding_json,metadata_json) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                     (item["chunk_id"], index_id, package_id, item["metadata"]["source_id"], item["metadata"]["revision_id"],
                      item["metadata"]["fragment_id"], item["source_type"], item["source_reference"], item["heading_path"], item["text"],
-                     _hash(item["text"]), json.dumps(vector), json.dumps(item["metadata"], ensure_ascii=False)))
+                     item["content_hash"], json.dumps(vector), json.dumps(item["metadata"], ensure_ascii=False)))
                 if db_module.PGVECTOR_AVAILABLE:
                     if dimensions != PGVECTOR_DIMENSIONS:
                         raise ValueError(f"Embedding dimensions {dimensions} do not match PGVECTOR_DIMENSIONS={PGVECTOR_DIMENSIONS}")
                     conn.execute("UPDATE knowledge_chunk SET embedding_vector=%s::vector WHERE chunk_id=%s",
                         (_vector_literal(vector), item["chunk_id"]))
         _update_build_progress(index_id, 75, "saving", f"Saved {len(chunk_rows):,} embedded chunks.", chunk_count=len(chunk_rows))
-        _update_build_progress(index_id, 80, "graphing", "Building the knowledge graph from indexed evidence.")
+        graph_message = f"Updating the knowledge graph from {len(graph_chunks):,} new or changed chunks." if graph_parent_compatible and reused_chunk_count else "Building the knowledge graph from indexed evidence."
+        _update_build_progress(index_id, 80, "graphing", graph_message)
         def graph_progress(done, total, nodes, edges):
             graph_percent = 80 + round((done / max(1, total)) * 16)
             _update_build_progress(index_id, graph_percent, "graphing", f"Built graph batch {done:,} of {total:,}.", node_count=nodes, edge_count=edges)
-        node_count, edge_count, graph_warnings = _extract_graph(client, index_id, package_id, chunk_rows, request.graph_model, graph_progress)
+        node_count, edge_count, graph_warnings = _extract_graph(client, index_id, package_id, chunk_rows, request.graph_model,
+            graph_progress, seed_nodes=seed_nodes, seed_edges=seed_edges, graph_chunks=graph_chunks)
         _update_build_progress(index_id, 98, "finalizing", "Finalizing the Knowledge Base index.", chunk_count=len(chunk_rows), node_count=node_count, edge_count=edge_count)
         warning_text = "\n".join(graph_warnings)[:2000] if graph_warnings else None
         with connection() as conn:
+            ready_message = (f"Knowledge Base version {knowledge_version} is ready: {reused_chunk_count:,} chunks reused, "
+                f"{new_chunk_count:,} added or changed, and {retired_chunk_count:,} retired.")
             conn.execute("UPDATE knowledge_index SET status=%s,chunk_count=%s,node_count=%s,edge_count=%s,progress_percent=%s,progress_stage=%s,progress_message=%s,error=%s WHERE index_id=%s",
-                ("ready", len(chunk_rows), node_count, edge_count, 100, "ready", "Knowledge Base is ready.", warning_text, index_id))
+                ("ready", len(chunk_rows), node_count, edge_count, 100, "ready", ready_message, warning_text, index_id))
             _ensure_system_approval(conn, index_id)
             row = conn.execute("SELECT * FROM knowledge_index WHERE index_id=%s", (index_id,)).fetchone()
             return {**_serialize_index(row), "reused": False}
@@ -937,6 +1077,105 @@ def list_package_indexes(package_id: str):
         return [_serialize_index(row) for row in conn.execute("SELECT * FROM knowledge_index WHERE package_id=%s ORDER BY created_at DESC", (package_id,)).fetchall()]
 
 
+@router.get("/api/v1/packages/{package_id}/knowledge-summary")
+def get_package_knowledge_summary(package_id: str):
+    """Load all Knowledge Base screen artifacts with one PostgreSQL network flush."""
+    with connection() as conn:
+        package_sql = "SELECT * FROM source_package_manifest WHERE package_id=%s"
+        indexes_sql = "SELECT * FROM knowledge_index WHERE package_id=%s ORDER BY created_at DESC LIMIT 25"
+        reviews_sql = (
+            "SELECT r.index_id,r.reviewer,r.decision,r.comments,r.object_hash,r.reviewed_at "
+            "FROM knowledge_index_review r JOIN knowledge_index ki ON ki.index_id=r.index_id "
+            "WHERE ki.package_id=%s ORDER BY r.reviewed_at DESC"
+        )
+        rules_sql = "SELECT * FROM package_business_rule WHERE package_id=%s ORDER BY ordinal"
+        versions_sql = (
+            "SELECT ki.*,pm.package_version,pm.package_name FROM knowledge_index ki "
+            "JOIN source_package_manifest pm ON pm.package_id=ki.package_id "
+            "WHERE ki.project_id=(SELECT project_id FROM source_package_manifest WHERE package_id=%s) "
+            "ORDER BY ki.knowledge_version DESC,ki.created_at DESC LIMIT 50"
+        )
+
+        # PostgreSQL pipeline mode sends these independent reads in one network
+        # flush. The SQLite test/development fallback executes the same queries
+        # normally because it has no network latency to hide.
+        if db_module.DATABASE_URL and hasattr(conn, "pipeline"):
+            with conn.pipeline():
+                package_cursor = conn.execute(package_sql, (package_id,))
+                indexes_cursor = conn.execute(indexes_sql, (package_id,))
+                reviews_cursor = conn.execute(reviews_sql, (package_id,))
+                rules_cursor = conn.execute(rules_sql, (package_id,))
+                versions_cursor = conn.execute(versions_sql, (package_id,))
+        else:
+            package_cursor = conn.execute(package_sql, (package_id,))
+            indexes_cursor = conn.execute(indexes_sql, (package_id,))
+            reviews_cursor = conn.execute(reviews_sql, (package_id,))
+            rules_cursor = conn.execute(rules_sql, (package_id,))
+            versions_cursor = conn.execute(versions_sql, (package_id,))
+
+        package = package_cursor.fetchone()
+        if not package:
+            raise HTTPException(404, "Resource Package not found")
+        index_rows = indexes_cursor.fetchall()
+        review_rows = reviews_cursor.fetchall()
+        latest_reviews = {}
+        for review_row in review_rows:
+            latest_reviews.setdefault(review_row["index_id"], review_row)
+        indexes = [_serialize_index(row) for row in index_rows]
+        ready_index = next((row for row in index_rows if row["status"] == "ready"), None)
+        if ready_index:
+            review = latest_reviews.get(ready_index["index_id"])
+            if not review or review["decision"] != "approved":
+                review = _ensure_system_approval(conn, ready_index["index_id"])
+                latest_reviews[ready_index["index_id"]] = review
+        latest = index_rows[0] if index_rows else None
+        if ready_index:
+            review = latest_reviews.get(ready_index["index_id"])
+            readiness = {
+                "package_id": package_id, "index_id": ready_index["index_id"], "status": "approved", "ready": True,
+                "index_status": ready_index["status"], "review": _dict(review), "progress_percent": 100,
+                "progress_stage": ready_index["progress_stage"] or "ready",
+                "progress_message": ready_index["progress_message"] or "Knowledge Base is ready.",
+                "message": "Knowledge Base is ready." if latest["index_id"] == ready_index["index_id"] else f"Knowledge Base is ready from the latest successful index. Newest build is {latest['status']}.",
+            }
+        elif latest:
+            review = latest_reviews.get(latest["index_id"])
+            status = review["decision"] if latest["status"] == "ready" and review else latest["status"]
+            readiness = {
+                "package_id": package_id, "index_id": latest["index_id"], "status": status, "ready": False,
+                "index_status": latest["status"], "review": _dict(review),
+                "progress_percent": int(latest["progress_percent"] or 0),
+                "progress_stage": latest["progress_stage"] or latest["status"],
+                "progress_message": latest["progress_message"], "message": f"Knowledge Base is {latest['status']}.",
+            }
+        else:
+            readiness = {"package_id": package_id, "status": "missing", "ready": False, "message": "Knowledge Base has not been built for this Resource Package yet."}
+        rule_rows = [_dict(row) for row in rules_cursor.fetchall()]
+        rules = {
+            "package_id": package_id, "review_status": package["rule_review_status"],
+            "rule_set_hash": package["rule_set_hash"], "rules_reviewed_at": package["rules_reviewed_at"],
+            "rules": rule_rows,
+            "counts": {status: sum(rule["status"] == status for rule in rule_rows) for status in ("pending", "approved", "rejected")},
+        }
+        version_rows = versions_cursor.fetchall()
+        return {"package_id": package_id, "indexes": indexes, "readiness": readiness,
+                "business_rules": rules, "versions": [_serialize_index(row) for row in version_rows]}
+
+
+@router.get("/api/v1/projects/{project_id}/knowledge-versions")
+def list_project_knowledge_versions(project_id: str):
+    with connection() as conn:
+        if not conn.execute("SELECT 1 FROM project WHERE project_id=%s", (project_id,)).fetchone():
+            raise HTTPException(404, "Project not found")
+        rows = conn.execute(
+            "SELECT ki.*,pm.package_version,pm.package_name FROM knowledge_index ki "
+            "JOIN source_package_manifest pm ON pm.package_id=ki.package_id "
+            "WHERE ki.project_id=%s ORDER BY ki.knowledge_version DESC,ki.created_at DESC",
+            (project_id,),
+        ).fetchall()
+        return [_serialize_index(row) for row in rows]
+
+
 @router.get("/api/v1/packages/{package_id}/rag-readiness")
 def get_rag_readiness(package_id: str):
     with connection() as conn:
@@ -946,7 +1185,7 @@ def get_rag_readiness(package_id: str):
         if not indexes:
             return {"package_id": package_id, "status": "missing", "ready": False, "message": "Knowledge Base has not been built for this source package yet."}
         latest = indexes[0]
-        ready_index = _latest_ready_index(conn, indexes)
+        ready_index = _latest_ready_index(conn, indexes, verify_integrity=False)
         if ready_index:
             review = _latest_review(conn, ready_index["index_id"])
             message = "Knowledge Base is ready."
