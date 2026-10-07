@@ -2058,6 +2058,97 @@ def create_manifest(project_id: str, request: ManifestRequest, background_tasks:
 def list_manifests(project_id: str):
     with connection() as conn: return [row_dict(x) for x in conn.execute("SELECT m.*,COUNT(i.source_id) AS source_count FROM source_package_manifest m LEFT JOIN source_package_item i ON i.package_id=m.package_id WHERE m.project_id=%s GROUP BY m.package_id ORDER BY m.package_version DESC",(project_id,)).fetchall()]
 
+@app.get("/api/v1/projects/{project_id}/dashboard")
+def get_project_dashboard(project_id: str, package_id: str | None = None):
+    """Return isolated, persisted workflow summaries for each immutable package."""
+    with connection() as conn:
+        project = conn.execute("SELECT project_id,project_name,created_at FROM project WHERE project_id=%s", (project_id,)).fetchone()
+        if not project:
+            raise HTTPException(404, "Project not found")
+        packages = conn.execute(
+            "SELECT m.*,COUNT(i.source_id) AS source_count FROM source_package_manifest m "
+            "LEFT JOIN source_package_item i ON i.package_id=m.package_id "
+            "WHERE m.project_id=%s GROUP BY m.package_id ORDER BY m.package_version DESC",
+            (project_id,),
+        ).fetchall()
+        summaries = []
+        for package_row in packages:
+            package = row_dict(package_row)
+            pid = package["package_id"]
+            rules = conn.execute("SELECT status,COUNT(*) AS count FROM package_business_rule WHERE package_id=%s GROUP BY status", (pid,)).fetchall()
+            rule_counts = {row["status"]: row["count"] for row in rules}
+            indexes = conn.execute("SELECT * FROM knowledge_index WHERE package_id=%s ORDER BY knowledge_version DESC,created_at DESC", (pid,)).fetchall()
+            index = row_dict(indexes[0]) if indexes else None
+            analyses = conn.execute("SELECT * FROM requirement_analysis WHERE package_id=%s ORDER BY analysis_version DESC,created_at DESC", (pid,)).fetchall()
+            analysis = row_dict(analyses[0]) if analyses else None
+            requirements_total = requirements_approved = 0
+            if analysis:
+                contract = _clean_requirement_contract(json.loads(analysis.get("contract_json") or "{}"))
+                requirements = contract.get("requirements", [])
+                approved_ids = set(contract.get("approved_items", []))
+                requirements_total = len(requirements)
+                requirements_approved = sum(1 for item in requirements if item.get("requirement_id") in approved_ids or item.get("approved") is True or item.get("review_status") == "approved")
+            generations = conn.execute("SELECT * FROM test_case_generation WHERE package_id=%s ORDER BY created_at DESC", (pid,)).fetchall()
+            generation = row_dict(generations[0]) if generations else None
+            cases_total = cases_approved = data_count = saved_data_count = 0
+            if generation:
+                generation_contract = json.loads(generation.get("contract_json") or "{}")
+                cases = generation_contract.get("test_cases", [])
+                cases_total = len(cases)
+                cases_approved = sum(1 for item in cases if item.get("approved") is True or item.get("review_status") == "approved")
+                data_rows = conn.execute("SELECT status,COUNT(*) AS count FROM test_data_record WHERE generation_id=%s GROUP BY status", (generation["generation_id"],)).fetchall()
+                data_count = sum(row["count"] for row in data_rows)
+                saved_data_count = sum(row["count"] for row in data_rows if row["status"] == "saved")
+            run_rows = conn.execute("SELECT status,COUNT(*) AS count FROM test_run WHERE package_id=%s GROUP BY status", (pid,)).fetchall()
+            execution_counts = {row["status"]: row["count"] for row in run_rows}
+            blockers = []
+            if not package.get("source_count"):
+                blockers.append("No source documents are attached to this package.")
+            if rule_counts.get("pending", 0):
+                blockers.append(f"{rule_counts['pending']} business rule(s) need review.")
+            if index and index.get("status") in {"failed", "error"}:
+                blockers.append("Knowledge Base build failed; review the build before continuing.")
+            if analysis and analysis.get("status") in {"needs_changes", "rejected"}:
+                blockers.append("Requirement analysis needs changes before delivery.")
+            if generation and generation.get("status") in {"failed", "error"}:
+                blockers.append("Test case generation failed; retry or review the run.")
+            if blockers:
+                overall_status = "at_risk"
+            elif saved_data_count:
+                overall_status = "delivered"
+            elif not generation:
+                overall_status = "in_progress"
+            else:
+                overall_status = "on_track"
+            if saved_data_count:
+                next_milestone = "Review execution results"
+            elif generation and data_count:
+                next_milestone = "Save approved test data to Bronze"
+            elif generation:
+                next_milestone = "Prepare test data"
+            elif analysis and requirements_total:
+                next_milestone = "Review requirements and generate test cases"
+            elif index and index.get("status") in {"ready", "succeeded"}:
+                next_milestone = "Generate and review requirements"
+            elif rule_counts.get("pending", 0):
+                next_milestone = "Review business rules"
+            else:
+                next_milestone = "Build the Knowledge Base"
+            summaries.append({
+                **package,
+                "status": overall_status,
+                "counts": {"sources": package.get("source_count", 0), "business_rules": sum(rule_counts.values()), "pending_business_rules": rule_counts.get("pending", 0), "requirements": requirements_total, "approved_requirements": requirements_approved, "test_cases": cases_total, "approved_test_cases": cases_approved, "test_data_records": data_count, "saved_test_data_records": saved_data_count, "test_runs": sum(execution_counts.values())},
+                "workflow": {"knowledge_base": index.get("status", "not_started") if index else "not_started", "requirements": analysis.get("status", "not_started") if analysis else "not_started", "test_cases": generation.get("status", "not_started") if generation else "not_started", "test_data": "ready" if data_count else "not_started"},
+                "knowledge_base": ({"status": index.get("status"), "knowledge_version": index.get("knowledge_version"), "chunk_count": index.get("chunk_count", 0), "node_count": index.get("node_count", 0), "edge_count": index.get("edge_count", 0), "updated_at": index.get("created_at")} if index else None),
+                "blockers": blockers,
+                "next_milestone": next_milestone,
+                "updated_at": max([value for value in ((generation or {}).get("updated_at"), (analysis or {}).get("updated_at"), (index or {}).get("created_at"), package.get("created_at")) if value], default=package.get("created_at")),
+            })
+        selected = next((item["package_id"] for item in summaries if item["package_id"] == package_id), None)
+        if package_id and selected is None:
+            raise HTTPException(404, "Resource Package not found in this project")
+        return {"project": row_dict(project), "packages": summaries, "selected_package_id": selected or (summaries[0]["package_id"] if summaries else None)}
+
 @app.get("/api/v1/manifests/{package_id}")
 def get_package(package_id: str):
     with connection() as conn:

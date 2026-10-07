@@ -175,6 +175,10 @@ export async function listManifests(projectId, options = {}) {
   return request(`/api/v1/projects/${encodeURIComponent(projectId)}/manifests`, { cacheTtl: 30_000, ...options });
 }
 
+export async function getProjectDashboard(projectId, options = {}) {
+  return request(`/api/v1/projects/${encodeURIComponent(projectId)}/dashboard`, { cache: "no-store", ...options });
+}
+
 export async function buildKnowledgeIndex(packageId, options = {}) {
   return request(`/api/v1/packages/${encodeURIComponent(packageId)}/knowledge-index`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(options) });
 }
