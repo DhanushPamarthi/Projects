@@ -399,6 +399,7 @@ MIGRATIONS = [
     "CREATE TABLE IF NOT EXISTS test_execution_result (result_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES test_run(run_id), generation_id TEXT NOT NULL REFERENCES test_case_generation(generation_id), test_case_id TEXT NOT NULL, status TEXT NOT NULL, expected_json TEXT NOT NULL, actual_json TEXT NOT NULL, assertions_json TEXT NOT NULL, bronze_refs_json TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT NOT NULL, error TEXT, UNIQUE(run_id, test_case_id))",
     "CREATE INDEX IF NOT EXISTS testiq_test_execution_result_run_idx ON test_execution_result(run_id)",
     "CREATE INDEX IF NOT EXISTS testiq_test_execution_result_case_idx ON test_execution_result(generation_id,test_case_id)",
+    "UPDATE test_data_record SET status='ready_for_execution' WHERE status='ready_for_cdp'",
 ]
 
 class _SQLiteConnection:

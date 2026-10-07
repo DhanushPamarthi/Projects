@@ -318,8 +318,8 @@ export async function reviewTestData(generationId, items) {
   return request(`/api/v1/test-case-generations/${encodeURIComponent(generationId)}/test-data/review`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ items }) });
 }
 
-export async function saveTestDataToBronze(generationId, testCaseIds) {
-  return request(`/api/v1/test-case-generations/${encodeURIComponent(generationId)}/test-data/save`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ test_case_ids: testCaseIds }) });
+export async function saveTestDataToBronze(generationId, testCaseIds, reviewer = "Product Owner") {
+  return request(`/api/v1/test-case-generations/${encodeURIComponent(generationId)}/test-data/save`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ test_case_ids: testCaseIds, reviewer }) });
 }
 
 export async function getTokenUsage({ projectId, packageId, stage } = {}) {

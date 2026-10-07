@@ -457,6 +457,7 @@ class ExecutionRunRequest(BaseModel):
     reviewer: str = Field(min_length=1, max_length=200)
     comments: str | None = Field(default=None, max_length=4000)
     selected_test_case_ids: list[str] = Field(min_length=1)
+    selected_test_data_record_ids: list[str] | None = None
 
 class ExecutionRunLifecycleRequest(BaseModel):
     lifecycle_state: str = Field(pattern="^(cancelled|failed)$")
@@ -496,7 +497,11 @@ class TestDataReviewRequest(BaseModel):
     items: list[TestDataReviewItem] = Field(min_length=1)
 
 class TestDataSubmitRequest(BaseModel):
-    test_case_ids: list[str] = Field(min_length=1)
+    record_ids: list[str] = Field(default_factory=list)
+    # Keep accepting the former case-level payload for clients that have not refreshed yet.
+    test_case_ids: list[str] = Field(default_factory=list)
+    reviewer: str = Field(default="Product Owner", min_length=1, max_length=200)
+    comments: str | None = Field(default=None, max_length=4000)
 
 class DiscoveryContextRequest(BaseModel):
     package_id: str | None = None
@@ -3123,64 +3128,86 @@ def regenerate_test_cases(generation_id: str, request: TestCaseRegenerationReque
 @app.post("/api/v1/test-case-generations/{generation_id}/execution-runs", status_code=201)
 def create_execution_run(generation_id: str, request: ExecutionRunRequest):
     with connection() as conn:
-        row = conn.execute("SELECT * FROM test_case_generation WHERE generation_id=%s", (generation_id,)).fetchone()
-        if not row:
-            raise HTTPException(404, "Test-case generation run not found")
-        if len(set(request.selected_test_case_ids)) != len(request.selected_test_case_ids):
-            raise HTTPException(422, "Each selected test case must appear only once")
-        contract = json.loads(row["contract_json"])
-        cases = contract.get("test_cases", [])
-        by_id = {case.get("test_case_id"): case for case in cases}
-        unknown = sorted(set(request.selected_test_case_ids) - set(by_id))
-        if unknown:
-            raise HTTPException(422, {"unknown_items": unknown})
-        not_approved = [case_id for case_id in request.selected_test_case_ids if _review_status(by_id[case_id]) != "approved"]
-        if not_approved:
-            raise HTTPException(422, {"message": "Only approved test cases can be frozen for execution", "not_approved": not_approved})
-        if not request.selected_test_case_ids:
-            raise HTTPException(422, "Select at least one approved test case with saved test data before freezing a baseline")
+        return _create_execution_run(conn, generation_id, request)
 
-        timestamp = now()
-        selected_cases = [json.loads(json.dumps(by_id[case_id])) for case_id in request.selected_test_case_ids]
-        selected_test_data = []
-        if request.selected_test_case_ids:
-            placeholders = ",".join(["%s"] * len(request.selected_test_case_ids))
-            data_rows = conn.execute(f"SELECT r.* FROM test_data_record r WHERE r.generation_id=%s AND r.test_case_id IN ({placeholders}) AND r.status IN ('saved','ready_for_cdp') ORDER BY r.test_case_id,r.entity_name", tuple([generation_id] + request.selected_test_case_ids)).fetchall()
-            selected_test_data = [_test_data_record_response(data_row) for data_row in data_rows]
-        cases_with_saved_data = {record["test_case_id"] for record in selected_test_data}
-        missing_test_data = sorted(set(request.selected_test_case_ids) - cases_with_saved_data)
-        if missing_test_data:
-            raise HTTPException(422, {"message": "Generate and save test data for CDP before creating an execution run", "missing_test_data": missing_test_data})
-        source_contract_hash = hashlib.sha256(json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-        frozen_contract = {
-            "baseline_version": "1.0",
-            "generation_id": generation_id,
-            "analysis_id": row["analysis_id"],
-            "package_id": row["package_id"],
-            "project_id": row["project_id"],
-            "source_contract_hash": source_contract_hash,
-            "selected_test_case_ids": request.selected_test_case_ids,
-            "test_cases": selected_cases,
-            "test_data_records": selected_test_data,
-            "coverage_review": contract.get("coverage_review", {}),
-            "review_metadata": contract.get("review_metadata", {}),
-            "frozen_by": request.reviewer,
-            "frozen_at": timestamp,
-            "comments": request.comments,
-        }
-        baseline_hash = hashlib.sha256(json.dumps(frozen_contract, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-        run_id = uid("run")
-        configuration_snapshot = {
-            "generation_id": generation_id,
-            "baseline_hash": baseline_hash,
-            "selected_test_case_ids": request.selected_test_case_ids,
-            "selected_case_count": len(request.selected_test_case_ids),
-            "frozen_at": timestamp,
-            "reviewer": request.reviewer,
-        }
-        observations = [{"type": "baseline_frozen", "message": "Approved test cases were selected and frozen for an execution run.", "created_at": timestamp}]
-        conn.execute("INSERT INTO test_run (run_id,package_id,project_id,status,configuration_snapshot,generation_id,selected_test_case_ids_json,frozen_contract_json,baseline_hash,reviewer,review_comments,lifecycle_state,approved_at,immutable_observations_json,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (run_id, row["package_id"], row["project_id"], "selected", json.dumps(configuration_snapshot), generation_id, json.dumps(request.selected_test_case_ids), json.dumps(frozen_contract), baseline_hash, request.reviewer, request.comments, "selected", timestamp, json.dumps(observations), timestamp))
-        return _test_run_response(conn.execute("SELECT * FROM test_run WHERE run_id=%s", (run_id,)).fetchone(), conn)
+
+def _create_execution_run(conn, generation_id: str, request: ExecutionRunRequest):
+    row = conn.execute("SELECT * FROM test_case_generation WHERE generation_id=%s", (generation_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Test-case generation run not found")
+    if len(set(request.selected_test_case_ids)) != len(request.selected_test_case_ids):
+        raise HTTPException(422, "Each selected test case must appear only once")
+    selected_record_ids = request.selected_test_data_record_ids
+    if selected_record_ids is not None and len(set(selected_record_ids)) != len(selected_record_ids):
+        raise HTTPException(422, "Each selected test data record must appear only once")
+    contract = json.loads(row["contract_json"])
+    cases = contract.get("test_cases", [])
+    by_id = {case.get("test_case_id"): case for case in cases}
+    unknown = sorted(set(request.selected_test_case_ids) - set(by_id))
+    if unknown:
+        raise HTTPException(422, {"unknown_items": unknown})
+    not_approved = [case_id for case_id in request.selected_test_case_ids if _review_status(by_id[case_id]) != "approved"]
+    if not_approved:
+        raise HTTPException(422, {"message": "Only approved test cases can be frozen for execution", "not_approved": not_approved})
+    if not request.selected_test_case_ids:
+        raise HTTPException(422, "Select at least one approved test case with saved test data before freezing a baseline")
+
+    timestamp = now()
+    selected_cases = [json.loads(json.dumps(by_id[case_id])) for case_id in request.selected_test_case_ids]
+    if selected_record_ids is not None:
+        if not selected_record_ids:
+            raise HTTPException(422, "Select at least one test data record")
+        placeholders = ",".join(["%s"] * len(selected_record_ids))
+        data_rows = conn.execute(
+            f"SELECT r.* FROM test_data_record r WHERE r.generation_id=%s AND r.record_id IN ({placeholders}) ORDER BY r.test_case_id,r.entity_name",
+            tuple([generation_id] + selected_record_ids),
+        ).fetchall()
+        if {item["record_id"] for item in data_rows} != set(selected_record_ids):
+            raise HTTPException(422, "One or more selected test data records are missing or belong to another generation")
+        wrong_cases = sorted({item["test_case_id"] for item in data_rows} - set(request.selected_test_case_ids))
+        missing_cases = sorted(set(request.selected_test_case_ids) - {item["test_case_id"] for item in data_rows})
+        if wrong_cases or missing_cases:
+            raise HTTPException(422, {"message": "Selected records must belong to the selected approved cases, with data for every selected case", "unexpected_case_ids": wrong_cases, "missing_test_data": missing_cases})
+    else:
+        placeholders = ",".join(["%s"] * len(request.selected_test_case_ids))
+        data_rows = conn.execute(
+            f"SELECT r.* FROM test_data_record r WHERE r.generation_id=%s AND r.test_case_id IN ({placeholders}) AND r.status IN ('saved','ready_for_execution','processing','bronze_loaded','processed') ORDER BY r.test_case_id,r.entity_name",
+            tuple([generation_id] + request.selected_test_case_ids),
+        ).fetchall()
+    selected_test_data = [_test_data_record_response(data_row) for data_row in data_rows]
+    invalid_statuses = [record["record_id"] for record in selected_test_data if record.get("status") not in {"saved", "ready_for_execution", "processing", "bronze_loaded", "processed"}]
+    if invalid_statuses:
+        raise HTTPException(409, {"message": "Execution runs can include only records saved or marked ready for execution", "record_ids": invalid_statuses})
+    cases_with_data = {record["test_case_id"] for record in selected_test_data}
+    missing_test_data = sorted(set(request.selected_test_case_ids) - cases_with_data)
+    if missing_test_data:
+        raise HTTPException(422, {"message": "Generate and mark test data ready for execution before creating an execution run", "missing_test_data": missing_test_data})
+    record_ids = [record["record_id"] for record in selected_test_data]
+    source_contract_hash = hashlib.sha256(json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    frozen_contract = {
+        "baseline_version": "1.0", "generation_id": generation_id,
+        "analysis_id": row["analysis_id"], "package_id": row["package_id"], "project_id": row["project_id"],
+        "source_contract_hash": source_contract_hash,
+        "selected_test_case_ids": request.selected_test_case_ids,
+        "selected_test_data_record_ids": record_ids,
+        "test_cases": selected_cases, "test_data_records": selected_test_data,
+        "coverage_review": contract.get("coverage_review", {}),
+        "review_metadata": contract.get("review_metadata", {}),
+        "frozen_by": request.reviewer, "frozen_at": timestamp, "comments": request.comments,
+    }
+    baseline_hash = hashlib.sha256(json.dumps(frozen_contract, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    run_id = uid("run")
+    configuration_snapshot = {
+        "generation_id": generation_id, "baseline_hash": baseline_hash,
+        "selected_test_case_ids": request.selected_test_case_ids,
+        "selected_test_data_record_ids": record_ids,
+        "selected_case_count": len(request.selected_test_case_ids),
+        "selected_record_count": len(record_ids), "frozen_at": timestamp, "reviewer": request.reviewer,
+    }
+    observations = [{"type": "baseline_frozen", "message": "Approved test cases and selected test data records were frozen for an execution run.", "created_at": timestamp}]
+    conn.execute("INSERT INTO test_run (run_id,package_id,project_id,status,configuration_snapshot,generation_id,selected_test_case_ids_json,frozen_contract_json,baseline_hash,reviewer,review_comments,lifecycle_state,approved_at,immutable_observations_json,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (run_id, row["package_id"], row["project_id"], "selected", json.dumps(configuration_snapshot), generation_id, json.dumps(request.selected_test_case_ids), json.dumps(frozen_contract), baseline_hash, request.reviewer, request.comments, "selected", timestamp, json.dumps(observations), timestamp))
+    return _test_run_response(conn.execute("SELECT * FROM test_run WHERE run_id=%s", (run_id,)).fetchone(), conn)
+
 
 @app.get("/api/v1/test-case-generations/{generation_id}/execution-runs")
 def list_execution_runs_for_generation(generation_id: str):
@@ -3205,6 +3232,12 @@ def execute_run(run_id: str, request: ExecutionRunExecuteRequest | None = None):
         selected_case_ids = json.loads(row["selected_test_case_ids_json"] or "[]")
         if not selected_case_ids:
             raise HTTPException(422, "Execution baseline has no selected test cases")
+        frozen_contract = json.loads(row["frozen_contract_json"] or "{}")
+        frozen_record_ids = frozen_contract.get("selected_test_data_record_ids")
+        frozen_records_by_case = {}
+        if frozen_record_ids is not None:
+            for record in frozen_contract.get("test_data_records", []):
+                frozen_records_by_case.setdefault(record.get("test_case_id"), []).append(record.get("record_id"))
 
         observations = json.loads(row["immutable_observations_json"] or "[]")
         reviewer = request.reviewer if request else None
@@ -3221,7 +3254,13 @@ def execute_run(run_id: str, request: ExecutionRunExecuteRequest | None = None):
             ("running", "running", started_at, None, json.dumps(observations), run_id),
         )
 
-        statuses = [_execute_case_against_bronze(conn, run_id, row["generation_id"], test_case_id, started_at) for test_case_id in selected_case_ids]
+        statuses = [
+            _execute_case_against_bronze(
+                conn, run_id, row["generation_id"], test_case_id, started_at,
+                selected_record_ids=frozen_records_by_case.get(test_case_id, []) if frozen_record_ids is not None else None,
+            )
+            for test_case_id in selected_case_ids
+        ]
         completed_at = now()
         passed = sum(status == "passed" for status in statuses)
         failed = sum(status == "failed" for status in statuses)
@@ -4218,15 +4257,19 @@ def list_test_data(generation_id: str):
 @app.put("/api/v1/test-case-generations/{generation_id}/test-data/review")
 def review_test_data(generation_id: str, request: TestDataReviewRequest):
     with connection() as conn:
-        rows = conn.execute("SELECT record_id FROM test_data_record WHERE generation_id=%s", (generation_id,)).fetchall()
+        rows = conn.execute("SELECT record_id,status FROM test_data_record WHERE generation_id=%s", (generation_id,)).fetchall()
         known = {row["record_id"] for row in rows}
         submitted = {item.record_id for item in request.items}
-        if submitted != known:
-            raise HTTPException(422, {"unknown_record_ids": sorted(submitted - known), "missing_record_ids": sorted(known - submitted)})
+        if submitted - known:
+            raise HTTPException(422, {"unknown_record_ids": sorted(submitted - known)})
+        status_by_id = {row["record_id"]: row["status"] for row in rows}
+        non_draft = sorted(item.record_id for item in request.items if status_by_id.get(item.record_id) != "draft")
+        if non_draft:
+            raise HTTPException(409, {"message": "Only draft test data records can be edited", "record_ids": non_draft})
         timestamp = now()
         for item in request.items:
             conn.execute("UPDATE test_data_record SET payload_json=%s,updated_at=%s WHERE generation_id=%s AND record_id=%s AND status='draft'", (json.dumps(item.payload, sort_keys=True), timestamp, generation_id, item.record_id))
-        saved_rows = conn.execute("SELECT r.* FROM test_data_record r WHERE r.generation_id=%s ORDER BY r.test_case_id,r.entity_name", (generation_id,)).fetchall()
+        saved_rows = conn.execute("SELECT r.* FROM test_data_record r WHERE r.generation_id=%s AND r.record_id=ANY(%s) ORDER BY r.test_case_id,r.entity_name", (generation_id, list(submitted))).fetchall()
         return [_test_data_record_response(row) for row in saved_rows]
 
 _BRONZE_TABLES = {"raw_file", "membership", "prescription", "order", "claim", "benefit", "drug", "medical_claim", "product"}
@@ -4745,11 +4788,20 @@ def _evaluate_record_payload(payload, actual_by_table, assertions):
         if expected_outcome.get("should_suppress_communication") is not None and order_row.get("suppress_communication") is not None:
             _add_assertion(assertions, "suppression expectation matches setup", bool(order_row.get("suppress_communication")) == bool(expected_outcome.get("should_suppress_communication")), expected_outcome.get("should_suppress_communication"), bool(order_row.get("suppress_communication")))
 
-def _execute_case_against_bronze(conn, run_id: str, generation_id: str, test_case_id: str, started_at: str):
-    rows = conn.execute(
-        "SELECT * FROM test_data_record WHERE generation_id=%s AND test_case_id=%s AND status IN ('saved','ready_for_cdp') ORDER BY entity_name,record_id",
-        (generation_id, test_case_id),
-    ).fetchall()
+def _execute_case_against_bronze(conn, run_id: str, generation_id: str, test_case_id: str, started_at: str, selected_record_ids: list[str] | None = None):
+    if selected_record_ids is not None and not selected_record_ids:
+        rows = []
+    elif selected_record_ids is not None:
+        placeholders = ",".join(["%s"] * len(selected_record_ids))
+        rows = conn.execute(
+            f"SELECT * FROM test_data_record WHERE generation_id=%s AND test_case_id=%s AND record_id IN ({placeholders}) ORDER BY entity_name,record_id",
+            tuple([generation_id, test_case_id] + selected_record_ids),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM test_data_record WHERE generation_id=%s AND test_case_id=%s AND status IN ('saved','ready_for_execution','processing','bronze_loaded','processed') ORDER BY entity_name,record_id",
+            (generation_id, test_case_id),
+        ).fetchall()
     assertions = []
     expected_records = []
     actual_records = []
@@ -4937,14 +4989,48 @@ def save_test_data_to_bronze(generation_id: str, request: TestDataSubmitRequest)
             raise HTTPException(404, "Test-case generation run not found")
         generation_contract = json.loads(generation["contract_json"])
         cases = {case.get("test_case_id"): case for case in generation_contract.get("test_cases", [])}
-        if len(set(request.test_case_ids)) != len(request.test_case_ids):
-            raise HTTPException(422, "Each selected test case must appear only once")
-        unknown_cases = sorted(set(request.test_case_ids) - set(cases))
+        if request.record_ids and request.test_case_ids:
+            raise HTTPException(422, "Submit selected record_ids or legacy test_case_ids, not both")
+        if request.record_ids:
+            if len(set(request.record_ids)) != len(request.record_ids):
+                raise HTTPException(422, "Each selected test data record must appear only once")
+            placeholders = ",".join(["%s"] * len(request.record_ids))
+            rows = conn.execute(
+                f"SELECT * FROM test_data_record WHERE generation_id=%s AND record_id IN ({placeholders}) ORDER BY test_case_id,entity_name",
+                tuple([generation_id] + request.record_ids),
+            ).fetchall()
+            if {row["record_id"] for row in rows} != set(request.record_ids):
+                raise HTTPException(422, "One or more selected records are missing or belong to another generation")
+            selected_case_ids = sorted({row["test_case_id"] for row in rows})
+            case_placeholders = ",".join(["%s"] * len(selected_case_ids))
+            all_case_rows = conn.execute(
+                f"SELECT record_id,status FROM test_data_record WHERE generation_id=%s AND test_case_id IN ({case_placeholders})",
+                tuple([generation_id] + selected_case_ids),
+            ).fetchall()
+            if {row["record_id"] for row in all_case_rows} != set(request.record_ids):
+                raise HTTPException(422, "Select the entire test case, including every generated template record")
+            non_draft = [row["record_id"] for row in rows if row["status"] not in {"draft", "saved"}]
+            non_draft.extend(row["record_id"] for row in all_case_rows if row["status"] not in {"draft", "saved"} and row["record_id"] not in non_draft)
+            if non_draft:
+                raise HTTPException(409, {"message": "A test case must be selected as a whole and can only be marked ready once. One or more records are already ready or processed.", "record_ids": non_draft})
+        else:
+            if not request.test_case_ids:
+                raise HTTPException(422, "Select at least one generated test data record")
+            if len(set(request.test_case_ids)) != len(request.test_case_ids):
+                raise HTTPException(422, "Each selected test case must appear only once")
+            unknown_cases = sorted(set(request.test_case_ids) - set(cases))
+            if unknown_cases:
+                raise HTTPException(422, {"unknown_test_case_ids": unknown_cases})
+            selected_case_ids = request.test_case_ids
+            rows = conn.execute("SELECT * FROM test_data_record WHERE generation_id=%s AND test_case_id=ANY(%s) ORDER BY test_case_id,entity_name", (generation_id, selected_case_ids)).fetchall()
+            non_draft = [row["record_id"] for row in rows if row["status"] not in {"draft", "saved"}]
+            if non_draft:
+                raise HTTPException(409, {"message": "A test case must be selected as a whole and can only be marked ready once. One or more records are already ready or processed.", "record_ids": non_draft})
+        if not rows:
+            raise HTTPException(404, "No generated records were found for the selected test cases")
+        unknown_cases = sorted(set(selected_case_ids) - set(cases))
         if unknown_cases:
             raise HTTPException(422, {"unknown_test_case_ids": unknown_cases})
-        rows = conn.execute("SELECT * FROM test_data_record WHERE generation_id=%s AND test_case_id=ANY(%s) ORDER BY test_case_id,entity_name", (generation_id, request.test_case_ids)).fetchall()
-        if not rows:
-            raise HTTPException(404, "Generate test data before saving it for CDP")
         templates = {}
         template_ids = sorted({row["template_id"] for row in rows})
         if "bronze_test_dataset_v1" in template_ids:
@@ -4954,7 +5040,7 @@ def save_test_data_to_bronze(generation_id: str, request: TestDataSubmitRequest)
                 templates[template_row["template_id"]] = {**row_dict(template_row), "payload": json.loads(template_row["payload_json"])}
         validated_payloads = {}
         records_by_case = {}
-        case_statuses = {case_id for case_id in request.test_case_ids}
+        case_statuses = set(selected_case_ids)
         if {row["test_case_id"] for row in rows} != case_statuses:
             raise HTTPException(422, {"message": "Generate test data for every selected case before saving it for CDP", "missing_test_data": sorted(case_statuses - {row["test_case_id"] for row in rows})})
         for row in rows:
@@ -4963,7 +5049,7 @@ def save_test_data_to_bronze(generation_id: str, request: TestDataSubmitRequest)
                 raise HTTPException(422, f"Approved test case {row['test_case_id']} is missing from its generation contract.")
             payload = json.loads(row["payload_json"])
             if payload.get("type") == "pharmacy.orders.v1.sample-notification":
-                if row["status"] not in {"saved", "ready_for_cdp"}:
+                if row["status"] not in {"saved", "ready_for_execution"}:
                     payload = _stamp_pharmacy_event_fields(payload, generation_id, row["test_case_id"])
                 _validate_pharmacy_notification(payload, test_case)
             else:
@@ -4985,11 +5071,11 @@ def save_test_data_to_bronze(generation_id: str, request: TestDataSubmitRequest)
             membership_item = items.get("membership")
             prescription_item = items.get("prescription")
             if not membership_item and _test_case_requires_membership(cases[case_id]):
-                raise HTTPException(422, f"Test case {case_id} requires Membership data before it can be queued for CDP.")
+                raise HTTPException(422, f"Test case {case_id} requires Membership data before it can be marked ready for execution.")
             if not prescription_item and _test_case_requires_prescription(cases[case_id]):
-                raise HTTPException(422, f"Test case {case_id} requires Prescription data before it can be queued for CDP.")
+                raise HTTPException(422, f"Test case {case_id} requires Prescription data before it can be marked ready for execution.")
             if not membership_item and not prescription_item:
-                raise HTTPException(422, f"Test case {case_id} must have at least one Membership or Prescription record before it can be queued for CDP.")
+                raise HTTPException(422, f"Test case {case_id} must have at least one Membership or Prescription record before it can be marked ready for execution.")
             if membership_item:
                 _validate_domain_template_payload(membership_item[1], membership_item[2], cases[case_id])
             if prescription_item:
@@ -4997,10 +5083,17 @@ def save_test_data_to_bronze(generation_id: str, request: TestDataSubmitRequest)
         staged = []
         for row in rows:
             payload = validated_payloads[row["record_id"]]
-            conn.execute("UPDATE test_data_record SET payload_json=%s,status='ready_for_cdp',updated_at=%s WHERE record_id=%s", (json.dumps(payload, sort_keys=True), now(), row["record_id"]))
+            conn.execute("UPDATE test_data_record SET payload_json=%s,status='ready_for_execution',updated_at=%s WHERE record_id=%s", (json.dumps(payload, sort_keys=True), now(), row["record_id"]))
             saved_row = conn.execute("SELECT r.* FROM test_data_record r WHERE r.record_id=%s", (row["record_id"],)).fetchone()
             staged.append(_test_data_record_response(saved_row))
-        return {"generation_id": generation_id, "saved_count": len(staged), "ready_case_count": len(case_statuses), "handoff_status": "ready_for_cdp", "records": staged}
+        run_request = ExecutionRunRequest(
+            reviewer=request.reviewer,
+            comments=request.comments,
+            selected_test_case_ids=sorted(case_statuses),
+            selected_test_data_record_ids=[row["record_id"] for row in rows],
+        )
+        execution_run = _create_execution_run(conn, generation_id, run_request)
+        return {"generation_id": generation_id, "saved_count": len(staged), "ready_case_count": len(case_statuses), "handoff_status": "ready_for_execution", "records": staged, "execution_run": execution_run}
 
 
 @app.get("/api/v1/requirement-analyses/{analysis_id}/review-audit")
