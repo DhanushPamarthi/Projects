@@ -1,12 +1,15 @@
 import copy, difflib, hashlib, json, logging, mimetypes, os, threading, time, uuid
+from contextvars import copy_context
 import re
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from .config import BRONZE_SCHEMA, DATABASE_URL, EXTRACTION_CONFIG_VERSION, EXTRACTION_PROMPT_VERSION, LOCAL_EXTRACTOR_VERSION, MAX_UPLOAD_BYTES, OPENAI_MODEL, OPENAI_TIMEOUT_SECONDS, REQUIRED_BRD_SECTIONS, REQUIREMENTS_ANALYSIS_PROMPT_VERSION, SUPPORTED_EXTENSIONS, TEST_CASE_GENERATION_PROMPT_VERSION, UPLOAD_DIR
 from .openai_requests import responses_create
+from .token_usage import estimate_cost_usd, usage_scope, usage_step
 from .db import close_connection_pool, connection, init_db, warm_connection_pool
 from .extractors import _json_sections, extract_local, extract_openai_file, extraction_prompt_hash, missing_sections
 from .validation import validate_file_content
@@ -190,7 +193,8 @@ def _try_retrieve_package_context(package_id: str, requested_by: str):
         except Exception as exc:
             failure.append(exc)
 
-    worker = threading.Thread(target=run, daemon=True)
+    worker_context = copy_context()
+    worker = threading.Thread(target=lambda: worker_context.run(run), daemon=True)
     worker.start()
     worker.join(timeout_seconds)
     if result:
@@ -306,48 +310,49 @@ async def read_upload_with_limit(file: UploadFile) -> bytes:
         chunks.append(chunk)
     return b"".join(chunks)
 
+@usage_step("source_extraction")
 def process_extraction(revision_id, source_id, extraction_id, storage_path, filename, required_sections):
-    # Parse machine-readable documents locally first. OpenAI is reserved for
-    # scanned/image-only PDFs or files the deterministic parser cannot read.
+    # Try OpenAI for every uploaded source; keep the deterministic parser as a
+    # fallback when the provider is unavailable or cannot extract the file.
     started_at = time.monotonic()
     with connection() as conn:
         source_row = conn.execute("SELECT source_type FROM source_document WHERE source_id=%s", (source_id,)).fetchone()
         source_type = source_row["source_type"] if source_row else None
-        conn.execute("UPDATE source_extraction SET mode=%s,status=%s WHERE extraction_id=%s", ("local", "processing", extraction_id))
+        conn.execute("UPDATE source_extraction SET mode=%s,status=%s WHERE extraction_id=%s", ("openai", "processing", extraction_id))
         conn.execute("UPDATE source_revision SET status=%s WHERE revision_id=%s", ("processing", revision_id))
-    mode = "local"
+    mode = "openai"
     try:
         content = Path(storage_path).read_bytes()
         fallback_message = None
-        local_started_at = time.monotonic()
         try:
-            text, sections = extract_local(filename, content)
-            logger.info(
-                "Source extraction local parser completed revision=%s source_type=%s filename=%s size_bytes=%d fragments=%d duration_seconds=%.2f",
-                revision_id, source_type, filename, len(content), len(sections), time.monotonic() - local_started_at,
-            )
-        except Exception as local_error:
-            logger.info(
-                "Source extraction local parser requires OpenAI revision=%s filename=%s duration_seconds=%.2f reason=%s",
-                revision_id, filename, time.monotonic() - local_started_at, local_error,
-            )
             openai_started_at = time.monotonic()
+            text, sections = extract_openai_file(content, filename)
+            logger.info(
+                "Source extraction OpenAI completed revision=%s source_type=%s filename=%s size_bytes=%d fragments=%d duration_seconds=%.2f",
+                revision_id, source_type, filename, len(content), len(sections), time.monotonic() - openai_started_at,
+            )
+        except Exception as openai_error:
+            logger.info(
+                "Source extraction OpenAI requires local fallback revision=%s filename=%s duration_seconds=%.2f reason=%s",
+                revision_id, filename, time.monotonic() - openai_started_at, openai_error,
+            )
+            local_started_at = time.monotonic()
             try:
-                text, sections = extract_openai_file(content, filename)
-                mode = "openai"
-                fallback_message = f"Local extraction was unavailable; OpenAI extraction was used: {local_error}"
+                text, sections = extract_local(filename, content)
+                mode = "local"
+                fallback_message = f"OpenAI extraction failed: {openai_error}. Local extraction fallback was used."
                 logger.info(
-                    "Source extraction OpenAI completed revision=%s filename=%s size_bytes=%d duration_seconds=%.2f",
-                    revision_id, filename, len(content), time.monotonic() - openai_started_at,
+                    "Source extraction local fallback completed revision=%s filename=%s size_bytes=%d fragments=%d duration_seconds=%.2f",
+                    revision_id, filename, len(content), len(sections), time.monotonic() - local_started_at,
                 )
-            except Exception as openai_error:
+            except Exception as local_error:
                 logger.exception(
-                    "Source extraction OpenAI fallback failed revision=%s filename=%s size_bytes=%d duration_seconds=%.2f error=%s",
-                    revision_id, filename, len(content), time.monotonic() - openai_started_at, openai_error,
+                    "Source extraction local fallback failed revision=%s filename=%s size_bytes=%d duration_seconds=%.2f error=%s",
+                    revision_id, filename, len(content), time.monotonic() - local_started_at, local_error,
                 )
                 raise RuntimeError(
-                    f"Local extraction failed ({local_error}); OpenAI extraction failed ({openai_error})"
-                ) from openai_error
+                    f"OpenAI extraction failed ({openai_error}); local extraction fallback failed ({local_error})"
+                ) from local_error
         with connection() as conn:
             source = conn.execute("SELECT validation_messages FROM source_revision WHERE revision_id=%s", (revision_id,)).fetchone()
             messages = json.loads(source["validation_messages"] or "[]") if source else []
@@ -743,6 +748,7 @@ def _validate_requirements_contract(contract, fragments):
         if gap.get("technical_reference") not in exact_references:
             raise ValueError(f"AI returned an unsupported technical reference for {gap.get('gap_id', 'technical gap')}")
 
+@usage_step("requirements_analysis")
 def _requirements_contract_with_openai(package, items, fragments, rag_context=None):
     key = os.getenv("OPENAI_API_KEY")
     if not key:
@@ -800,12 +806,16 @@ def _requirements_contract_with_openai(package, items, fragments, rag_context=No
     contract["conflicts"] = contract.get("conflicting_requirements", [])
     return contract
 
+@usage_step("requirements_analysis")
 def _requirements_contract_with_timeout(package, items, fragments, rag_context=None):
     result, failure = [], []
     def run():
-        try: result.append(_requirements_contract_with_openai(package, items, fragments, rag_context))
+        try:
+            with usage_scope("requirements_analysis", project_id=package.get("project_id"), package_id=package.get("package_id")):
+                result.append(_requirements_contract_with_openai(package, items, fragments, rag_context))
         except Exception as exc: failure.append(exc)
-    worker = threading.Thread(target=run, daemon=True)
+    worker_context = copy_context()
+    worker = threading.Thread(target=lambda: worker_context.run(run), daemon=True)
     worker.start(); worker.join(OPENAI_TIMEOUT_SECONDS + 5)
     if worker.is_alive(): raise TimeoutError(f"Requirements Analysis timed out after {OPENAI_TIMEOUT_SECONDS + 5:g} seconds")
     if failure: raise failure[0]
@@ -1335,6 +1345,7 @@ def _validate_test_case_contract(contract, approved_requirements, requested_coun
                 if ref.get("fragment_id") and ref.get("fragment_id") not in valid_fragments:
                     raise ValueError(f"AI returned an unknown source fragment for {case_id}")
 
+@usage_step("test_cases")
 def _test_cases_with_openai(approved_requirements, package, requested_count, discovery_contexts=None, rag_context=None):
     from openai import OpenAI
     # Validation repair is controlled explicitly below; disable hidden SDK
@@ -2322,6 +2333,7 @@ def _business_requirements_to_review_contract(package, items, business_items, mo
     contract["readiness"] = _contract_readiness(contract)
     return contract
 
+@usage_step("business_use_cases")
 def _business_requirements_with_openai(package, items, fragments, rag_context=None):
     if not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY is not configured")
@@ -2411,11 +2423,13 @@ def _business_requirements_with_timeout(package, items, fragments, rag_context=N
 
     def run():
         try:
-            result.append(_business_requirements_with_openai(package, items, fragments, rag_context))
+            with usage_scope("business_use_cases", project_id=package.get("project_id"), package_id=package.get("package_id")):
+                result.append(_business_requirements_with_openai(package, items, fragments, rag_context))
         except Exception as exc:
             failure.append(exc)
 
-    worker = threading.Thread(target=run, daemon=True)
+    worker_context = copy_context()
+    worker = threading.Thread(target=lambda: worker_context.run(run), daemon=True)
     worker.start()
     worker.join(OPENAI_TIMEOUT_SECONDS + 5)
     if result:
@@ -2451,6 +2465,7 @@ def _functional_requirement_schema():
     item["required"].extend(["business_requirement_ids", "knowledge_context_ids"])
     return schema
 
+@usage_step("functional_requirements")
 def _generate_functional_contract(package, items, fragments, approved_business_requirements, rag_context):
     key = os.getenv("OPENAI_API_KEY")
     if not key:
@@ -2570,6 +2585,7 @@ def _generate_functional_contract(package, items, fragments, approved_business_r
 
 
 @app.post("/api/v1/packages/{package_id}/functional-requirements/generate", status_code=201)
+@usage_step("functional_requirements")
 def generate_functional_requirements(package_id: str):
     with connection() as conn:
         package = conn.execute("SELECT * FROM source_package_manifest WHERE package_id=%s", (package_id,)).fetchone()
@@ -2637,6 +2653,7 @@ def generate_functional_requirements(package_id: str):
 
 
 @app.post("/api/v1/packages/{package_id}/business-requirements/generate", status_code=201)
+@usage_step("business_use_cases")
 def generate_business_requirements(package_id: str):
     with connection() as conn:
         package = conn.execute("SELECT * FROM source_package_manifest WHERE package_id=%s", (package_id,)).fetchone()
@@ -2685,6 +2702,7 @@ def generate_business_requirements(package_id: str):
 
 
 @app.post("/api/v1/packages/{package_id}/requirements/analyze", status_code=201)
+@usage_step("requirements_analysis")
 def analyze_requirements(package_id: str):
     with connection() as conn:
         package=conn.execute("SELECT * FROM source_package_manifest WHERE package_id=%s",(package_id,)).fetchone()
@@ -2835,6 +2853,7 @@ def review_requirement_analysis(analysis_id: str, request: RequirementReviewRequ
         return _analysis_response(conn.execute("SELECT * FROM requirement_analysis WHERE analysis_id=%s", (analysis_id,)).fetchone(), discovery_count)
 
 @app.post("/api/v1/requirement-analyses/{analysis_id}/test-cases", status_code=201)
+@usage_step("test_cases")
 def generate_test_cases_from_analysis(analysis_id: str, request: TestCaseGenerationRequest):
     with connection() as conn:
         analysis = conn.execute("SELECT * FROM requirement_analysis WHERE analysis_id=%s", (analysis_id,)).fetchone()
@@ -2925,6 +2944,7 @@ def get_test_case_coverage_review(generation_id: str):
         return review
 
 @app.post("/api/v1/test-case-generations/{generation_id}/regenerate", status_code=201)
+@usage_step("test_cases")
 def regenerate_test_cases(generation_id: str, request: TestCaseRegenerationRequest):
     with connection() as conn:
         parent = conn.execute("SELECT * FROM test_case_generation WHERE generation_id=%s", (generation_id,)).fetchone()
@@ -4005,6 +4025,7 @@ def _validate_pharmacy_notification(payload, test_case, seen_member_ids=None, se
         raise HTTPException(422, "Generated SMS consent does not match the approved consented test case.")
 
 @app.post("/api/v1/test-case-generations/{generation_id}/test-data", status_code=201)
+@usage_step("test_data")
 def generate_test_data(generation_id: str, request: TestDataGenerationRequest):
     with connection() as conn:
         generation = conn.execute("SELECT * FROM test_case_generation WHERE generation_id=%s", (generation_id,)).fetchone()
@@ -4053,7 +4074,8 @@ def generate_test_data(generation_id: str, request: TestDataGenerationRequest):
             selected_templates_by_case[assignment.test_case_id] = [available_templates[item] for item in sorted(required_templates)]
         regeneration_id = uid("regen") if request.replace_existing_drafts and existing_rows else None
         try:
-            generated_payloads = _generate_test_data_with_openai(_test_data_generation_batches(assignment_case_ids, cases, selected_templates_by_case))
+            with usage_scope("test_data", project_id=generation["project_id"], package_id=generation["package_id"], generation_id=generation_id):
+                generated_payloads = _generate_test_data_with_openai(_test_data_generation_batches(assignment_case_ids, cases, selected_templates_by_case))
         except Exception as exc:
             raise HTTPException(502, f"OpenAI could not generate test data for the approved cases: {safe_llm_error_message(exc)}. No local data fallback was used.") from exc
         if existing_rows:
@@ -4905,6 +4927,62 @@ def list_test_case_review_audit(generation_id: str):
             raise HTTPException(404, "Test-case generation run not found")
         rows = conn.execute("SELECT * FROM test_case_review_audit WHERE generation_id=%s ORDER BY created_at DESC", (generation_id,)).fetchall()
         return [_audit_response(row) for row in rows]
+
+@app.get("/api/v1/token-usage")
+def get_token_usage(project_id: str | None = None, package_id: str | None = None, stage: str | None = None):
+    """Return persisted provider token counts and estimated cost by workflow step."""
+    clauses, params = [], []
+    if project_id:
+        clauses.append("u.project_id=%s")
+        params.append(project_id)
+    if package_id:
+        clauses.append("(u.package_id=%s OR u.source_revision_id IN (SELECT revision_id FROM source_package_item WHERE package_id=%s))")
+        params.extend([package_id, package_id])
+    if stage:
+        clauses.append("u.stage=%s")
+        params.append(stage)
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    with connection() as conn:
+        rows = conn.execute(
+            "SELECT u.stage,u.model,SUM(u.input_tokens) AS input_tokens,SUM(u.output_tokens) AS output_tokens, "
+            "SUM(u.total_tokens) AS total_tokens,SUM(u.cached_input_tokens) AS cached_input_tokens, "
+            "COUNT(*) AS calls,MAX(u.created_at) AS last_used_at, "
+            "SUM(CASE WHEN u.status='failed' THEN 1 ELSE 0 END) AS failed_calls "
+            "FROM llm_token_usage u" + where + " GROUP BY u.stage,u.model ORDER BY u.stage,u.model", tuple(params),
+        ).fetchall()
+    grouped = {}
+    for row in rows:
+        item = dict(row)
+        stage_row = grouped.setdefault(item["stage"], {
+            "stage": item["stage"], "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+            "cached_input_tokens": 0, "calls": 0, "failed_calls": 0, "last_used_at": None,
+            "estimated_cost_usd": Decimal("0"), "unpriced_calls": 0, "models": [],
+        })
+        input_tokens = int(item["input_tokens"] or 0)
+        output_tokens = int(item["output_tokens"] or 0)
+        cached_tokens = int(item["cached_input_tokens"] or 0)
+        calls = int(item["calls"] or 0)
+        cost = estimate_cost_usd(item.get("model"), input_tokens, output_tokens, cached_tokens)
+        stage_row["input_tokens"] += input_tokens
+        stage_row["output_tokens"] += output_tokens
+        stage_row["total_tokens"] += int(item["total_tokens"] or 0)
+        stage_row["cached_input_tokens"] += cached_tokens
+        stage_row["calls"] += calls
+        stage_row["failed_calls"] += int(item["failed_calls"] or 0)
+        if item.get("last_used_at") and (not stage_row["last_used_at"] or item["last_used_at"] > stage_row["last_used_at"]):
+            stage_row["last_used_at"] = item["last_used_at"]
+        if cost is None:
+            stage_row["unpriced_calls"] += calls
+        else:
+            stage_row["estimated_cost_usd"] += cost
+        if item.get("model") and item["model"] not in stage_row["models"]:
+            stage_row["models"].append(item["model"])
+    steps = [{**item, "estimated_cost_usd": float(item["estimated_cost_usd"])} for item in grouped.values()]
+    keys = ("input_tokens", "output_tokens", "total_tokens", "cached_input_tokens", "calls", "failed_calls", "unpriced_calls")
+    return {"project_id": project_id, "package_id": package_id, "steps": steps,
+            "totals": {**{key: sum(item[key] for item in steps) for key in keys},
+                       "estimated_cost_usd": sum(item["estimated_cost_usd"] for item in steps),
+                       "cost_pricing_complete": all(item["unpriced_calls"] == 0 for item in steps)}}
 
 @app.exception_handler(ValueError)
 async def value_error(_, exc): return JSONResponse(status_code=422, content={"detail":str(exc)})

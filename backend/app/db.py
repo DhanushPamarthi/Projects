@@ -295,6 +295,24 @@ CREATE TABLE IF NOT EXISTS testiq.knowledge_evaluation_run (
   package_id TEXT NOT NULL REFERENCES testiq.source_package_manifest(package_id), requested_by TEXT NOT NULL,
   questions_json TEXT NOT NULL, result_json TEXT NOT NULL, passed INTEGER NOT NULL, created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS testiq.llm_token_usage (
+  usage_id TEXT PRIMARY KEY,
+  stage TEXT NOT NULL,
+  operation_id TEXT,
+  project_id TEXT,
+  package_id TEXT,
+  source_revision_id TEXT,
+  analysis_id TEXT,
+  generation_id TEXT,
+  model TEXT,
+  input_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
+  total_tokens INTEGER NOT NULL DEFAULT 0,
+  cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'succeeded',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS testiq_llm_token_usage_scope_idx ON testiq.llm_token_usage(project_id, package_id, stage, created_at);
 """
 SQLITE_SCHEMA = SCHEMA.replace("CREATE SCHEMA IF NOT EXISTS testiq;\n", "").replace("testiq.", "")
 

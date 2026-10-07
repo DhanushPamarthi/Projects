@@ -5,6 +5,7 @@ import uuid
 from typing import Any
 
 from .config import OPENAI_PROMPT_CACHING_MODE
+from .token_usage import record_usage
 
 
 _GPT_VERSION = re.compile(r"^gpt-(\d+)(?:\.(\d+))?", re.I)
@@ -44,4 +45,22 @@ def responses_create(client: Any, **kwargs: Any) -> Any:
             kwargs.setdefault("prompt_cache_options", {"mode": "explicit"})
     elif OPENAI_PROMPT_CACHING_MODE == "explicit" and supports_explicit_prompt_cache_control(model):
         kwargs.setdefault("prompt_cache_options", {"mode": "explicit"})
-    return client.responses.create(**kwargs)
+    try:
+        response = client.responses.create(**kwargs)
+    except Exception as exc:
+        record_usage(None, model=model, status="failed", error=exc)
+        raise
+    record_usage(response, model=model)
+    return response
+
+
+def embeddings_create(client: Any, **kwargs: Any) -> Any:
+    """Create an embedding and record provider-reported prompt token usage."""
+    model = kwargs.get("model", "")
+    try:
+        response = client.embeddings.create(**kwargs)
+    except Exception as exc:
+        record_usage(None, model=model, status="failed", error=exc, embedding=True)
+        raise
+    record_usage(response, model=model, embedding=True)
+    return response

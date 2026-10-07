@@ -318,6 +318,14 @@ export async function saveTestDataToBronze(generationId, testCaseIds) {
   return request(`/api/v1/test-case-generations/${encodeURIComponent(generationId)}/test-data/save`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ test_case_ids: testCaseIds }) });
 }
 
+export async function getTokenUsage({ projectId, packageId, stage } = {}) {
+  const params = new URLSearchParams();
+  if (projectId) params.set("project_id", projectId);
+  if (packageId) params.set("package_id", packageId);
+  if (stage) params.set("stage", stage);
+  return request(`/api/v1/token-usage${params.size ? `?${params.toString()}` : ""}`, { cache: "no-store" });
+}
+
 
 export async function getRequirement(key) {
   return request(`/requirements/${encodeURIComponent(key)}`);

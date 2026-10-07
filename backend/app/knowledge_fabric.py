@@ -17,7 +17,8 @@ from pydantic import BaseModel, Field
 from . import db as db_module
 from .config import OPENAI_EMBEDDING_DIMENSIONS, OPENAI_TIMEOUT_SECONDS, PGVECTOR_DIMENSIONS
 from .db import connection
-from .openai_requests import responses_create
+from .openai_requests import embeddings_create, responses_create
+from .token_usage import usage_scope, usage_step
 
 
 router = APIRouter()
@@ -626,7 +627,7 @@ def _retrieve_with_client(index, request, client, query_vector=None):
     if unknown:
         raise HTTPException(422, f"Unsupported source types: {', '.join(sorted(unknown))}")
     if query_vector is None:
-        response = client.embeddings.create(model=index["embedding_model"], input=[request.query.strip()],
+        response = embeddings_create(client, model=index["embedding_model"], input=[request.query.strip()],
             encoding_format="float", dimensions=int(index["dimensions"]))
         query_vector = response.data[0].embedding
     with connection() as conn:
@@ -775,6 +776,7 @@ def retrieve_knowledge(index_id, request, client=None, query_vector=None):
         "hits": hits, "graph_paths": graph_paths, "context": context, "context_hash": context_hash, "created_at": created_at}
 
 
+@usage_step("knowledge_base")
 def retrieve_package_context(package_id, requested_by="Requirements Analysis"):
     with connection() as conn:
         indexes = conn.execute("SELECT * FROM knowledge_index WHERE package_id=%s ORDER BY created_at DESC", (package_id,)).fetchall()
@@ -803,7 +805,7 @@ def retrieve_package_context(package_id, requested_by="Requirements Analysis"):
             "Database tables, fields, relationships, API operations, request contracts, message templates, data templates, and implementation gaps",
             technical_source_types,
         ))
-    embedding_response = client.embeddings.create(
+    embedding_response = embeddings_create(client,
         model=selected["embedding_model"],
         input=[query for query, _ in query_specs],
         encoding_format="float",
@@ -858,6 +860,7 @@ def retrieve_package_context(package_id, requested_by="Requirements Analysis"):
 
 
 @router.post("/api/v1/packages/{package_id}/knowledge-index", status_code=201)
+@usage_step("knowledge_base")
 def build_knowledge_index(package_id: str, request: BuildIndexRequest):
     with connection() as conn:
         package = conn.execute("SELECT * FROM source_package_manifest WHERE package_id=%s", (package_id,)).fetchone()
@@ -1010,7 +1013,7 @@ def build_knowledge_index(package_id: str, request: BuildIndexRequest):
         embedded_count = 0
         for batch_number, start in enumerate(range(0, len(chunks_to_embed), EMBEDDING_BATCH_SIZE), 1):
             batch = chunks_to_embed[start:start + EMBEDDING_BATCH_SIZE]
-            response = client.embeddings.create(model=request.embedding_model, input=[item["text"] for item in batch],
+            response = embeddings_create(client, model=request.embedding_model, input=[item["text"] for item in batch],
                 encoding_format="float", dimensions=OPENAI_EMBEDDING_DIMENSIONS)
             batch_vectors = [item.embedding for item in sorted(response.data, key=lambda item: item.index)]
             if len(batch_vectors) != len(batch):
@@ -1253,6 +1256,7 @@ def review_knowledge_index(index_id: str, request: IndexReviewRequest):
 
 
 @router.post("/api/v1/knowledge-indexes/{index_id}/retrieve", status_code=201)
+@usage_step("knowledge_base")
 def retrieve_knowledge_endpoint(index_id: str, request: RetrievalRequest):
     return retrieve_knowledge(index_id, request)
 
@@ -1273,6 +1277,7 @@ def list_retrieval_runs(index_id: str):
 
 
 @router.post("/api/v1/knowledge-indexes/{index_id}/evaluate", status_code=201)
+@usage_step("knowledge_base")
 def evaluate_knowledge_index(index_id: str, request: EvaluationRequest):
     questions = request.questions or [EvaluationQuestion(**value) for value in DEFAULT_EVALUATION_QUESTIONS]
     client = _create_client()

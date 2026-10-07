@@ -37,14 +37,12 @@ function SourceRow({ source, compact = false }) {
   const validationMessages = source.validation_messages || revision.validation_messages || [];
   const parsedMessages = Array.isArray(validationMessages) ? validationMessages : (() => { try { return JSON.parse(validationMessages || "[]"); } catch { return []; } })();
   const missingWarnings = parsedMessages.filter((message) => message.startsWith("Missing expected section:")).map((message) => message.replace("Missing expected section:", "").trim());
-  const warnings = parsedMessages.filter((message) => message.startsWith("OpenAI extraction failed:") || message.startsWith("Extraction failed:"));
   return <div className={`source-row ${compact ? "compact" : ""}`}>
     <span className={`source-file-icon ${source.source_type === "brd" ? "brd" : "supporting"}`}><FileText size={17} /></span>
     <div className="source-main">
       <strong title={filename}>{filename}</strong>
       <span>{source.source_type === "brd" ? "Business requirements document" : (source.source_type || "Supporting source").replaceAll("_", " ")} - {size}</span>
       {missingWarnings.length > 0 && <small className="source-warning">Missing sections: {missingWarnings.join(", ")}</small>}
-      {warnings.map((warning) => <small className="source-warning" key={warning}>{warning}</small>)}
     </div>
     <span className={`source-status ${tone}`}><span />{tone === "success" ? "Ready" : tone === "pending" ? "Processing" : "Needs review"}</span>
     <span className="revision-label">{source.active_revision ? "Active revision" : "Review revision"}</span>
