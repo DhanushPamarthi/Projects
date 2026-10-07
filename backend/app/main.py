@@ -4175,10 +4175,24 @@ def generate_test_data(generation_id: str, request: TestDataGenerationRequest):
         unapproved = [case_id for case_id in assignment_case_ids if _review_status(cases[case_id]) != "approved"]
         if unapproved:
             raise HTTPException(422, {"message": "Test data can only be generated for approved test cases", "not_approved": unapproved})
-        existing_rows = conn.execute("SELECT test_case_id,status FROM test_data_record WHERE generation_id=%s", (generation_id,)).fetchall()
+        existing_rows = conn.execute(
+            "SELECT r.test_case_id,r.status,r.bronze_raw_file_id,"
+            "EXISTS (SELECT 1 FROM test_data_bronze_ref ref WHERE ref.record_id=r.record_id) AS sent_to_bronze "
+            "FROM test_data_record r WHERE r.generation_id=%s",
+            (generation_id,),
+        ).fetchall()
         if existing_rows:
             if not request.replace_existing_drafts:
                 raise HTTPException(409, "Test data already exists for this generation. Use regenerate for draft records or create a new test-case generation.")
+            sent_case_ids = sorted({
+                row["test_case_id"] for row in existing_rows
+                if row["bronze_raw_file_id"] or row["sent_to_bronze"]
+            })
+            if sent_case_ids:
+                raise HTTPException(409, {
+                    "message": "Test data already sent to Bronze is immutable. Create a new test-case generation instead of regenerating it.",
+                    "test_case_ids": sent_case_ids,
+                })
         available_templates = _test_data_templates_for_request(conn, request, assignments)
         membership_template = available_templates.get("bronze_membership_v1")
         prescription_template = available_templates.get("bronze_prescription_v1")
@@ -4984,6 +4998,13 @@ def _execute_case_against_bronze(conn, run_id: str, generation_id: str, test_cas
 @app.post("/api/v1/test-case-generations/{generation_id}/test-data/save")
 def save_test_data_to_bronze(generation_id: str, request: TestDataSubmitRequest):
     with connection() as conn:
+        if not DATABASE_URL:
+            raise HTTPException(503, "Sending test data to Bronze requires the shared PostgreSQL database.")
+        procedure = conn.execute(
+            "SELECT to_regprocedure('testiq.process_pending_testiq_to_bronze(integer,text)') AS procedure"
+        ).fetchone()
+        if not procedure or not procedure["procedure"]:
+            raise HTTPException(503, "The Process Pending TestIQ to Bronze stored procedure is not installed.")
         generation = conn.execute("SELECT * FROM test_case_generation WHERE generation_id=%s", (generation_id,)).fetchone()
         if not generation:
             raise HTTPException(404, "Test-case generation run not found")
@@ -4996,7 +5017,7 @@ def save_test_data_to_bronze(generation_id: str, request: TestDataSubmitRequest)
                 raise HTTPException(422, "Each selected test data record must appear only once")
             placeholders = ",".join(["%s"] * len(request.record_ids))
             rows = conn.execute(
-                f"SELECT * FROM test_data_record WHERE generation_id=%s AND record_id IN ({placeholders}) ORDER BY test_case_id,entity_name",
+                f"SELECT * FROM test_data_record WHERE generation_id=%s AND record_id IN ({placeholders}) ORDER BY test_case_id,entity_name FOR UPDATE",
                 tuple([generation_id] + request.record_ids),
             ).fetchall()
             if {row["record_id"] for row in rows} != set(request.record_ids):
@@ -5022,12 +5043,25 @@ def save_test_data_to_bronze(generation_id: str, request: TestDataSubmitRequest)
             if unknown_cases:
                 raise HTTPException(422, {"unknown_test_case_ids": unknown_cases})
             selected_case_ids = request.test_case_ids
-            rows = conn.execute("SELECT * FROM test_data_record WHERE generation_id=%s AND test_case_id=ANY(%s) ORDER BY test_case_id,entity_name", (generation_id, selected_case_ids)).fetchall()
+            rows = conn.execute("SELECT * FROM test_data_record WHERE generation_id=%s AND test_case_id=ANY(%s) ORDER BY test_case_id,entity_name FOR UPDATE", (generation_id, selected_case_ids)).fetchall()
             non_draft = [row["record_id"] for row in rows if row["status"] not in {"draft", "saved"}]
             if non_draft:
                 raise HTTPException(409, {"message": "A test case must be selected as a whole and can only be marked ready once. One or more records are already ready or processed.", "record_ids": non_draft})
         if not rows:
             raise HTTPException(404, "No generated records were found for the selected test cases")
+        already_sent = []
+        for row in rows:
+            has_reference = conn.execute(
+                "SELECT EXISTS (SELECT 1 FROM test_data_bronze_ref WHERE record_id=%s) AS value",
+                (row["record_id"],),
+            ).fetchone()["value"]
+            if row["bronze_raw_file_id"] or has_reference:
+                already_sent.append(row["record_id"])
+        if already_sent:
+            raise HTTPException(409, {
+                "message": "Duplicate handoff prevented. One or more selected test data records were already sent to the Bronze layer.",
+                "record_ids": already_sent,
+            })
         unknown_cases = sorted(set(selected_case_ids) - set(cases))
         if unknown_cases:
             raise HTTPException(422, {"unknown_test_case_ids": unknown_cases})
@@ -5080,12 +5114,39 @@ def save_test_data_to_bronze(generation_id: str, request: TestDataSubmitRequest)
                 _validate_domain_template_payload(membership_item[1], membership_item[2], cases[case_id])
             if prescription_item:
                 _validate_domain_template_payload(prescription_item[1], prescription_item[2], cases[case_id], membership_item[1].get("member_id") if membership_item else None)
-        staged = []
+        timestamp = now()
         for row in rows:
             payload = validated_payloads[row["record_id"]]
-            conn.execute("UPDATE test_data_record SET payload_json=%s,status='ready_for_execution',updated_at=%s WHERE record_id=%s", (json.dumps(payload, sort_keys=True), now(), row["record_id"]))
+            conn.execute(
+                "UPDATE test_data_record SET payload_json=%s,status='ready_for_cdp',updated_at=%s WHERE record_id=%s",
+                (json.dumps(payload, sort_keys=True), timestamp, row["record_id"]),
+            )
+        for row in rows:
+            conn.execute(
+                "CALL testiq.process_pending_testiq_to_bronze(%s,%s)",
+                (1, row["record_id"]),
+            )
+        staged = []
+        bronze_references = []
+        failed_records = []
+        for row in rows:
             saved_row = conn.execute("SELECT r.* FROM test_data_record r WHERE r.record_id=%s", (row["record_id"],)).fetchone()
-            staged.append(_test_data_record_response(saved_row))
+            references = [row_dict(item) for item in conn.execute(
+                "SELECT * FROM test_data_bronze_ref WHERE record_id=%s ORDER BY bronze_table,bronze_id",
+                (row["record_id"],),
+            ).fetchall()]
+            if saved_row["status"] != "saved" or not saved_row["bronze_raw_file_id"] or not references:
+                failed_records.append({"record_id": row["record_id"], "status": saved_row["status"]})
+                continue
+            item = _test_data_record_response(saved_row)
+            item["bronze_references"] = references
+            staged.append(item)
+            bronze_references.extend(references)
+        if failed_records:
+            raise HTTPException(502, {
+                "message": "The Bronze stored procedure did not complete every selected record. No selected test data was committed.",
+                "records": failed_records,
+            })
         run_request = ExecutionRunRequest(
             reviewer=request.reviewer,
             comments=request.comments,
@@ -5093,7 +5154,17 @@ def save_test_data_to_bronze(generation_id: str, request: TestDataSubmitRequest)
             selected_test_data_record_ids=[row["record_id"] for row in rows],
         )
         execution_run = _create_execution_run(conn, generation_id, run_request)
-        return {"generation_id": generation_id, "saved_count": len(staged), "ready_case_count": len(case_statuses), "handoff_status": "ready_for_execution", "records": staged, "execution_run": execution_run}
+        return {
+            "generation_id": generation_id,
+            "saved_count": len(staged),
+            "sent_count": len(staged),
+            "ready_case_count": len(case_statuses),
+            "handoff_status": "sent_to_bronze",
+            "message": f"{len(staged)} test data record(s) sent to the Bronze layer successfully.",
+            "records": staged,
+            "bronze_references": bronze_references,
+            "execution_run": execution_run,
+        }
 
 
 @app.get("/api/v1/requirement-analyses/{analysis_id}/review-audit")

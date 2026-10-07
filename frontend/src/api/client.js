@@ -319,7 +319,12 @@ export async function reviewTestData(generationId, items) {
 }
 
 export async function saveTestDataToBronze(generationId, testCaseIds, reviewer = "Product Owner") {
-  return request(`/api/v1/test-case-generations/${encodeURIComponent(generationId)}/test-data/save`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ test_case_ids: testCaseIds, reviewer }) });
+  return request(`/api/v1/test-case-generations/${encodeURIComponent(generationId)}/test-data/save`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ test_case_ids: testCaseIds, reviewer }),
+    activity: { label: "Sending test data to Bronze", section: "test-data", detail: "The selected test data is being validated and loaded through the database stored procedure." },
+  });
 }
 
 export async function getTokenUsage({ projectId, packageId, stage } = {}) {

@@ -21,6 +21,7 @@ function displayCaseName(testCase) {
 function displayRecordStatus(record) {
   const status = String(record?.status || "").toLowerCase();
   if (status === "ready_for_execution") return "Ready for Bronze";
+  if (status === "saved" && record?.bronze_raw_file_id) return "Sent to Bronze";
   if (status === "saved") return "Saved";
   if (status === "draft") return "Draft";
   return status ? status.charAt(0).toUpperCase() + status.slice(1) : "Generated";
@@ -86,17 +87,17 @@ export function TestDataStage({ projectId, generationId, approvedCases, reviewer
       const savedById = new Map(result.records.map((item) => [item.record_id, { ...item, payload_text: JSON.stringify(item.payload, null, 2) }]));
       setRecords((current) => current.map((item) => savedById.get(item.record_id) || item));
       setSelectedDataCaseIds([]);
-      setMessage(`${result.saved_count} record(s) marked ready for execution.`);
+      setMessage(result.message || `${result.sent_count || result.saved_count} test data record(s) sent to the Bronze layer successfully.`);
     } catch (err) { setError(err.message); }
     finally { setBusy(false); }
   }
   function toggle(list, setList, id) { setList((items) => items.includes(id) ? items.filter((item) => item !== id) : [...items, id]); }
   const visibleCases = approvedCases.filter((item) => `${item.test_case_id} ${item.title}`.toLowerCase().includes(caseFilter.toLowerCase()));
   const selectedCaseCount = selectedCases.length;
-  const canRegenerateDrafts = records.length > 0 && records.every((item) => ["draft", "ready_for_execution", "saved"].includes(item.status));
+  const wasSentToBronze = (record) => Boolean(record.bronze_raw_file_id || (record.bronze_references || []).length);
+  const canRegenerateDrafts = records.length > 0 && records.every((item) => ["draft", "ready_for_execution", "saved"].includes(item.status) && !wasSentToBronze(item));
   const hasSavedRecords = records.some((item) => ["saved", "ready_for_execution"].includes(item.status));
-  const draftRecords = records.filter((record) => record.status === "draft");
-  const selectableCaseIds = [...new Set(records.map((record) => record.test_case_id))].filter((caseId) => records.filter((record) => record.test_case_id === caseId).every((record) => ["draft", "saved"].includes(record.status)));
+  const selectableCaseIds = [...new Set(records.map((record) => record.test_case_id))].filter((caseId) => records.filter((record) => record.test_case_id === caseId).every((record) => ["draft", "saved"].includes(record.status) && !wasSentToBronze(record)));
   const selectedExecutionCaseIds = selectedDataCaseIds.filter((caseId) => selectableCaseIds.includes(caseId));
   const selectedExecutionRecordCount = records.filter((record) => selectedExecutionCaseIds.includes(record.test_case_id)).length;
   const allReadyForExecution = records.length > 0 && records.every((item) => item.status === "ready_for_execution");
@@ -129,7 +130,7 @@ export function TestDataStage({ projectId, generationId, approvedCases, reviewer
             const payload = parsedRecordPayload(record);
             return [payload.membership && "Membership", payload.prescription && "Prescription"].filter(Boolean);
           }))];
-          const allRowsAvailable = caseRecords.every((item) => ["draft", "saved"].includes(item.status));
+          const allRowsAvailable = caseRecords.every((item) => ["draft", "saved"].includes(item.status) && !wasSentToBronze(item));
           const caseSelected = allRowsAvailable && selectedExecutionCaseIds.includes(testCaseId);
           return <div className="test-data-case-selection-group" key={testCaseId}>
             <label className="test-data-case-selection"><input type="checkbox" aria-label={`Select all data for ${testCaseId}`} checked={caseSelected} disabled={!allRowsAvailable} onChange={() => toggle(selectedDataCaseIds, setSelectedDataCaseIds, testCaseId)} /></label>
