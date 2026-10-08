@@ -74,7 +74,7 @@ export function TestDataStage({ projectId, generationId, approvedCases, reviewer
       setRecords(mergedRecords);
       setSelectedDataCaseIds([]);
       const generated = `${replaceExistingDrafts ? "Regenerated" : "Generated"} data for ${new Set(result.records.map((item) => item.test_case_id)).size} case(s) using ${result.records.length} template record(s)`;
-      setMessage(`${generated} from the stored BronzeBox Membership and Prescription templates with ${result.generation_model || "the configured LLM"}. Review the JSON, select cases, then save them in the shared database for CDP.`);
+      setMessage(`${generated} for approved cases using case-specific templates built from the database schema and data patterns with ${result.generation_model || "the configured LLM"}. Review the JSON, select cases, then save them for CDP.`);
     } catch (err) { setError(err.message); }
     finally { setBusy(false); }
   }

@@ -70,4 +70,4 @@ Patterns based on the latest paired sample supplied in chat. Each row has outer 
 - IDs must be unique across generated scenarios. Keep `member_id`, `prescription_id`, and `rx_number` distinct where the target system requires distinct identifiers.
 - Keep phone and SMS preference values identical.
 - Keep dates, eligibility, membership status, and refill counts aligned with the test case's expected outcome.
-- This file documents generation patterns; the application will not use it until the generator is explicitly wired to read it.
+- The test-data generator reads these rules when it creates draft Membership and Prescription payloads. Outer Bronze columns such as `id`, `load_id`, and `created_time` are assigned during ingestion, not invented by the generator.
