@@ -3,6 +3,8 @@ import { FileSearch } from "lucide-react";
 import { LoadingSpinner } from "./LoadingSpinner.jsx";
 import { getProject, getTestCaseCoverageReview, listGeneratedTestCases, listManifests, listProjects, listRequirementAnalyses } from "../api/client.js";
 import { AppSelect } from "./AppSelect.jsx";
+import { Pagination } from "./Pagination.jsx";
+import { WorkspacePageHero } from "./WorkspacePageHero.jsx";
 
 function readStoredJson(key) {
   try {
@@ -43,6 +45,7 @@ export function TraceabilityPage() {
   const [testGeneration, setTestGeneration] = useState(null);
   const [coverageReview, setCoverageReview] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [page, setPage] = useState(1);
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -110,6 +113,7 @@ export function TraceabilityPage() {
     loadAnalysis();
     return () => { cancelled = true; };
   }, [packageId]);
+  useEffect(() => { setPage(1); }, [packageId]);
 
   async function selectProject(projectId) {
     setProject(null); setPackages([]); setPackageId(""); setAnalysis(null); setTestGeneration(null); setCoverageReview(null);
@@ -203,17 +207,20 @@ export function TraceabilityPage() {
     return <span className="traceability-gap">{text}</span>;
   }
 
-  return <div className="requirements-page">
-    <div className="page-heading"><div><div className="eyebrow">TRACEABILITY MATRIX</div><h1>Traceability</h1><p>Review business requirement coverage and the generated test cases linked to each requirement.</p></div></div>
+  const pageSize = 8;
+  const visibleCoverageRows = coverage.rows.slice((page - 1) * pageSize, page * pageSize);
+
+  return <div className="requirements-page professional-workspace-page">
+    <WorkspacePageHero productLabel="TestIQ · Traceability" eyebrow="TRACEABILITY MATRIX" title="Coverage Intelligence" context={project?.project_name} cues={["Requirement coverage", "Linked evidence", "Audit visibility"]} />
     <div className="requirements-toolbar"><div><label>Project</label><AppSelect value={project?.project_id || ""} onChange={(event) => selectProject(event.target.value)}><option value="">Select project</option>{projects.map((item) => <option key={item.project_id} value={item.project_id}>{item.project_name}</option>)}</AppSelect></div><div><label>Source package</label><AppSelect value={packageId} onChange={(event) => selectPackage(event.target.value)} disabled={!packages.length}><option value="">Select package</option>{packages.map((item) => <option key={item.package_id} value={item.package_id}>{item.package_name || item.scope || "Source package"} - v{item.package_version || "?"}</option>)}</AppSelect></div></div>
     {error && <div className="error-message">{error}</div>}
     {loading ? <LoadingSpinner variant="page" label="Loading traceability" detail="Linking source evidence to requirements and generated artifacts." />
       : !analysis ? <section className="requirements-empty"><div className="empty-state-icon"><FileSearch size={25} /></div><h2>No analysis available yet</h2><p>Run Functional Requirements for a source package to view traceability links.</p></section>
         : tree.length ? <>
           <section className="traceability-coverage-card">
-            <div className="traceability-coverage-header"><div><div className="eyebrow">COVERAGE REVIEW</div><h2>Business requirement coverage</h2><p>Every business requirement is listed with the generated test case evidence linked to it.</p></div><div className={`traceability-coverage-score ${coverage.percent === 100 ? "complete" : ""}`}><strong>{coverage.percent}%</strong><span>covered</span></div></div>
+            <div className="traceability-coverage-header"><div><div className="eyebrow">COVERAGE REVIEW</div><h2>Business requirement coverage</h2><p>Requirements mapped to generated test evidence.</p></div><div className={`traceability-coverage-score ${coverage.percent === 100 ? "complete" : ""}`}><strong>{coverage.percent}%</strong><span>covered</span></div></div>
             <div className="traceability-coverage-summary"><span><strong>{coverage.covered}</strong> of {coverage.total} requirements covered</span><span>{coverage.rows.filter((row) => row.testCaseId).length} linked test cases</span></div>
-            <div className="traceability-coverage-table-wrap"><table className="traceability-coverage-table"><thead><tr><th>Status</th><th>Business requirement</th><th>Description</th><th>Test case ID</th><th>Test case description</th></tr></thead><tbody>{coverage.rows.length ? coverage.rows.map((row) => <tr key={`${row.ruleId}-${row.testCaseId || "missing"}`}><td><span className={`traceability-coverage-status ${row.status === "covered" ? "covered" : "missing"}`}>{row.status === "covered" ? "Covered" : "Missing"}</span></td><td><strong>{row.ruleId}</strong><small>{row.requirementId}</small></td><td>{row.description || "No business requirement description"}</td><td>{row.testCaseId || emptyBadge("No test case linked")}</td><td>{row.testCase ? (row.testCase.title || row.testCase.scenario || "No description") : emptyBadge("Coverage required")}</td></tr>) : <tr><td colSpan="5">{emptyBadge("Coverage review is not available for this generation")}</td></tr>}</tbody></table></div>
+            <div className="traceability-coverage-table-wrap"><table className="traceability-coverage-table"><thead><tr><th>Status</th><th>Business requirement</th><th>Description</th><th>Test case ID</th><th>Test case description</th></tr></thead><tbody>{coverage.rows.length ? visibleCoverageRows.map((row) => <tr key={`${row.ruleId}-${row.testCaseId || "missing"}`}><td><span className={`traceability-coverage-status ${row.status === "covered" ? "covered" : "missing"}`}>{row.status === "covered" ? "Covered" : "Missing"}</span></td><td><strong>{row.ruleId}</strong><small>{row.requirementId}</small></td><td>{row.description || "No business requirement description"}</td><td>{row.testCaseId || emptyBadge("No test case linked")}</td><td>{row.testCase ? (row.testCase.title || row.testCase.scenario || "No description") : emptyBadge("Coverage required")}</td></tr>) : <tr><td colSpan="5">{emptyBadge("Coverage review is not available for this generation")}</td></tr>}</tbody></table></div><Pagination page={page} pageSize={pageSize} totalItems={coverage.rows.length} onPageChange={setPage} label="traceability records" />
           </section>
         </>
           : <section className="requirements-empty"><div className="empty-state-icon"><FileSearch size={25} /></div><h2>No traceability mappings found</h2><p>This analysis does not contain business requirement mappings to trace.</p></section>}

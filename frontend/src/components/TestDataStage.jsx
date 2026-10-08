@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { CheckCheck, LoaderCircle, X } from "lucide-react";
 import { generateTestData, listTestData, reviewTestData, saveTestDataToBronze } from "../api/client.js";
+import { Pagination } from "./Pagination.jsx";
 
 function displayCaseName(testCase) {
   let name = String(testCase?.title || testCase?.test_case_id || "Test case")
@@ -41,6 +42,7 @@ export function TestDataStage({ projectId, generationId, approvedCases, reviewer
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [caseFilter, setCaseFilter] = useState("");
+  const [casePage, setCasePage] = useState(1); const [recordPage, setRecordPage] = useState(1);
   useEffect(() => {
     if (!message) return undefined;
     const timer = window.setTimeout(() => setMessage(""), 4500);
@@ -93,6 +95,8 @@ export function TestDataStage({ projectId, generationId, approvedCases, reviewer
   }
   function toggle(list, setList, id) { setList((items) => items.includes(id) ? items.filter((item) => item !== id) : [...items, id]); }
   const visibleCases = approvedCases.filter((item) => `${item.test_case_id} ${item.title}`.toLowerCase().includes(caseFilter.toLowerCase()));
+  const casesPerPage = 6;
+  const pagedCases = visibleCases.slice((casePage - 1) * casesPerPage, casePage * casesPerPage);
   const selectedCaseCount = selectedCases.length;
   const wasSentToBronze = (record) => Boolean(record.bronze_raw_file_id || (record.bronze_references || []).length);
   const canRegenerateDrafts = records.length > 0 && records.every((item) => ["draft", "ready_for_execution", "saved"].includes(item.status) && !wasSentToBronze(item));
@@ -107,6 +111,10 @@ export function TestDataStage({ projectId, generationId, approvedCases, reviewer
     groups.get(record.test_case_id).push(record);
     return groups;
   }, new Map()).entries()];
+  const recordsPerPage = 4;
+  const pagedRecordGroups = groupedRecords.slice((recordPage - 1) * recordsPerPage, recordPage * recordsPerPage);
+  useEffect(() => { setCasePage(1); }, [caseFilter]);
+  useEffect(() => { setRecordPage(1); }, [groupedRecords.length]);
   const recordStatusCounts = records.reduce((counts, record) => {
     const label = displayRecordStatus(record);
     counts[label] = (counts[label] || 0) + 1;
@@ -117,13 +125,13 @@ export function TestDataStage({ projectId, generationId, approvedCases, reviewer
   return <section className="requirements-panel test-data-stage-panel">
     <div className="panel-title-row"><div><h2>Approved cases and generated records</h2></div><span>{groupedRecords.length} case(s) · {records.length} template record(s)</span></div>
     {error && <div className="error-message">{error}</div>}{message && <div className="toast-message test-data-toast" role="status" aria-live="polite">{message}</div>}
-    <div className="test-data-cases-picker"><div className="test-data-case-heading"><div><h3>Approved test cases</h3><p className="panel-helper">Select one or more cases. Each selected case uses the stored Membership template, Prescription template, or both as the scenario requires. When both are used, their records share the same member_id.</p></div><span>{selectedCases.length} of {approvedCases.length} selected</span></div><div className="test-data-case-actions"><input aria-label="Filter test cases" value={caseFilter} onChange={(event) => setCaseFilter(event.target.value)} placeholder="Filter by ID or title" /><div className="test-data-selection-actions"><button type="button" className="test-data-selection-action" onClick={() => setSelectedCases((items) => [...new Set([...items, ...visibleCases.map((item) => item.test_case_id)])])}><CheckCheck size={15} />{caseFilter.trim() ? "Select filtered" : "Select all"}</button><button type="button" className="test-data-selection-action clear-selection-action" onClick={() => setSelectedCases([])}><X size={15} />Clear selection</button></div></div><div className="test-data-case-list">{visibleCases.map((item) => <label className="test-data-case-item" key={item.test_case_id}><input type="checkbox" checked={selectedCases.includes(item.test_case_id)} onChange={() => toggle(selectedCases, setSelectedCases, item.test_case_id)} /><span><strong>{item.test_case_id} · {displayCaseName(item)}</strong></span></label>)}</div>
+    <div className="test-data-cases-picker"><div className="test-data-case-heading"><div><h3>Approved test cases</h3><p className="panel-helper">Select cases for controlled data generation.</p></div><span>{selectedCases.length} of {approvedCases.length} selected</span></div><div className="test-data-case-actions"><input aria-label="Filter test cases" value={caseFilter} onChange={(event) => setCaseFilter(event.target.value)} placeholder="Filter by ID or title" /><div className="test-data-selection-actions"><button type="button" className="test-data-selection-action" onClick={() => setSelectedCases((items) => [...new Set([...items, ...visibleCases.map((item) => item.test_case_id)])])}><CheckCheck size={15} />{caseFilter.trim() ? "Select filtered" : "Select all"}</button><button type="button" className="test-data-selection-action clear-selection-action" onClick={() => setSelectedCases([])}><X size={15} />Clear</button></div></div><div className="test-data-case-list">{pagedCases.map((item) => <label className="test-data-case-item" key={item.test_case_id}><input type="checkbox" checked={selectedCases.includes(item.test_case_id)} onChange={() => toggle(selectedCases, setSelectedCases, item.test_case_id)} /><span><strong>{item.test_case_id} · {displayCaseName(item)}</strong></span></label>)}</div><Pagination page={casePage} pageSize={casesPerPage} totalItems={visibleCases.length} onPageChange={setCasePage} label="approved test cases" />
       <button type="button" className="primary-button" disabled={busy || (!selectedCases.length && !canRegenerateDrafts) || (records.length > 0 && !canRegenerateDrafts)} onClick={() => generate(canRegenerateDrafts)}>{busy ? <><LoaderCircle className="spin" size={16} /> {canRegenerateDrafts ? "Regenerating..." : "Generating..."}</> : canRegenerateDrafts ? <>Regenerate {new Set(records.map((item) => item.test_case_id)).size} case(s)</> : allReadyForExecution ? "Ready for execution" : allSavedToBronze ? "Data saved" : hasSavedRecords ? "Ready for execution" : <>Generate data for {selectedCaseCount} case{selectedCaseCount === 1 ? "" : "s"}</>}</button></div>
     {records.length > 0 && <>
       <div className="test-data-record-list">
         <div className="test-data-overall-status"><span>Status</span><strong className={overallStatus === "Ready for Bronze" ? "test-data-ready-status" : ""}>{overallStatus}</strong></div>
         <div className="test-data-group-column-head"><span>Test case</span><span>Templates used</span></div>
-        {groupedRecords.map(([testCaseId, caseRecords]) => {
+        {pagedRecordGroups.map(([testCaseId, caseRecords]) => {
           const testCase = approvedCases.find((item) => item.test_case_id === testCaseId);
           const labels = [...new Set(caseRecords.flatMap((record) => {
             if (String(record.entity_name || "").toLowerCase() !== "test_dataset") return [recordTemplateLabel(record)];
@@ -143,7 +151,7 @@ export function TestDataStage({ projectId, generationId, approvedCases, reviewer
             </div>
             </details>
           </div>;
-        })}
+        })}<Pagination page={recordPage} pageSize={recordsPerPage} totalItems={groupedRecords.length} onPageChange={setRecordPage} label="test-data cases" />
       </div>{selectableCaseIds.length > 0 && <div className="test-data-record-selection-bar"><span>{selectedExecutionCaseIds.length} test case(s) selected · {selectedExecutionRecordCount} template record(s)</span><div className="test-data-selection-actions"><button type="button" className="test-data-selection-action" onClick={() => setSelectedDataCaseIds(selectableCaseIds)}><CheckCheck size={15} />Select all available cases</button><button type="button" className="test-data-selection-action clear-selection-action" onClick={() => setSelectedDataCaseIds([])}><X size={15} />Clear</button></div></div>}{selectedExecutionCaseIds.length > 0 && <button type="button" className="primary-button" disabled={busy} onClick={save}>
         {busy ? <><LoaderCircle className="spin" size={16} /> Sending to Bronze...</> : <>Send to Bronze</>}
       </button>}

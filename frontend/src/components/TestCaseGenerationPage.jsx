@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
-import { AlertCircle, ArrowLeft, Check, CheckCircle2, ClipboardList, LoaderCircle, Pencil, RefreshCw, ShieldCheck, X } from "lucide-react";
+import { AlertCircle, ArrowLeft, Check, CheckCircle2, ChevronLeft, ChevronRight, ClipboardList, LoaderCircle, Pencil, ShieldCheck, Sparkles, X } from "lucide-react";
 import { generateFunctionalRequirements, generateTestCasesFromAnalysis, getRequirementAnalysis, listGeneratedTestCases, listTestData, reviewTestCaseGeneration } from "../api/client.js";
+import { useActivities } from "../activity/activityStore.js";
 
 function lines(value) {
   return String(value || "")
@@ -88,6 +89,7 @@ function caseDisplayTitle(item, allCases = []) {
 }
 
 export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData, onReviewSaved, onAnalysisUnavailable, onAnalysisPrepared }) {
+  const activities = useActivities();
   const [verifiedAnalysis, setVerifiedAnalysis] = useState(null);
   const [analysisLoading, setAnalysisLoading] = useState(Boolean(analysis?.analysis_id));
   const [analysisError, setAnalysisError] = useState("");
@@ -106,6 +108,9 @@ export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData,
   const [success, setSuccess] = useState("");
   const [generatedDataByCase, setGeneratedDataByCase] = useState({});
   const [workflowProgress, setWorkflowProgress] = useState(null);
+  const [casePage, setCasePage] = useState(1);
+  const activeGenerationActivity = activities.find((item) => item.status === "running" && (item.label === "Generating Functional Requirements" || item.label === "Generating test cases"));
+  const generationActivityKey = activities.filter((item) => item.label === "Generating Functional Requirements" || item.label === "Generating test cases").map((item) => `${item.id}:${item.status}:${item.updatedAt}`).join("|");
 
   const currentAnalysis = verifiedAnalysis?.analysis_id === analysis?.analysis_id ? verifiedAnalysis : null;
   const isAnalysisLoading = analysisLoading || Boolean(analysis?.analysis_id && !currentAnalysis && !analysisError);
@@ -179,7 +184,18 @@ export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData,
     listGeneratedTestCases(currentAnalysis.analysis_id)
       .then((items) => applyGeneration(items[0] || null))
       .catch((err) => setError(err.message || "Could not load generated test cases."));
-  }, [currentAnalysis?.analysis_id, isAnalysisLoading]);
+  }, [currentAnalysis?.analysis_id, isAnalysisLoading, generationActivityKey]);
+
+  useEffect(() => {
+    if (!analysis?.generation_pipeline) return;
+    if (!activeGenerationActivity) {
+      setLoading(false);
+      return;
+    }
+    const generatingCases = activeGenerationActivity.label === "Generating test cases";
+    setLoading(true);
+    setWorkflowProgress({ percent: generatingCases ? 72 : 24, label: activeGenerationActivity.label });
+  }, [analysis?.generation_pipeline, activeGenerationActivity?.id, activeGenerationActivity?.label]);
 
   async function generate() {
     if (!currentAnalysis?.analysis_id) return;
@@ -214,13 +230,13 @@ export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData,
       setWorkflowProgress({ percent: 18, label: "Generating Functional Requirements" });
       const nextAnalysis = await generateFunctionalRequirements(analysis.package_id);
       setWorkflowProgress({ percent: 50, label: "Functional Requirements complete" });
+      setVerifiedAnalysis(nextAnalysis);
+      onAnalysisPrepared?.({ ...nextAnalysis, generation_pipeline: true, project_id: analysis.project_id, project_name: analysis.project_name });
       setWorkflowProgress({ percent: 58, label: "Generating Test Cases" });
       progressTimer = advanceProgressUntilComplete(setWorkflowProgress);
       const nextGeneration = await generateTestCasesFromAnalysis(nextAnalysis.analysis_id);
       applyGeneration(nextGeneration);
       setSelected([]);
-      setVerifiedAnalysis(nextAnalysis);
-      onAnalysisPrepared?.({ ...nextAnalysis, generation_pipeline: true, project_id: analysis.project_id, project_name: analysis.project_name });
       setWorkflowProgress({ percent: 100, label: "Test Cases generated" });
     } catch (err) {
       setError(err.message || "Could not complete Test Case generation.");
@@ -293,6 +309,17 @@ export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData,
 
   const caseItems = useMemo(() => testCases.map((item) => ({ ...item, reviewStatus: statuses[item.test_case_id] || item.review_status || item.approval?.status || "pending" })), [testCases, statuses]);
   const approvedCaseItems = caseItems.filter((item) => item.reviewStatus === "approved");
+  const casesPerPage = 5;
+  const casePageCount = Math.max(1, Math.ceil(caseItems.length / casesPerPage));
+  const visibleCaseItems = caseItems.slice((casePage - 1) * casesPerPage, casePage * casesPerPage);
+  const casePaginationStart = Math.max(1, Math.min(casePage - 2, casePageCount - 4));
+  const casePaginationPages = Array.from({ length: Math.min(5, casePageCount) }, (_, index) => casePaginationStart + index);
+  useEffect(() => { setCasePage(1); }, [generationId]);
+  useEffect(() => { setCasePage((current) => Math.min(current, casePageCount)); }, [casePageCount]);
+
+  function pageHeader() {
+    return <section className="test-design-header"><div className="test-design-header-copy"><div className="test-design-header-meta"><span><Sparkles size={12} /> TestIQ Test Design</span><div className="eyebrow">QUALITY ASSURANCE WORKSPACE</div></div><h1>Test Design Intelligence</h1><div className="test-design-cues"><span>AI-assisted generation</span><span>Human approval</span><span>Traceable coverage</span></div></div><div className="test-design-header-actions">{analysis?.project_name && <span className="test-design-project">{analysis.project_name}</span>}<button type="button" className="test-design-back" onClick={onBack}><ArrowLeft size={15} /> Upload Document</button></div></section>;
+  }
 
   function listBlock(title, items, empty = "Not specified") {
     return <div className="case-detail-block"><h4>{title}</h4>{Array.isArray(items) && items.length ? <ul>{items.map((item, index) => <li key={`${title}-${index}`}>{displayText(typeof item === "string" ? item : item.text || item.action || item.name || JSON.stringify(item))}</li>)}</ul> : <p>{empty}</p>}</div>;
@@ -365,9 +392,9 @@ export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData,
   if (!currentAnalysis && analysis?.generation_pipeline && analysis?.package_id) {
     const progress = workflowProgress || { percent: 0, label: "Ready to start" };
     return <div className="requirements-page test-generation-page">
-      <div className="page-heading"><div><div className="eyebrow">TEST CASE GENERATION</div><h1>Generate, review, and approve test cases</h1><p>{analysis.project_name ? `${analysis.project_name} · ` : ""}Functional Requirements and Test Case generation will run in sequence.</p></div><button type="button" className="secondary-button" onClick={onBack}><ArrowLeft size={16} /> Back to projects</button></div>
+      {pageHeader()}
       {error && <div className="error-message"><AlertCircle size={17} /> {error}</div>}
-      <section className="generation-next-card project-test-generation-card"><div><div className="eyebrow">PROJECT TEST DESIGN</div><h2>Generate test cases</h2><p>Functional Requirements are prepared first, then Test Cases are generated for review and approval.</p></div><div className="generation-controls project-generation-controls">{workflowProgress && <div className="test-case-inline-progress" aria-label="Test Case generation progress"><div className={`project-progress-track ${progress.percent === 100 ? "completed" : ""} ${loading ? "running" : ""}`} role="progressbar" aria-label="Test Case generation" aria-valuemin="0" aria-valuemax="100" aria-valuenow={progress.percent}><span style={{ width: `${progress.percent}%` }} /></div><div className={`project-progress-meta ${progress.percent === 100 ? "completed" : ""}`}><strong>{progress.percent}%</strong><span>{progress.label}</span></div></div>}{!loading && <button type="button" className="primary-button" onClick={generateProjectTestCases}>{workflowProgress?.percent === 100 ? <><RefreshCw size={16} /> Regenerate Test Cases</> : <><ShieldCheck size={16} /> Generate Test Cases</>}</button>}</div></section>
+      <section className="generation-next-card project-test-generation-card"><div><div className="eyebrow">GENERATION PIPELINE</div><h2>{activeGenerationActivity ? "Generation in progress" : "Generate test cases"}</h2><p>{activeGenerationActivity ? "You can open another section. Generation will continue in the background." : "Prepare requirements and create review-ready test cases."}</p></div><div className="generation-controls project-generation-controls">{(workflowProgress || activeGenerationActivity) && <div className="test-case-inline-progress" aria-label="Test Case generation progress"><div className={`project-progress-track ${progress.percent === 100 ? "completed" : ""} ${(loading || activeGenerationActivity) ? "running" : ""}`} role="progressbar" aria-label="Test Case generation" aria-valuemin="0" aria-valuemax="100" aria-valuenow={progress.percent}><span style={{ width: `${progress.percent}%` }} /></div><div className={`project-progress-meta ${progress.percent === 100 ? "completed" : ""}`}><strong>{progress.percent}%</strong><span>{progress.label}</span></div></div>}{!loading && !activeGenerationActivity && <button type="button" className="primary-button" onClick={generateProjectTestCases}><ShieldCheck size={16} /> Generate Test Cases</button>}</div></section>
     </div>;
   }
   if (!currentAnalysis) {
@@ -375,12 +402,12 @@ export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData,
   }
 
   return <div className="requirements-page test-generation-page">
-    <div className="page-heading"><div><div className="eyebrow">TEST CASE GENERATION</div><h1>Generate, review, and approve test cases</h1><p>Generate grounded positive and negative cases from the project Knowledge Base, then review and approve the test cases before creating test data.</p></div><div className="generation-page-actions">{generation && approvedCaseItems.length > 0 && <button type="button" className="primary-button" onClick={onContinueToTestData}>Continue to test data</button>}<button type="button" className="secondary-button" onClick={onBack}><ArrowLeft size={16} /> Back to upload document</button></div></div>
+    {pageHeader()}
     {error && <div className="error-message"><AlertCircle size={17} /> {error}</div>}
     {success && <div className="toast-message"><CheckCircle2 size={17} /> {success}</div>}
-    <section className="generation-next-card"><div><div className="eyebrow">TEST CASE GENERATION</div><h2>{generation ? "Generate another set" : "Generate positive and negative test cases"}</h2><p>{generation ? "Regenerate test cases from the current project requirements and Knowledge Base." : "Generate test cases from the current project requirements and Knowledge Base. Review and approve them before creating test data."}</p></div><div className="generation-controls project-generation-controls">{analysis?.generation_pipeline && loading && workflowProgress && <div className="test-case-inline-progress" aria-label="Test Case generation progress"><div className={`project-progress-track ${workflowProgress.percent === 100 ? "completed" : ""} running`} role="progressbar" aria-label="Test Case generation" aria-valuemin="0" aria-valuemax="100" aria-valuenow={workflowProgress.percent}><span style={{ width: `${workflowProgress.percent}%` }} /></div><div className={`project-progress-meta ${workflowProgress.percent === 100 ? "completed" : ""}`}><strong>{workflowProgress.percent}%</strong><span>{workflowProgress.label}</span></div></div>}{!(analysis?.generation_pipeline && loading) && <button type="button" className="primary-button" disabled={!generationRequirements.length || loading} onClick={generate}>{loading ? <><LoaderCircle className="spin" size={16} /> Generating...</> : <><ShieldCheck size={16} /> {analysis?.generation_pipeline && generation ? "Regenerate Test Cases" : generation ? "Generate another set" : "Generate test cases"}</>}</button>}</div></section>
-    {generation && <section className="requirements-panel generated-cases-panel"><div className="panel-title-row"><div><h2>Review generated test cases</h2><p className="panel-helper">Approve or reject each case. Edit title, steps, or expected result before saving.</p></div><span>{approvedCount}/{testCases.length} approved</span></div><div className="selection-actions"><label className="select-all"><input type="checkbox" checked={selectedAll} onChange={(event) => toggleAll(event.target.checked)} /> Select all</label><div className="review-move-actions"><button type="button" className="review-icon-action approved-action" disabled={!selected.length} title="Approve selected test cases" onClick={() => moveSelected("approved")}><Check size={14} /> Approve</button><button type="button" className="review-icon-action rejected-action" disabled={!selected.length} title="Reject selected test cases" onClick={() => moveSelected("rejected")}><X size={14} /> Reject</button></div></div><div className="test-case-execution-table-wrap"><table className="test-case-execution-table"><thead><tr><th className="test-case-grid-select-heading"></th><th>TC#</th><th>Test Title</th><th>Test Steps</th><th>Test data</th><th>Expected</th><th>Status</th><th className="test-case-grid-actions"></th></tr></thead><tbody>{caseItems.map(testCaseTableRow)}</tbody></table></div></section>}
+    <section className="generation-next-card"><div><div className="eyebrow">GENERATION</div><h2>{generation ? "Test cases ready for review" : activeGenerationActivity ? "Generation in progress" : "Generate test cases"}</h2><p>{generation ? `${testCases.length} cases generated from the approved project context.` : activeGenerationActivity ? "Generation continues in the background. You can safely open another page." : "Create positive and negative cases from approved requirements."}</p></div><div className="generation-controls project-generation-controls">{analysis?.generation_pipeline && loading && workflowProgress && <div className="test-case-inline-progress" aria-label="Test Case generation progress"><div className={`project-progress-track ${workflowProgress.percent === 100 ? "completed" : ""} running`} role="progressbar" aria-label="Test Case generation" aria-valuemin="0" aria-valuemax="100" aria-valuenow={workflowProgress.percent}><span style={{ width: `${workflowProgress.percent}%` }} /></div><div className={`project-progress-meta ${workflowProgress.percent === 100 ? "completed" : ""}`}><strong>{workflowProgress.percent}%</strong><span>{workflowProgress.label}</span></div></div>}{generation ? <span className="test-case-generation-ready"><CheckCircle2 size={16} /> Generated · {testCases.length} cases</span> : !(analysis?.generation_pipeline && loading) && !activeGenerationActivity && <button type="button" className="primary-button" disabled={!generationRequirements.length || loading} onClick={generate}><ShieldCheck size={16} /> Generate test cases</button>}</div></section>
+    {generation && <section className="requirements-panel generated-cases-panel"><div className="panel-title-row"><div><h2>Test-case review</h2><p className="panel-helper">Approve, reject, or edit generated cases.</p></div><span>{approvedCount}/{testCases.length} approved</span></div><div className="selection-actions"><label className="select-all"><input type="checkbox" checked={selectedAll} onChange={(event) => toggleAll(event.target.checked)} /> Select all {testCases.length}</label><div className="review-move-actions"><button type="button" className="review-icon-action approved-action" disabled={!selected.length} title="Approve selected test cases" onClick={() => moveSelected("approved")}><Check size={14} /> Approve</button><button type="button" className="review-icon-action rejected-action" disabled={!selected.length} title="Reject selected test cases" onClick={() => moveSelected("rejected")}><X size={14} /> Reject</button></div></div><div className="test-case-execution-table-wrap"><table className="test-case-execution-table"><thead><tr><th className="test-case-grid-select-heading"></th><th>TC#</th><th>Test Title</th><th>Test Steps</th><th>Test data</th><th>Expected</th><th>Status</th><th className="test-case-grid-actions"></th></tr></thead><tbody>{visibleCaseItems.map(testCaseTableRow)}</tbody></table></div>{casePageCount > 1 && <nav className="test-case-pagination" aria-label="Test case pages"><span>Showing {(casePage - 1) * casesPerPage + 1}–{Math.min(casePage * casesPerPage, caseItems.length)} of {caseItems.length}</span><div><button type="button" aria-label="Previous test-case page" disabled={casePage === 1} onClick={() => setCasePage((current) => current - 1)}><ChevronLeft size={16} /></button>{casePaginationPages.map((pageNumber) => <button type="button" className={casePage === pageNumber ? "active" : ""} aria-current={casePage === pageNumber ? "page" : undefined} key={pageNumber} onClick={() => setCasePage(pageNumber)}>{pageNumber}</button>)}<button type="button" aria-label="Next test-case page" disabled={casePage === casePageCount} onClick={() => setCasePage((current) => current + 1)}><ChevronRight size={16} /></button></div></nav>}</section>}
     {editingId && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setEditingId(""); }}><div className="confirm-modal case-edit-modal" role="dialog" aria-modal="true" aria-labelledby="case-edit-heading"><button type="button" className="modal-close" aria-label="Close edit test case" onClick={() => setEditingId("")}><X size={18} /></button><div className="eyebrow">EDIT TEST CASE · {editingId}</div><h2 id="case-edit-heading">Update test case details</h2><label className="case-edit-field">Test title<input className="test-case-grid-input" value={editingTitle} onChange={(event) => setEditingTitle(event.target.value)} /></label><label className="case-edit-field">Test steps<textarea className="test-case-grid-input test-case-grid-textarea" value={editingSteps} onChange={(event) => setEditingSteps(event.target.value)} /></label><label className="case-edit-field">Expected results<textarea className="test-case-grid-input test-case-grid-textarea" value={editingExpected} onChange={(event) => setEditingExpected(event.target.value)} /></label><div className="confirm-actions"><button type="button" className="secondary-button" onClick={() => setEditingId("")}>Cancel</button><button type="button" className="primary-button" onClick={() => saveEdit(editingId)}>Save changes</button></div></div></div>}
-    {generation && <section className="requirements-review-card"><div><div className="eyebrow">HUMAN REVIEW</div><h2>{allApproved ? "Test cases approved" : "Save test-case review"}</h2><p>{allApproved ? "Approved cases can continue to test data generation." : "Save reviewer, comments, and approval decisions for the generated cases."}</p></div><div className="review-fields"><label>Reviewer<input value={reviewer} onChange={(event) => setReviewer(event.target.value)} /></label><label>Review comments<textarea value={comments} onChange={(event) => setComments(event.target.value)} placeholder="Add review notes" /></label><button className="primary-button" onClick={saveReview} disabled={saving || !testCases.length}>{saving ? <><LoaderCircle className="spin" size={16} /> Saving review...</> : <><ShieldCheck size={16} /> Save test-case review</>}</button></div></section>}
+    {generation && <section className="requirements-review-card"><div className="test-review-heading"><div><div className="eyebrow">HUMAN REVIEW</div><h2>{allApproved ? "Review complete" : "Finalize review"}</h2></div>{approvedCaseItems.length > 0 && <button type="button" className="secondary-button compact-button" onClick={onContinueToTestData}>Continue to test data</button>}</div><div className="review-fields"><label>Reviewer<input value={reviewer} onChange={(event) => setReviewer(event.target.value)} /></label><label>Review comments<textarea value={comments} onChange={(event) => setComments(event.target.value)} placeholder="Optional review notes" /></label><button className="primary-button" onClick={saveReview} disabled={saving || !testCases.length}>{saving ? <><LoaderCircle className="spin" size={16} /> Saving...</> : <><ShieldCheck size={16} /> Save review</>}</button></div></section>}
   </div>;
 }
