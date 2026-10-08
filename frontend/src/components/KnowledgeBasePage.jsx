@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { BookOpen, CheckCircle2, Database, History, LoaderCircle, RefreshCw, Search } from "lucide-react";
 import {
-  buildKnowledgeIndex, evaluateKnowledgeIndex, getKnowledgeSummary, listManifests,
+  evaluateKnowledgeIndex, getKnowledgeSummary, listManifests,
   listProjects, retrieveKnowledge,
 } from "../api/client.js";
 import { LoadingSpinner } from "./LoadingSpinner.jsx";
@@ -10,7 +10,7 @@ function editableRules(payload) {
   return (payload?.rules || []).map((rule) => ({ ...rule, decision: rule.status || rule.decision || "pending", review_comment: rule.review_comment || "" }));
 }
 
-export function KnowledgeBasePage({ onContinueToFunctional, onOpenBusinessRequirements }) {
+export function KnowledgeBasePage({ onContinueToFunctional }) {
   const [projects, setProjects] = useState([]);
   const [project, setProject] = useState(() => JSON.parse(localStorage.getItem("testiq_current_project") || "null"));
   const [packages, setPackages] = useState([]);
@@ -19,7 +19,6 @@ export function KnowledgeBasePage({ onContinueToFunctional, onOpenBusinessRequir
   const [versions, setVersions] = useState([]);
   const [readiness, setReadiness] = useState(null);
   const [selectedIndex, setSelectedIndex] = useState(null);
-  const [ruleState, setRuleState] = useState(null);
   const [ruleDrafts, setRuleDrafts] = useState([]);
   const [query, setQuery] = useState("");
   const [retrieval, setRetrieval] = useState(null);
@@ -29,7 +28,7 @@ export function KnowledgeBasePage({ onContinueToFunctional, onOpenBusinessRequir
   const [notice, setNotice] = useState("");
 
   function clearSelectedPackage() {
-    setPackageId(""); setIndexes([]); setReadiness(null); setSelectedIndex(null); setRuleState(null); setRuleDrafts([]);
+    setPackageId(""); setIndexes([]); setReadiness(null); setSelectedIndex(null); setRuleDrafts([]);
     setRetrieval(null); setEvaluation(null); localStorage.removeItem("testiq_current_package");
   }
 
@@ -45,7 +44,7 @@ export function KnowledgeBasePage({ onContinueToFunctional, onOpenBusinessRequir
       const nextVersions = summary.versions || [];
       const list = Array.isArray(nextIndexes) ? nextIndexes : nextIndexes?.indexes || [];
       setIndexes(list); setVersions(Array.isArray(nextVersions) ? nextVersions : []); setReadiness(nextReadiness);
-      setRuleState(nextRules); setRuleDrafts(editableRules(nextRules));
+      setRuleDrafts(editableRules(nextRules));
       setSelectedIndex((current) => list.find((item) => item.index_id === current?.index_id)
         || list.find((item) => item.index_id === nextReadiness?.index_id) || list[0] || null);
       if (!silent) { setRetrieval(null); setEvaluation(null); }
@@ -90,14 +89,10 @@ export function KnowledgeBasePage({ onContinueToFunctional, onOpenBusinessRequir
   const latestIndex = useMemo(() => indexes.find((item) => item.index_id === readiness?.index_id) || indexes[0] || null, [indexes, readiness?.index_id]);
   const progressIndex = latestIndex || selectedIndex;
   const hasReadyIndex = Boolean(readiness?.ready && indexes.some((item) => item.index_id === readiness.index_id));
-  const approvedCount = ruleDrafts.filter((rule) => rule.decision === "approved").length;
-  const rejectedCount = ruleDrafts.filter((rule) => rule.decision === "rejected").length;
-  const pendingCount = ruleDrafts.length - approvedCount - rejectedCount;
-  const reviewComplete = ruleState?.review_status === "approved" && Number(ruleState?.counts?.approved || 0) > 0;
   const storedProgress = Number(readiness?.progress_percent ?? progressIndex?.progress_percent ?? 0);
   const knowledgeProgress = Math.max(0, Math.min(100, working === "build" ? Math.max(5, storedProgress) : storedProgress));
   const knowledgeStage = readiness?.progress_stage || progressIndex?.progress_stage || progressIndex?.status || "Not built";
-  const knowledgeMessage = readiness?.progress_message || progressIndex?.progress_message || readiness?.message || "Complete the Business Use Case review before building the Knowledge Base.";
+  const knowledgeMessage = readiness?.progress_message || progressIndex?.progress_message || readiness?.message || "The Knowledge Base will be created automatically when the BRD and available source documents finish processing.";
   const isKnowledgeBuilding = working === "build" || readiness?.index_status === "building" || progressIndex?.status === "building";
   const isLoadingWorkspace = working === "projects";
   const isLoadingKnowledge = working === "load" && Boolean(chosenPackage);
@@ -124,20 +119,6 @@ export function KnowledgeBasePage({ onContinueToFunctional, onOpenBusinessRequir
     finally { setWorking(""); }
   }
 
-  async function performBuild() {
-    setWorking("build"); setError("");
-    const built = await buildKnowledgeIndex(packageId);
-    setNotice(built.reused ? `Knowledge Base version ${built.knowledge_version} was already current.`
-      : `Knowledge Base version ${built.knowledge_version} is ready: ${built.reused_chunk_count || 0} chunks reused and ${built.new_chunk_count || 0} added or changed.`);
-    await loadPackage(packageId, { silent: true });
-    if (built.index_id) setSelectedIndex(built);
-    return built;
-  }
-
-  async function buildIndex() {
-    try { await performBuild(); } catch (err) { setError(err.message); } finally { setWorking(""); }
-  }
-
   async function runRetrieval(event) {
     event.preventDefault(); if (!selectedIndex || !query.trim()) return;
     setWorking("retrieve"); setError(""); setRetrieval(null);
@@ -151,7 +132,7 @@ export function KnowledgeBasePage({ onContinueToFunctional, onOpenBusinessRequir
   }
 
   return <div className="packages-page knowledge-page">
-    <div className="page-heading"><div><div className="eyebrow">PROJECT KNOWLEDGE</div><h1>Knowledge Base</h1><p>Build reusable project knowledge from approved Business Use Cases and their supporting source documents.</p></div><button className="secondary-button" onClick={() => loadPackage(packageId, { refresh: true })} disabled={!chosenPackage || Boolean(working)}>{isLoadingKnowledge ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />} Refresh</button></div>
+    <div className="page-heading"><div><div className="eyebrow">PROJECT KNOWLEDGE</div><h1>Knowledge Base</h1><p>Knowledge is created automatically from the BRD and every available source document.</p></div><button className="secondary-button" onClick={() => loadPackage(packageId, { refresh: true })} disabled={!chosenPackage || Boolean(working)}>{isLoadingKnowledge ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />} Refresh</button></div>
     <section className="knowledge-toolbar">
       <label><span>Project</span><select value={project?.project_id || ""} onChange={(event) => selectProject(event.target.value)} disabled={isLoadingWorkspace}><option value="">Choose project</option>{projects.map((item) => <option key={item.project_id} value={item.project_id}>{item.project_name}</option>)}</select></label>
       <label><span>Resource Package</span><select value={packageId} onChange={(event) => { const id = event.target.value; const chosen = packages.find((item) => item.package_id === id); setPackageId(id); if (chosen) localStorage.setItem("testiq_current_package", JSON.stringify(chosen)); }} disabled={!packages.length || isLoadingWorkspace}><option value="">Choose a Resource Package</option>{packages.map((item) => <option key={item.package_id} value={item.package_id}>v{item.package_version} · {item.package_name || item.scope || "Resource Package"}</option>)}</select></label>
@@ -164,14 +145,14 @@ export function KnowledgeBasePage({ onContinueToFunctional, onOpenBusinessRequir
 
     {chosenPackage && <>
       <section className="packages-card knowledge-rule-summary">
-        <div className="packages-card-head"><div><h2>Approved Business Use Cases</h2><p>Only approved Business Use Cases are included in this Knowledge Base version.</p></div><span className={`health-badge ${reviewComplete ? "" : "pending"}`}>{reviewComplete ? `${approvedCount} approved · ${rejectedCount} rejected` : `${pendingCount} decisions remaining`}</span></div>
-        {!reviewComplete && <div className="success-actions"><span>Complete all Business Use Case decisions before building the Knowledge Base.</span><button className="primary-button" onClick={() => onOpenBusinessRequirements?.()} disabled={!onOpenBusinessRequirements}>Review Business Use Cases</button></div>}
+        <div className="packages-card-head"><div><h2>Automatic indexing</h2><p>All successfully extracted project documents are included. No Business Use Case approval is required.</p></div><span className="health-badge">Automatic</span></div>
+        <div className="success-actions"><span>{ruleDrafts.length ? `${ruleDrafts.length} BRD rules were captured as traceable Knowledge Base context.` : "The BRD and source documents will be indexed automatically."}</span></div>
       </section>
 
       <section className="packages-card">
-        <div className="packages-card-head"><div><h2>Knowledge Base version</h2><p>Each Resource Package creates a traceable version. Unchanged source sections and knowledge records are reused automatically.</p></div><span className={`health-badge ${hasReadyIndex ? "" : "pending"}`}>{hasReadyIndex ? "Ready" : isKnowledgeBuilding ? "Building" : reviewComplete ? "Ready to build" : "Waiting for review"}</span></div>
+        <div className="packages-card-head"><div><h2>Knowledge Base version</h2><p>Each document update creates a traceable version. Unchanged source sections and knowledge records are reused automatically.</p></div><span className={`health-badge ${hasReadyIndex ? "" : "pending"}`}>{hasReadyIndex ? "Ready" : isKnowledgeBuilding ? "Building" : "Waiting for document processing"}</span></div>
         {(progressIndex || readiness) && <div className={`knowledge-progress-card ${isKnowledgeBuilding ? "building" : hasReadyIndex ? "ready" : "pending"}`}><div className="knowledge-progress-head"><div><strong>{isKnowledgeBuilding ? "Updating Knowledge Base" : hasReadyIndex ? `Knowledge Base version ${progressIndex?.knowledge_version || 1} ready` : "Knowledge Base status"}</strong><span>{knowledgeStage}</span></div><b>{knowledgeProgress}%</b></div><div className="knowledge-progress-track" role="progressbar" aria-label="Knowledge Base build progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow={knowledgeProgress}><span style={{ width: `${knowledgeProgress}%` }} /></div><p>{knowledgeMessage}</p></div>}
-        <div className="review-actions"><label className="package-selector"><span>Knowledge Base version</span><select value={selectedIndex?.index_id || ""} onChange={(event) => setSelectedIndex(indexes.find((item) => item.index_id === event.target.value) || null)}><option value="">Not built yet</option>{indexes.map((item) => <option key={item.index_id} value={item.index_id}>Version {item.knowledge_version || 1} · {item.status}</option>)}</select></label><button className="primary-button" onClick={buildIndex} disabled={!reviewComplete || Boolean(working)}>{working === "build" ? <LoaderCircle className="spin" size={16} /> : <BookOpen size={16} />} {indexes.length ? "Retry Knowledge Base build" : "Build Knowledge Base"}</button></div>
+        <div className="review-actions"><label className="package-selector"><span>Knowledge Base version</span><select value={selectedIndex?.index_id || ""} onChange={(event) => setSelectedIndex(indexes.find((item) => item.index_id === event.target.value) || null)}><option value="">Not built yet</option>{indexes.map((item) => <option key={item.index_id} value={item.index_id}>Version {item.knowledge_version || 1} · {item.status}</option>)}</select></label><span className={`health-badge ${hasReadyIndex ? "" : "pending"}`}>{hasReadyIndex ? "Ready" : isKnowledgeBuilding ? "Building automatically" : "Waiting for document processing"}</span></div>
         {selectedIndex && <div className="knowledge-summary-grid"><div><span>Version</span><strong>{selectedIndex.knowledge_version || 1}</strong></div><div><span>Reused source sections</span><strong>{selectedIndex.reused_chunk_count || 0}</strong></div><div><span>New or changed</span><strong>{selectedIndex.new_chunk_count ?? selectedIndex.chunk_count ?? 0}</strong></div><div><span>Removed</span><strong>{selectedIndex.retired_chunk_count || 0}</strong></div></div>}
         {selectedIndex && <div className="source-list-card"><strong>{selectedIndex.chunk_count ?? 0} indexed source sections</strong><span> · {selectedIndex.node_count ?? 0} knowledge items · {selectedIndex.edge_count ?? 0} relationships</span><p>{selectedIndex.build_mode === "incremental" ? `Updated from Knowledge Base version ${versions.find((item) => item.index_id === selectedIndex.parent_index_id)?.knowledge_version || "previous"}.` : "Initial Knowledge Base version."}</p>{selectedIndex.error && <div className="error-message">{selectedIndex.error}</div>}</div>}
       </section>

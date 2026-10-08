@@ -7,14 +7,14 @@ from pathlib import Path
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
-from .config import BRONZE_SCHEMA, DATABASE_URL, EXTRACTION_CONFIG_VERSION, EXTRACTION_PROMPT_VERSION, LOCAL_EXTRACTOR_VERSION, MAX_UPLOAD_BYTES, OPENAI_MODEL, OPENAI_TIMEOUT_SECONDS, REQUIRED_BRD_SECTIONS, REQUIREMENTS_ANALYSIS_PROMPT_VERSION, SUPPORTED_EXTENSIONS, TEST_CASE_GENERATION_PROMPT_VERSION, UPLOAD_DIR
+from .config import BRONZE_SCHEMA, DATABASE_URL, EXTRACTION_CONFIG_VERSION, EXTRACTION_PROMPT_VERSION, LOCAL_EXTRACTOR_VERSION, MAX_UPLOAD_BYTES, OPENAI_MODEL, OPENAI_TIMEOUT_SECONDS, REQUIRED_BRD_SECTIONS, REQUIREMENTS_ANALYSIS_PROMPT_VERSION, SUPPORTED_EXTENSIONS, TEST_CASE_GENERATION_PROMPT_VERSION, TEST_CASE_OPENAI_TIMEOUT_SECONDS, UPLOAD_DIR
 from .openai_requests import responses_create
 from .token_usage import estimate_cost_usd, usage_scope, usage_step
 from .db import close_connection_pool, connection, init_db, warm_connection_pool
 from .extractors import _json_sections, extract_local, extract_openai_file, extraction_prompt_hash, missing_sections
 from .validation import validate_file_content
+from .knowledge_fabric import BuildIndexRequest, build_knowledge_index, retrieve_package_context
 from .knowledge_fabric import router as knowledge_fabric_router
-from .knowledge_fabric import retrieve_package_context
 
 app = FastAPI(title="TestIQ Source Package API", version="1.0.0")
 app.include_router(knowledge_fabric_router)
@@ -99,7 +99,7 @@ def _ensure_package_business_rules(conn, package_id: str) -> None:
     for fragment in fragments:
         text = " ".join(str(fragment["fragment_text"] or "").split())
         for candidate in re.split(r"(?<=[.!;])\s+", text):
-            statement = candidate.strip(" -•\t")
+            statement = candidate.strip(" -Ã¢â‚¬Â¢\t")
             if not 15 <= len(statement) <= 1200 or not _BUSINESS_RULE_TERMS.search(statement) or statement.endswith("?"):
                 continue
             if statement.casefold() in seen:
@@ -109,7 +109,7 @@ def _ensure_package_business_rules(conn, package_id: str) -> None:
             rule_id = "rule_" + hashlib.sha256(f"{package_id}:{fragment['fragment_id']}:{statement}".encode()).hexdigest()[:24]
             source_reference = f"{fragment['logical_name']}@v{fragment['revision']} | {fragment['source_reference']}"
             conn.execute(
-                "INSERT INTO package_business_rule (rule_id,package_id,ordinal,statement,source_fragment_id,source_reference,impact_if_missing,status,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,'pending',%s,%s)",
+                "INSERT INTO package_business_rule (rule_id,package_id,ordinal,statement,source_fragment_id,source_reference,impact_if_missing,status,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,'approved',%s,%s)",
                 (rule_id, package_id, ordinal, statement, fragment["fragment_id"], source_reference, _business_rule_impact(statement), timestamp, timestamp),
             )
 
@@ -162,7 +162,7 @@ def extraction_config_hash() -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 REQUIREMENTS_ANALYSIS_PROMPT = f"{read_skill_instructions('requirements-analysis')}\n\nSOURCE FRAGMENTS:\n"
-TEST_CASE_GENERATION_PROMPT = f"{read_skill_instructions('test-case-generation')}\n\nUse the package-scoped retrieved_knowledge_evidence in the input to ground database setup, API behavior, and test steps. Treat approved requirements as the behavior scope and cite only approved requirement/source references. For every acceptance_criteria_id and business_rule_id listed in coverage_plan, include that exact ID in the matching requirement's test case traceability fields (acceptance_criteria_ids or business_rule_ids respectively). For every evidence.source_references entry, copy an exact fragment_id and source_reference pair from the supplied approved requirements or retrieved Knowledge Base evidence; never invent or alter either value. Every test case must include at least one test_data_setup item with created_during_execution set to true; name a supported record key, explain how execution creates that record, and cite its supporting requirement or acceptance-criterion ID in source. Never supply an actual production identifier. Keep each generated case concise: short title, one-sentence description, three to five steps, one or two expected results, and focused setup data only.\n\nAPPROVED REQUIREMENTS:\n"
+TEST_CASE_GENERATION_PROMPT = f"{read_skill_instructions('test-case-generation')}\n\nUse the package-scoped source_package_evidence and retrieved_knowledge_evidence in the input to ground API behavior, database fields, validation locations, and test steps. The direct BRD and technical source-package fragments are authoritative evidence and must be used alongside the Knowledge Base context. Treat the generated requirement contract as the behavior scope; business use cases and functional requirements are internal generation artifacts and do not require human approval. For each supported acceptance_criteria_id and business_rule_id in coverage_plan, include the exact ID only on a case whose executable content exercises it. Do not attach IDs merely to satisfy metadata coverage; unsupported categories and rules belong in global_gaps. Traceability IDs are requirement-scoped: never place an acceptance criterion or business-rule ID on a test case whose requirement_id does not own that ID. For every evidence.source_references entry, copy an exact fragment_id and source_reference pair from the supplied generated requirements or retrieved Knowledge Base evidence; never invent or alter either value. Generate positive and negative test cases when the BRD or source package supports both behaviors. Never invent an unsupported negative, boundary, channel, or failure scenario; record unsupported coverage in global_gaps. A traceability ID counts as covered only when the case steps, data_needs, assertions, and expected_results exercise that rule or criterion. Put required test-data field names such as member_id, prescription_id, status, or due_date in data_needs. Do not generate pre-steps, setup instructions, setup records, or production identifier values. Keep each generated case concise: short title, one-sentence description, one or more numbered execution steps (normally three to five when the source supports them), one or two expected results, and focused data fields only. Do not add pre-steps, setup records, or production values.\n\nGENERATED REQUIREMENTS:\n"
 TEST_CASE_GENERATION_MAX_ATTEMPTS = 2
 
 def test_case_generation_prompt_hash() -> str:
@@ -316,8 +316,9 @@ def process_extraction(revision_id, source_id, extraction_id, storage_path, file
     # fallback when the provider is unavailable or cannot extract the file.
     started_at = time.monotonic()
     with connection() as conn:
-        source_row = conn.execute("SELECT source_type FROM source_document WHERE source_id=%s", (source_id,)).fetchone()
+        source_row = conn.execute("SELECT source_type,project_id FROM source_document WHERE source_id=%s", (source_id,)).fetchone()
         source_type = source_row["source_type"] if source_row else None
+        project_id = source_row["project_id"] if source_row else None
         conn.execute("UPDATE source_extraction SET mode=%s,status=%s WHERE extraction_id=%s", ("openai", "processing", extraction_id))
         conn.execute("UPDATE source_revision SET status=%s WHERE revision_id=%s", ("processing", revision_id))
     mode = "openai"
@@ -378,6 +379,8 @@ def process_extraction(revision_id, source_id, extraction_id, storage_path, file
             "Source extraction completed revision=%s filename=%s mode=%s fragments=%d total_duration_seconds=%.2f",
             revision_id, filename, mode, len(fragment_rows), time.monotonic() - started_at,
         )
+        if project_id:
+            _auto_sync_project_knowledge(project_id)
     except Exception as exc:
         logger.exception(
             "Source extraction failed revision=%s filename=%s total_duration_seconds=%.2f",
@@ -390,6 +393,59 @@ def process_extraction(revision_id, source_id, extraction_id, storage_path, file
             messages = json.loads(row["validation_messages"] or "[]") if row else []
             messages.append(f"Extraction failed: {exc}")
             conn.execute("UPDATE source_revision SET status=%s,validation_messages=%s WHERE revision_id=%s", ("extraction_failed", json.dumps(messages), revision_id))
+
+
+def _build_knowledge_for_package(package_id: str) -> None:
+    """Build a package-scoped Knowledge Base without a user action."""
+    try:
+        build_knowledge_index(package_id, BuildIndexRequest())
+    except Exception:
+        logger.exception("Automatic Knowledge Base build failed package=%s", package_id)
+
+
+def _auto_sync_project_knowledge(project_id: str) -> None:
+    """Create a new immutable package when all current project documents are ready.
+
+    A project may receive technical documents before its BRD. Those documents
+    stay attached to the project until the BRD arrives; the first successful
+    BRD extraction completes the package input set and starts indexing.
+    """
+    try:
+        with connection() as conn:
+            project = conn.execute("SELECT * FROM project WHERE project_id=%s", (project_id,)).fetchone()
+            if not project:
+                return
+            sources = conn.execute("SELECT * FROM source_document WHERE project_id=%s ORDER BY created_at", (project_id,)).fetchall()
+            brds = [source for source in sources if source["source_type"] == "brd"]
+            if len(brds) != 1:
+                return
+            brd = brds[0]
+            if not brd["active_revision_id"]:
+                return
+            ready_source_ids = []
+            active_pairs = []
+            for source in sources:
+                if not source["active_revision_id"]:
+                    return
+                revision = conn.execute("SELECT r.*,e.status AS extraction_status FROM source_revision r LEFT JOIN source_extraction e ON e.revision_id=r.revision_id WHERE r.revision_id=%s ORDER BY e.created_at DESC LIMIT 1", (source["active_revision_id"],)).fetchone()
+                if not revision or revision["status"] in {"pending", "processing", "rejected", "extraction_failed"} or revision["extraction_status"] not in {"succeeded", "skipped"}:
+                    return
+                ready_source_ids.append(source["source_id"])
+                active_pairs.append((source["source_id"], revision["revision_id"], revision["sha256"]))
+            supporting = [source for source in sources if source["source_type"] != "brd"]
+            for source in supporting:
+                conn.execute("INSERT INTO source_relationship (relationship_id,brd_source_id,supporting_source_id,relationship_type,created_at) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (brd_source_id,supporting_source_id) DO NOTHING", (uid("rel"), brd["source_id"], source["source_id"], "supports", now()))
+            latest = conn.execute("SELECT * FROM source_package_manifest WHERE project_id=%s ORDER BY package_version DESC LIMIT 1", (project_id,)).fetchone()
+            if latest:
+                existing = conn.execute("SELECT source_id,revision_id,content_hash FROM source_package_item WHERE package_id=%s", (latest["package_id"],)).fetchall()
+                if {(row["source_id"], row["revision_id"], row["content_hash"]) for row in existing} == set(active_pairs):
+                    return
+            project_name = project["project_name"]
+        created = create_manifest(project_id, ManifestRequest(source_ids=ready_source_ids, package_name=f"{project_name} Resource Package", scope="Project"), BackgroundTasks())
+        package_id = created["package_id"]
+        threading.Thread(target=_build_knowledge_for_package, args=(package_id,), daemon=True).start()
+    except Exception:
+        logger.exception("Automatic project package synchronization failed project=%s", project_id)
 
 class ManifestRequest(BaseModel):
     source_ids: list[str] = Field(min_length=1)
@@ -750,8 +806,31 @@ def _validate_requirements_contract(contract, fragments):
             raise ValueError("AI returned an empty technical gap")
         validate_refs(gap.get("source_references"), gap.get("gap_id", "technical gap"))
         exact_references = {ref.get("source_reference") for ref in gap.get("source_references", [])}
-        if gap.get("technical_reference") not in exact_references:
-            raise ValueError(f"AI returned an unsupported technical reference for {gap.get('gap_id', 'technical gap')}")
+        technical_reference = str(gap.get("technical_reference") or "").strip()
+        if technical_reference not in exact_references:
+            # Models sometimes return the human-readable portion of a source
+            # reference (or normalize whitespace/case) even though the cited
+            # source reference is valid. Canonicalize that representation to
+            # the exact reference already validated above.
+            def reference_key(value):
+                return " ".join(str(value or "").casefold().split())
+
+            candidate_key = reference_key(technical_reference)
+            canonical = next((ref for ref in exact_references if reference_key(ref) == candidate_key), None)
+            if canonical is None and candidate_key:
+                canonical = next((ref for ref in exact_references
+                                  if candidate_key in reference_key(ref)
+                                  or reference_key(ref).endswith(candidate_key)
+                                  or any(candidate_key == part.strip() or candidate_key in part.strip()
+                                         for part in reference_key(ref).split("|"))), None)
+            if canonical is None and candidate_key:
+                candidate_tokens = set(candidate_key.split())
+                canonical = next((ref for ref in exact_references
+                                  if candidate_tokens and candidate_tokens <= set(reference_key(ref).replace("|", " ").split())), None)
+            if canonical:
+                gap["technical_reference"] = canonical
+            else:
+                raise ValueError(f"AI returned an unsupported technical reference for {gap.get('gap_id', 'technical gap')}")
 
 @usage_step("requirements_analysis")
 def _requirements_contract_with_openai(package, items, fragments, rag_context=None):
@@ -777,7 +856,7 @@ def _requirements_contract_with_openai(package, items, fragments, rag_context=No
         usable_fragments = [fragment for fragment in fragments if str(fragment.get("fragment_text") or "").strip()]
     source_fragments = _analysis_source_references(usable_fragments)
     fragment_text = "\n".join(json.dumps({**ref, "text": str(fragment.get("fragment_text") or "")}, ensure_ascii=False) for ref, fragment in zip(source_fragments, usable_fragments))
-    client = OpenAI(api_key=key, timeout=OPENAI_TIMEOUT_SECONDS)
+    client = OpenAI(api_key=key, timeout=OPENAI_TIMEOUT_SECONDS, max_retries=0)
     response = responses_create(client,
         model=OPENAI_MODEL,
         input=REQUIREMENTS_ANALYSIS_PROMPT + "\n\nRETRIEVED KNOWLEDGE BASE EVIDENCE (supporting context; cite only original source fragment IDs):\n" + json.dumps(rag_context or {}, ensure_ascii=False) + "\n\nSOURCE FRAGMENTS:\n" + fragment_text,
@@ -1004,26 +1083,23 @@ def _review_items(contract):
     return items
 
 def _approved_requirement_payload(contract):
-    approved_ids = set(contract.get("approved_items", []))
+    # Requirements are generated working context. Test-case review is the only
+    # human approval gate, so include every generated requirement and its
+    # supporting criteria/rules regardless of review metadata.
     approved = []
     for requirement in contract.get("requirements", []):
         requirement_id = requirement.get("requirement_id")
-        if requirement_id not in approved_ids and requirement.get("review_status") != "approved":
-            continue
         criteria = []
         for criterion in requirement.get("acceptance_criteria", []):
-            criterion_id = criterion.get("acceptance_id") if isinstance(criterion, dict) else None
-            if criterion_id and (f"{requirement_id}:{criterion_id}" in approved_ids or criterion.get("review_status") == "approved"):
+            if isinstance(criterion, dict):
                 criteria.append(criterion)
         rules = []
         for rule in requirement.get("business_rules", []):
-            rule_id = rule.get("rule_id") if isinstance(rule, dict) else None
-            if rule_id and (f"{requirement_id}:{rule_id}" in approved_ids or rule.get("review_status") == "approved"):
+            if isinstance(rule, dict):
                 rules.append(rule)
         outcomes = []
         for outcome in requirement.get("expected_outcomes", []):
-            outcome_id = outcome.get("outcome_id") if isinstance(outcome, dict) else None
-            if outcome_id and (f"{requirement_id}:{outcome_id}" in approved_ids or outcome.get("review_status") == "approved"):
+            if isinstance(outcome, dict):
                 outcomes.append(outcome)
         approved.append({"requirement_id": requirement_id, "title": requirement.get("title"), "type": requirement.get("type"), "statement": requirement.get("statement"), "priority": requirement.get("priority"), "actors": requirement.get("actors", []), "entities": requirement.get("entities", []), "flow_steps": requirement.get("flow_steps", []), "acceptance_criteria": criteria, "expected_outcomes": outcomes, "business_rules": rules, "source_references": requirement.get("source_references", [])})
     return approved
@@ -1031,7 +1107,6 @@ def _approved_requirement_payload(contract):
 def _test_case_generation_schema():
     source_reference = {"type": "object", "additionalProperties": False, "properties": {"fragment_id": {"type": "string"}, "source_reference": {"type": "string"}}, "required": ["fragment_id", "source_reference"]}
     surface = {"type": "object", "additionalProperties": False, "properties": {"name": {"type": "string"}, "type": {"type": "string"}, "coverage": {"type": "string"}}, "required": ["name", "type", "coverage"]}
-    test_data_setup = {"type": "object", "additionalProperties": False, "properties": {"name": {"type": "string"}, "data_type": {"type": "string"}, "value_strategy": {"type": "string"}, "created_during_execution": {"type": "boolean"}, "setup_step": {"type": "string"}, "source": {"type": "string"}}, "required": ["name", "data_type", "value_strategy", "created_during_execution", "setup_step", "source"]}
     data_need = {"type": "object", "additionalProperties": False, "properties": {"name": {"type": "string"}, "type": {"type": "string"}, "value": {"type": "string"}, "required": {"type": "boolean"}, "source": {"type": "string"}}, "required": ["name", "type", "value", "required", "source"]}
     deterministic_input = {"type": "object", "additionalProperties": False, "properties": {"name": {"type": "string"}, "value": {"type": "string"}, "seed_strategy": {"type": "string"}}, "required": ["name", "value", "seed_strategy"]}
     action = {"type": "object", "additionalProperties": False, "properties": {"step": {"type": "integer"}, "surface": {"type": "string"}, "actor": {"type": "string"}, "action": {"type": "string"}, "data_inputs": {"type": "array", "items": {"type": "string"}}}, "required": ["step", "surface", "actor", "action", "data_inputs"]}
@@ -1043,6 +1118,7 @@ def _test_case_generation_schema():
     return {"type": "object", "additionalProperties": False, "properties": {
         "test_cases": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": False, "properties": {
             "test_case_id": {"type": "string", "pattern": "^TC-[0-9]{3}$"},
+            "execution_status": {"type": "string", "enum": ["not_run", "pass", "fail"]},
             "requirement_id": {"type": "string", "pattern": "^FR-[0-9]{3}$"},
             "title": {"type": "string"},
             "description": {"type": "string"},
@@ -1052,7 +1128,6 @@ def _test_case_generation_schema():
             "priority": {"type": "string"},
             "surfaces": {"type": "array", "minItems": 1, "items": surface},
             "preconditions": {"type": "array", "items": {"type": "string"}},
-            "test_data_setup": {"type": "array", "minItems": 1, "items": test_data_setup},
             "deterministic_inputs": {"type": "array", "minItems": 1, "items": deterministic_input},
             "data_needs": {"type": "array", "minItems": 1, "items": data_need},
             "actions": {"type": "array", "minItems": 1, "items": action},
@@ -1068,7 +1143,7 @@ def _test_case_generation_schema():
             "cleanup_ownership": cleanup_ownership,
             "approval": approval,
             "source_references": {"type": "array", "items": source_reference, "minItems": 1}
-        }, "required": ["test_case_id", "requirement_id", "title", "description", "scenario", "category", "type", "priority", "surfaces", "preconditions", "test_data_setup", "deterministic_inputs", "data_needs", "actions", "steps", "assertions", "expected_results", "acceptance_criteria_ids", "business_rule_ids", "discovery_context_ids", "evidence", "assumptions", "validation_results", "cleanup_ownership", "approval", "source_references"]}},
+        }, "required": ["test_case_id", "execution_status", "requirement_id", "title", "description", "scenario", "category", "type", "priority", "surfaces", "preconditions", "deterministic_inputs", "data_needs", "actions", "steps", "assertions", "expected_results", "acceptance_criteria_ids", "business_rule_ids", "discovery_context_ids", "evidence", "assumptions", "validation_results", "cleanup_ownership", "approval", "source_references"]}},
         "coverage": {"type": "object", "additionalProperties": False, "properties": {"required_categories": {"type": "array", "items": {"type": "string"}}, "generated_categories": {"type": "array", "items": {"type": "string"}}, "missing_categories": {"type": "array", "items": {"type": "string"}}}, "required": ["required_categories", "generated_categories", "missing_categories"]},
         "global_gaps": {"type": "array", "items": {"type": "string"}}
     }, "required": ["test_cases", "coverage", "global_gaps"]}
@@ -1120,10 +1195,39 @@ def _coverage_overlap_score(left, right):
         return 1.0
     return containment if common >= 3 and containment >= 0.7 and jaccard >= 0.3 else jaccard
 
+def _test_case_exercises_item(test_case, item, acceptance=False):
+    """Return whether the executable case content actually exercises an item.
+
+    Traceability IDs are only meaningful when the title, steps, data needs,
+    assertions, or expected results describe the referenced rule. This keeps
+    coverage from being inflated by metadata-only ID attachments.
+    """
+    case_text = " ".join([
+        str(test_case.get("title") or ""),
+        str(test_case.get("description") or ""),
+        str(test_case.get("scenario") or ""),
+        " ".join(str(step or "") for step in test_case.get("steps") or []),
+        " ".join(str(value or "") for value in test_case.get("data_needs") or []),
+        " ".join(str(value or "") for value in test_case.get("expected_results") or []),
+        " ".join(str(value or "") for value in test_case.get("assertions") or []),
+    ])
+    case_terms = _coverage_terms({"text": case_text})
+    item_terms = _coverage_terms(item, acceptance)
+    if not case_terms or not item_terms:
+        return False
+    # A single distinctive term is sufficient for short rules; longer rules
+    # require at least two shared terms so a copied ID cannot claim coverage.
+    common = case_terms & item_terms
+    threshold = 1 if len(item_terms) <= 3 else 2
+    if len(common) < threshold:
+        return False
+    return _coverage_overlap_score({"text": case_text}, item) > 0
+
 def _test_case_coverage_plan(approved_requirements, requested_count=None):
     categories = [
         ("happy_path", "Eligible-member happy path", ("eligible", "active", "success", "reminder", "campaign")),
         ("exclusion", "Exclusion or missing-data path", ("ineligible", "inactive", "exclude", "not eligible", "suppress", "missing")),
+        ("negative_validation", "Invalid input or failure path", ("invalid", "failure", "fails", "error", "reject", "denied")),
         ("boundary", "Threshold or boundary path", ("threshold", "boundary", "due", "day", "status", "eligibility", "eligible")),
         ("channel_fallback", "Channel fallback path", ("fallback", "alternate", "phone", "sms fail", "channel")),
         ("retry_failure", "Retry, idempotency, or service-failure path", ("retry", "idempot", "failure", "fails", "partial", "service", "timeout")),
@@ -1133,32 +1237,24 @@ def _test_case_coverage_plan(approved_requirements, requested_count=None):
         for requirement in approved_requirements:
             criteria = [item for item in requirement.get("acceptance_criteria", []) if isinstance(item, dict)]
             rules = [item for item in requirement.get("business_rules", []) if isinstance(item, dict)]
-            requirement_plan = []
-            for criterion in criteria:
-                requirement_plan.append({"category": "requirement_validation", "label": criterion.get("acceptance_id") or "Acceptance criterion validation", "requirement": requirement, "acceptance_criteria": [criterion], "business_rules": []})
-            for rule in rules:
-                criterion_cases = [item for item in requirement_plan if item["acceptance_criteria"]]
-                best_match = max(criterion_cases, key=lambda item: _coverage_overlap_score(item["acceptance_criteria"][0], rule), default=None)
-                if best_match and _coverage_overlap_score(best_match["acceptance_criteria"][0], rule) >= 0.58:
-                    best_match["business_rules"].append(rule)
-                    continue
-                requirement_plan.append({"category": "requirement_validation", "label": rule.get("rule_id") or "Business rule validation", "requirement": requirement, "acceptance_criteria": [], "business_rules": [rule]})
-            if not requirement_plan:
-                requirement_plan.append({"category": "requirement_validation", "label": "Requirement validation", "requirement": requirement, "acceptance_criteria": [], "business_rules": []})
-            remaining = 100 - len(plan)
-            plan.extend(requirement_plan[:remaining])
-            if len(requirement_plan) > remaining:
-                gaps.append("Automatic test-case plan was capped at 100 cases for one generation run.")
-                return plan, gaps
+            plan.append({"category": "happy_path", "label": "Positive behavior", "requirement": requirement,
+                         "acceptance_criteria": criteria, "business_rules": rules})
+            requirement_text = _requirement_text(requirement)
+            negative_terms = ("ineligible", "inactive", "exclude", "excluded", "suppress", "missing", "invalid", "failure", "fail", "denied", "reject", "not eligible", "no communication")
+            if any(term in requirement_text for term in negative_terms):
+                plan.append({"category": "negative_validation", "label": "Negative behavior", "requirement": requirement,
+                             "acceptance_criteria": criteria, "business_rules": rules})
+            else:
+                gaps.append(f"Negative behavior is not supported by the BRD or source package for {requirement.get('requirement_id')}.")
         return plan[:100], gaps
 
     first_requirement = approved_requirements[0] if approved_requirements else None
     for category, label, terms in categories:
         requirement = first_requirement if category == "happy_path" else _find_requirement_for_terms(approved_requirements, terms)
-        if requirement:
+        if requirement and any(term in _requirement_text(requirement) for term in terms):
             plan.append({"category": category, "label": label, "requirement": requirement})
         else:
-            gaps.append(f"No approved evidence was found for the {label.lower()} category.")
+            gaps.append(f"The BRD or source package does not support the {label.lower()} category.")
     if not plan and first_requirement:
         plan.append({"category": "requirement_validation", "label": "Requirement validation", "requirement": first_requirement})
     while len(plan) < requested_count and plan:
@@ -1230,22 +1326,115 @@ def _test_case_generation_input(approved_requirements, package, requested_count,
             "knowledge_contexts": discovery_contexts,
             "gaps": context_gaps,
         },
-        "retrieved_knowledge_evidence": _rag_context_for_prompt(rag_context, max_evidence=10, max_fragment_characters=650),
+        "retrieved_knowledge_evidence": _rag_context_for_prompt(rag_context, max_evidence=24, max_fragment_characters=1800),
+        "source_package_evidence": [
+            {
+                "source_type": fragment.get("source_type"),
+                "fragment_id": fragment.get("original_fragment_id") or fragment.get("fragment_id"),
+                "source_reference": fragment.get("source_reference"),
+                "text": str(fragment.get("fragment_text") or ""),
+            }
+            for fragment in ((rag_context or {}).get("brd_fragments", []) + (rag_context or {}).get("technical_fragments", []))
+            if fragment.get("fragment_id") or fragment.get("original_fragment_id")
+        ],
         "database_test_data_instruction": {
-            "purpose": "The LLM must infer database presteps and required test data from the approved functional requirements, acceptance criteria, business rules, source package references, and knowledge context.",
+            "purpose": "The LLM must produce execution-ready steps and field-level test data from the approved functional requirements, acceptance criteria, business rules, source package references, and knowledge context.",
             "required_behavior": [
-                "For each test case, identify the concrete database keys and attributes needed before execution.",
-                "Mark generated identifiers such as member_id as created_during_execution instead of inventing actual production values.",
-                "Use setup_step to describe how the execution template or pre-step creates or selects the data.",
+                "Write exactly one action-oriented step for each numbered execution step, using the format Step 1:, Step 2:, and Step 3:.",
+                "For every step, populate actions[].data_inputs with the field names used by that step and include the same fields in data_needs.",
+                "List field-level test data such as member_id, member_status, prescription_id, prescription_status, refill_due_date, and validation_location without inventing actual production identifiers.",
+                "State the validation location explicitly in surfaces and expected_results, such as Gold layer, API response, database table, message queue, or audit log, only when supported by the source package.",
                 "Cite approved requirement, acceptance criterion, business rule, or knowledge context IDs in source.",
                 "Reference table or schema names only when supplied by source package or knowledge context.",
             ],
+        },
+        "execution_table_format": {
+            "columns": ["TC#", "Test Title", "Test Steps", "Test data", "Expected", "Status", "Notes"],
+            "rules": ["Use concise distinct titles.", "Keep steps numbered and action-oriented.", "Keep test data aligned to the step that uses it.", "Start status as Not Run; execution changes it to Pass or Fail."],
         },
         "coverage_gaps": gaps,
         "requirements": [_compact_requirement_for_test_prompt(requirement) for requirement in approved_requirements],
     }
 
-def _validate_test_case_contract(contract, approved_requirements, requested_count=None, discovery_contexts=None, rag_context=None):
+def _ensure_default_case_categories(contract):
+    """Do not fabricate scenarios; the LLM must return source-supported cases."""
+    return
+
+def _normalize_test_case_format(contract):
+    """Keep generated steps and action numbering consistent for table rendering."""
+    for case in contract.get("test_cases", []):
+        steps = case.get("steps") or []
+        normalized_steps = []
+        for index, step in enumerate(steps, 1):
+            text = str(step or "").strip()
+            # Models sometimes return the display prefix even though the UI
+            # adds it. Strip every repeated prefix before storing one canonical
+            # `Step N:` prefix.
+            text = text.replace("\\r\\n", " ").replace("\\n", " ").replace("\r", " ").replace("\n", " ")
+            text = re.sub(r"^(?:step\s*\d+\s*:\s*)+", "", text, flags=re.IGNORECASE).strip()
+            normalized_steps.append(f"Step {index}: {text}")
+        case["steps"] = normalized_steps
+        # Keep the structured test-data contract unique by field name. A field
+        # may be used by several actions, but it should appear once in the
+        # rendered Test data column.
+        unique_data_needs = []
+        seen_data_names = set()
+        for need in case.get("data_needs") or []:
+            name = need if isinstance(need, str) else need.get("name") if isinstance(need, dict) else None
+            key = str(name or "").strip().casefold()
+            if not key or key in seen_data_names:
+                continue
+            seen_data_names.add(key)
+            unique_data_needs.append(need)
+        case["data_needs"] = unique_data_needs
+        for index, action in enumerate(case.get("actions") or [], 1):
+            if isinstance(action, dict):
+                action["step"] = index
+
+def _sanitize_test_case_traceability(contract, approved_requirements):
+    """Keep model traceability IDs scoped to each case's requirement.
+
+    Models occasionally copy an acceptance criterion or business-rule ID from
+    a neighboring requirement. That is a QA finding on the affected case, not
+    a reason to discard every valid case in the response. Remove only the
+    out-of-scope IDs; the coverage validator then reports any remaining gap.
+    """
+    approved_by_id = {item.get("requirement_id"): item for item in approved_requirements}
+    findings = []
+    for test_case in contract.get("test_cases", []) or []:
+        case_id = test_case.get("test_case_id") or "unknown"
+        requirement = approved_by_id.get(test_case.get("requirement_id"))
+        if not requirement:
+            continue
+        allowed_acceptance_ids = {
+            item.get("acceptance_id") for item in requirement.get("acceptance_criteria", [])
+            if isinstance(item, dict) and item.get("acceptance_id")
+        }
+        allowed_rule_ids = {
+            item.get("rule_id") for item in requirement.get("business_rules", [])
+            if isinstance(item, dict) and item.get("rule_id")
+        }
+        for field, allowed, label in (
+            ("acceptance_criteria_ids", allowed_acceptance_ids, "acceptance criterion"),
+            ("business_rule_ids", allowed_rule_ids, "business rule"),
+        ):
+            supplied = list(test_case.get(field) or [])
+            invalid = [item for item in supplied if item not in allowed]
+            if not invalid:
+                continue
+            test_case[field] = [item for item in supplied if item in allowed]
+            findings.append({
+                "finding_id": f"GEN-{len(findings) + 1:03d}",
+                "type": "unapproved_traceability_reference",
+                "severity": "high",
+                "status": "requires_qa_confirmation",
+                "requirement_id": requirement.get("requirement_id"),
+                "scenario": case_id,
+                "message": f"{case_id} cited out-of-scope {label} ID(s): {', '.join(map(str, invalid))}. Invalid IDs were removed; verify coverage for the owning requirement.",
+            })
+    return findings
+
+def _validate_test_case_contract(contract, approved_requirements, requested_count=None, discovery_contexts=None, rag_context=None, enforce_coverage=True):
     discovery_contexts = discovery_contexts or []
     if not isinstance(contract, dict) or not contract.get("test_cases"):
         raise ValueError("The AI returned no test cases")
@@ -1266,20 +1455,64 @@ def _validate_test_case_contract(contract, approved_requirements, requested_coun
     required_categories = {item["category"] for item in plan}
     generated_categories = {case.get("category") for case in contract["test_cases"]}
     missing_categories = sorted(required_categories - generated_categories)
+    coverage_findings = []
     if missing_categories:
-        raise ValueError(f"AI missed required test-case categories: {', '.join(missing_categories)}")
+        coverage_findings.extend({
+            "finding_id": f"GEN-{len(coverage_findings)+1:03d}",
+            "type": "missing_category",
+            "severity": "high",
+            "status": "requires_qa_confirmation",
+            "requirement_id": None,
+            "scenario": category,
+            "message": f"No generated test case covered the required {category} scenario.",
+        } for category in missing_categories)
+        if enforce_coverage:
+            pass
     for entry in plan:
         requirement_id = entry["requirement"].get("requirement_id")
-        criterion_ids = [criterion.get("acceptance_id") for criterion in entry.get("acceptance_criteria", []) if criterion.get("acceptance_id")]
-        rule_ids = [rule.get("rule_id") for rule in entry.get("business_rules", []) if rule.get("rule_id")]
-        for criterion_id in criterion_ids:
-            if not any(case.get("requirement_id") == requirement_id and criterion_id in (case.get("acceptance_criteria_ids") or []) for case in contract["test_cases"]):
-                raise ValueError(f"AI missed required acceptance criterion coverage: {criterion_id}")
-        for rule_id in rule_ids:
-            if not any(case.get("requirement_id") == requirement_id and rule_id in (case.get("business_rule_ids") or []) for case in contract["test_cases"]):
-                raise ValueError(f"AI missed required business rule coverage: {rule_id}")
+        requirement_cases = [case for case in contract["test_cases"] if case.get("requirement_id") == requirement_id]
+        for criterion in entry.get("acceptance_criteria", []):
+            criterion_id = criterion.get("acceptance_id")
+            if not criterion_id:
+                continue
+            exercised = any(
+                criterion_id in (case.get("acceptance_criteria_ids") or [])
+                and _test_case_exercises_item(case, criterion, acceptance=True)
+                for case in requirement_cases
+            )
+            if not exercised:
+                has_reference = any(criterion_id in (case.get("acceptance_criteria_ids") or []) for case in requirement_cases)
+                coverage_findings.append({
+                    "finding_id": f"GEN-{len(coverage_findings)+1:03d}",
+                    "type": "unexercised_acceptance_criterion" if has_reference else "missing_acceptance_criterion",
+                    "severity": "high",
+                    "status": "requires_qa_confirmation",
+                    "requirement_id": requirement_id,
+                    "scenario": criterion_id,
+                    "message": f"Acceptance criterion {criterion_id} is referenced but not exercised by the case steps, data, and expected results." if has_reference else f"No generated test case covered acceptance criterion {criterion_id}.",
+                })
+        for rule in entry.get("business_rules", []):
+            rule_id = rule.get("rule_id")
+            if not rule_id:
+                continue
+            exercised = any(
+                rule_id in (case.get("business_rule_ids") or [])
+                and _test_case_exercises_item(case, rule)
+                for case in requirement_cases
+            )
+            if not exercised:
+                has_reference = any(rule_id in (case.get("business_rule_ids") or []) for case in requirement_cases)
+                coverage_findings.append({
+                    "finding_id": f"GEN-{len(coverage_findings)+1:03d}",
+                    "type": "unexercised_business_rule" if has_reference else "missing_business_rule",
+                    "severity": "high",
+                    "status": "requires_qa_confirmation",
+                    "requirement_id": requirement_id,
+                    "scenario": rule_id,
+                    "message": f"Business rule {rule_id} is referenced but not exercised by the case steps, data, and expected results." if has_reference else f"No generated test case covered business rule {rule_id}.",
+                })
     seen = set()
-    required_fields = ("description", "scenario", "category", "surfaces", "test_data_setup", "deterministic_inputs", "data_needs", "actions", "assertions", "evidence", "validation_results", "cleanup_ownership", "approval")
+    required_fields = ("description", "scenario", "category", "surfaces", "deterministic_inputs", "data_needs", "actions", "assertions", "evidence", "validation_results", "cleanup_ownership", "approval")
     for test_case in contract["test_cases"]:
         case_id = test_case.get("test_case_id")
         requirement_id = test_case.get("requirement_id")
@@ -1288,30 +1521,38 @@ def _validate_test_case_contract(contract, approved_requirements, requested_coun
         seen.add(case_id)
         if not test_case.get("steps") or not test_case.get("expected_results"):
             raise ValueError(f"AI returned an incomplete test case for {requirement_id}")
+        if len(test_case.get("steps", [])) < 1:
+            raise ValueError(f"AI returned {case_id} without an executable step")
+        if len(test_case.get("steps", [])) > 5:
+            raise ValueError(f"AI returned {case_id} with {len(test_case.get('steps', []))} steps; execution cases allow at most 5 numbered steps")
         for field in required_fields:
             if not test_case.get(field):
                 raise ValueError(f"AI returned test case {case_id} without {field}")
-        if not any(item.get("created_during_execution") for item in test_case.get("test_data_setup", []) if isinstance(item, dict)):
-            raise ValueError(f"AI returned test case {case_id} without execution-created database test data")
         item = approved_by_id[requirement_id]
         criterion_ids = {x.get("acceptance_id") for x in item.get("acceptance_criteria", []) if isinstance(x, dict)}
         rule_ids = {x.get("rule_id") for x in item.get("business_rules", []) if isinstance(x, dict)}
         context_ids = {context["context_id"] for context in discovery_contexts}
         valid_evidence_ids = {requirement_id, *criterion_ids, *rule_ids, *context_ids, *rag_fragment_ids}
-        for setup_item in test_case.get("test_data_setup", []):
-            if not isinstance(setup_item, dict):
-                raise ValueError(f"AI returned invalid test data setup for {case_id}")
-            setup_name = str(setup_item.get("name") or "").strip().lower()
-            setup_step = str(setup_item.get("setup_step") or "").strip().lower()
-            setup_source = str(setup_item.get("source") or "").strip()
-            if setup_name in {"data", "test_data", "record", "setup"} or setup_step in {"create test data", "setup test data"}:
-                raise ValueError(f"AI returned generic test data setup for {case_id}")
-            cited_sources = {value.strip() for value in setup_source.replace(";", ",").split(",") if value.strip()}
-            if not cited_sources or not cited_sources <= valid_evidence_ids:
-                raise ValueError(f"AI returned uncited test data setup for {case_id}")
         valid_fragments = {ref.get("fragment_id") for ref in _case_source_refs(item) if ref.get("fragment_id")} | rag_fragment_ids
-        if not set(test_case.get("acceptance_criteria_ids", [])) <= criterion_ids or not set(test_case.get("business_rule_ids", [])) <= rule_ids:
-            raise ValueError(f"AI returned an unapproved evidence reference for {case_id}")
+        invalid_acceptance_ids = sorted(set(test_case.get("acceptance_criteria_ids", [])) - criterion_ids)
+        invalid_rule_ids = sorted(set(test_case.get("business_rule_ids", [])) - rule_ids)
+        if invalid_acceptance_ids or invalid_rule_ids:
+            # Keep validation defensive even when a caller bypasses the
+            # pre-validation traceability sanitizer. A single model typo must
+            # become a QA finding, never abort otherwise usable test cases.
+            if invalid_acceptance_ids:
+                test_case["acceptance_criteria_ids"] = [item for item in test_case.get("acceptance_criteria_ids", []) if item in criterion_ids]
+            if invalid_rule_ids:
+                test_case["business_rule_ids"] = [item for item in test_case.get("business_rule_ids", []) if item in rule_ids]
+            coverage_findings.append({
+                "finding_id": f"GEN-{len(coverage_findings) + 1:03d}",
+                "type": "unapproved_traceability_reference",
+                "severity": "high",
+                "status": "requires_qa_confirmation",
+                "requirement_id": requirement_id,
+                "scenario": case_id,
+                "message": f"Removed out-of-scope traceability IDs from {case_id}: {', '.join(invalid_acceptance_ids + invalid_rule_ids)}.",
+            })
         if discovery_contexts:
             if not set(test_case.get("discovery_context_ids", [])) <= context_ids:
                 raise ValueError(f"AI returned an unknown knowledge context for {case_id}")
@@ -1349,13 +1590,14 @@ def _validate_test_case_contract(contract, approved_requirements, requested_coun
             for ref in test_case.get("source_references", []):
                 if ref.get("fragment_id") and ref.get("fragment_id") not in valid_fragments:
                     raise ValueError(f"AI returned an unknown source fragment for {case_id}")
+    return coverage_findings
 
 @usage_step("test_cases")
 def _test_cases_with_openai(approved_requirements, package, requested_count, discovery_contexts=None, rag_context=None):
     from openai import OpenAI
     # Validation repair is controlled explicitly below; disable hidden SDK
     # retries so a slow request cannot be repeated before our repair logic runs.
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=OPENAI_TIMEOUT_SECONDS, max_retries=0)
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=TEST_CASE_OPENAI_TIMEOUT_SECONDS, max_retries=0)
     payload = _test_case_generation_input(approved_requirements, package, requested_count, discovery_contexts, rag_context)
     base_prompt = TEST_CASE_GENERATION_PROMPT + json.dumps(payload, ensure_ascii=False)
     failures = []
@@ -1367,10 +1609,8 @@ def _test_cases_with_openai(approved_requirements, package, requested_count, dis
                 previous_error = failures[-1]["details"]
                 repair_guidance = (
                     "Correct the specific validation failure while preserving supported case behavior. "
-                    "Every test case must have at least one test_data_setup item whose created_during_execution is true. "
-                    "Use a record key explicitly supported by that case's approved requirement or Knowledge Base evidence; "
-                    "describe how the execution template or pre-step creates it, do not invent a production value, and set "
-                    "source to comma-separated approved evidence IDs only. "
+                    "Do not add pre-steps, setup instructions, setup records, or production identifier values. "
+                    "List required test-data field names in data_needs and cite the requirement through the case evidence. "
                 )
                 missing_case = re.search(r"test case (TC-\d{3})", previous_error, re.IGNORECASE)
                 if missing_case:
@@ -1384,7 +1624,6 @@ def _test_cases_with_openai(approved_requirements, package, requested_count, dis
                         allowed_ids.extend(item.get("acceptance_id") for item in requirement.get("acceptance_criteria", []) if item.get("acceptance_id"))
                         allowed_ids.extend(item.get("rule_id") for item in requirement.get("business_rules", []) if item.get("rule_id"))
                         allowed_ids.extend(context.get("context_id") for context in discovery_contexts or [] if context.get("context_id"))
-                        repair_guidance += f"For {case_id}, use one or more of these evidence IDs in test_data_setup.source: {', '.join(dict.fromkeys(x for x in allowed_ids if x))}. "
                         if "unknown source fragment in evidence" in previous_error.lower():
                             allowed_pairs = _case_source_refs(requirement)
                             for fragment in (rag_context or {}).get("brd_fragments", []) + (rag_context or {}).get("technical_fragments", []):
@@ -1448,14 +1687,40 @@ def _test_cases_with_openai(approved_requirements, package, requested_count, dis
                 raise ValueError("OpenAI returned no test cases")
             contract = json.loads(response.output_text)
             _deduplicate_generated_test_cases(contract)
-            _validate_test_case_contract(contract, approved_requirements, requested_count, discovery_contexts, rag_context)
-            contract["agent_attempts"] = [{"attempt": attempt, "status": "passed", "details": "Schema, evidence, and coverage validation passed."}]
+            _ensure_default_case_categories(contract)
+            _normalize_test_case_format(contract)
+            traceability_findings = _sanitize_test_case_traceability(contract, approved_requirements)
+            coverage_findings = _validate_test_case_contract(contract, approved_requirements, requested_count, discovery_contexts, rag_context)
+            all_findings = traceability_findings + coverage_findings
+            contract["agent_attempts"] = [{"attempt": attempt, "status": "passed_with_findings" if all_findings else "passed", "details": "Schema and evidence validation passed; generation findings require QA confirmation." if all_findings else "Schema, evidence, and coverage validation passed."}]
             contract.setdefault("global_gaps", []).extend(payload["context"]["gaps"] + payload.get("coverage_gaps", []))
+            contract["generation_findings"] = all_findings
             return contract
         except Exception as exc:
             if "contract" in locals() and isinstance(contract, dict):
                 previous_invalid_output = contract
             failures.append({"attempt": attempt, "status": "failed", "details": safe_llm_error_message(exc)})
+    # Preserve usable cases when one or more cases fail strict evidence
+    # validation. The failed cases become explicit QA findings instead of
+    # discarding the entire generation.
+    if isinstance(previous_invalid_output, dict):
+        usable_cases = []
+        findings = []
+        for candidate in previous_invalid_output.get("test_cases", []) or []:
+            candidate_contract = {**previous_invalid_output, "test_cases": [candidate]}
+            try:
+                traceability_findings = _sanitize_test_case_traceability(candidate_contract, approved_requirements)
+                _validate_test_case_contract(candidate_contract, approved_requirements, requested_count, discovery_contexts, rag_context, enforce_coverage=False)
+                usable_cases.append(candidate)
+                findings.extend(traceability_findings)
+            except Exception as exc:
+                findings.append({"finding_id": f"GEN-{len(findings)+1:03d}", "type": "generation_failure", "severity": "high", "status": "requires_qa_confirmation", "requirement_id": candidate.get("requirement_id"), "scenario": candidate.get("test_case_id"), "message": safe_llm_error_message(exc)})
+        if usable_cases:
+            salvaged = dict(previous_invalid_output)
+            salvaged["test_cases"] = usable_cases
+            salvaged["generation_findings"] = findings + [{"finding_id": f"GEN-{len(findings)+1:03d}", "type": "generation_attempt", "severity": "high", "status": "requires_qa_confirmation", "requirement_id": None, "scenario": None, "message": failures[-1]["details"]}]
+            salvaged["agent_attempts"] = [{"attempt": TEST_CASE_GENERATION_MAX_ATTEMPTS, "status": "passed_with_findings", "details": "Usable test cases were retained; failed scenarios were recorded for QA confirmation."}]
+            return salvaged
     raise ValueError(f"LLM test-case generation failed validation after {TEST_CASE_GENERATION_MAX_ATTEMPTS} attempts: {failures[-1]['details']}")
 
 def _normalized_case_text(test_case):
@@ -1502,16 +1767,6 @@ def _deduplicate_generated_test_cases(contract):
                 if encoded not in seen:
                     values.append(item)
                     seen.add(encoded)
-        setup_by_name = {str(item.get("name") or "").strip().lower(): item for item in existing.get("test_data_setup", []) if isinstance(item, dict)}
-        for setup in test_case.get("test_data_setup", []) or []:
-            name = str(setup.get("name") or "").strip().lower() if isinstance(setup, dict) else ""
-            current = setup_by_name.get(name) if name else None
-            if current is None:
-                existing.setdefault("test_data_setup", []).append(setup)
-                if name: setup_by_name[name] = setup
-            else:
-                sources = list(dict.fromkeys([value.strip() for value in f"{current.get('source', '')},{setup.get('source', '')}".split(",") if value.strip()]))
-                current["source"] = ",".join(sources)
 
     for index, test_case in enumerate(merged, 1):
         test_case["test_case_id"] = f"TC-{index:03d}"
@@ -1828,13 +2083,12 @@ def get_project(project_id: str):
 @app.post("/api/v1/projects/{project_id}/sources")
 async def upload_source(project_id: str, file: UploadFile = File(...), source_type: str = Form(...), owner: str | None = Form(None), owner_version: str | None = Form(None), brd_source_id: str | None = Form(None), required_sections: str | None = Form(None), background_tasks: BackgroundTasks = None):
     if source_type not in SOURCE_TYPES: raise HTTPException(422, "Unsupported source type")
-    if source_type != "brd" and not brd_source_id: raise HTTPException(422, "Supporting sources must reference a BRD source")
     content = await read_upload_with_limit(file)
     init_db()
     with connection() as conn:
         if not conn.execute("SELECT project_id FROM project WHERE project_id=%s", (project_id,)).fetchone():
             raise HTTPException(404, "Project not found")
-        if source_type != "brd":
+        if source_type != "brd" and brd_source_id:
             brd = conn.execute("SELECT * FROM source_document WHERE source_id=%s AND project_id=%s", (brd_source_id, project_id)).fetchone()
             if not brd: raise HTTPException(422, "Associated BRD was not found in this project")
             if brd["source_type"] != "brd": raise HTTPException(422, "Associated source must be a BRD")
@@ -1842,7 +2096,7 @@ async def upload_source(project_id: str, file: UploadFile = File(...), source_ty
             brd_revision = conn.execute("SELECT status FROM source_revision WHERE revision_id=%s", (brd["active_revision_id"],)).fetchone()
             brd_extraction = conn.execute("SELECT status FROM source_extraction WHERE revision_id=%s ORDER BY created_at DESC LIMIT 1", (brd["active_revision_id"],)).fetchone()
             if not brd_revision or brd_revision["status"] in {"rejected", "extraction_failed"} or not brd_extraction or brd_extraction["status"] != "succeeded":
-                raise HTTPException(422, "Associated BRD must finish extraction successfully before adding supporting sources")
+                raise HTTPException(422, "Associated BRD is not ready; upload this source without a BRD link and it will be attached automatically when the BRD is ready")
     try: detected_type, messages = validate_file_content(file.filename or "source", content, file.content_type)
     except ValueError as exc:
         source_id, revision_id = uid("src"), uid("rev"); path = UPLOAD_DIR / f"{revision_id}_{Path(file.filename or 'source').name}"; path.write_bytes(content)
@@ -2034,7 +2288,8 @@ def create_manifest(project_id: str, request: ManifestRequest, background_tasks:
             if source["source_type"] != "brd":
                 placeholders = ",".join(["%s"] * len(brds))
                 relation = conn.execute(f"SELECT 1 FROM source_relationship WHERE supporting_source_id=%s AND brd_source_id IN ({placeholders})", tuple([source["source_id"]] + [brd["source_id"] for brd in brds])).fetchone()
-                if not relation: raise HTTPException(422, f"Supporting source '{source['logical_name']}' is not linked to a BRD in this package")
+                if not relation:
+                    conn.execute("INSERT INTO source_relationship (relationship_id,brd_source_id,supporting_source_id,relationship_type,created_at) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (brd_source_id,supporting_source_id) DO NOTHING", (uid("rel"), brds[0]["source_id"], source["source_id"], "supports", now()))
             resolved.append((source, revision))
         manifest_payload = sorted(([{"revision_id": revision["revision_id"], "content_hash": revision["sha256"]} for _, revision in resolved]), key=lambda item: item["revision_id"])
         manifest_hash = hashlib.sha256(json.dumps(manifest_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
@@ -2057,7 +2312,10 @@ def create_manifest(project_id: str, request: ManifestRequest, background_tasks:
             items.append({"source_id": source["source_id"], "revision_id": revision["revision_id"], "ingestion_status": revision["extraction_status"], "content_hash": revision["sha256"], "model_name": revision["model_name"], "prompt_version": revision["prompt_version"], "config_version": revision["config_version"], "extractor_version": revision["extractor_version"], "prompt_hash": revision["prompt_hash"], "config_hash": revision["config_hash"]})
         _ensure_package_business_rules(conn, package_id)
         _refresh_package_business_rule_summary(conn, package_id)
-        return {"package_id": package_id, "project_id": project_id, "package_version": version, "package_name": package_name, "scope": request.scope, "manifest_hash": manifest_hash, "lifecycle_status": "ready", "run_id": run_id, "knowledge_build_status": "awaiting_rule_review", "items": items}
+        result = {"package_id": package_id, "project_id": project_id, "package_version": version, "package_name": package_name, "scope": request.scope, "manifest_hash": manifest_hash, "lifecycle_status": "ready", "run_id": run_id, "knowledge_build_status": "queued", "items": items}
+        if background_tasks is not None:
+            background_tasks.add_task(_build_knowledge_for_package, package_id)
+        return result
 
 @app.get("/api/v1/projects/{project_id}/manifests")
 def list_manifests(project_id: str):
@@ -2434,7 +2692,9 @@ def _business_requirements_with_openai(package, items, fragments, rag_context=No
     if not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY is not configured")
     from openai import OpenAI
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=OPENAI_TIMEOUT_SECONDS)
+    # A single controlled request is easier to bound than the SDK's default
+    # retry loop, which previously consumed the entire endpoint timeout.
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=OPENAI_TIMEOUT_SECONDS, max_retries=0)
 
     use_knowledge_base = bool(rag_context and rag_context.get("brd_fragments"))
     source_type_by_id = {item.get("source_id"): item.get("source_type") for item in items}
@@ -2566,6 +2826,21 @@ def _generate_functional_contract(package, items, fragments, approved_business_r
     key = os.getenv("OPENAI_API_KEY")
     if not key:
         raise RuntimeError("OPENAI_API_KEY is not configured")
+    # Business Requirements generated by the current contract use
+    # `description`; older approved-review contracts use `text`. Normalize at
+    # this boundary so Functional Requirements generation never fails with a
+    # raw KeyError when both contract versions are present.
+    normalized_business_requirements = []
+    for business in approved_business_requirements:
+        item = dict(business)
+        item["text"] = str(item.get("text") or item.get("description") or item.get("business_use_case") or "").strip()
+        if not item["text"]:
+            continue
+        item.setdefault("source_references", [])
+        normalized_business_requirements.append(item)
+    approved_business_requirements = normalized_business_requirements
+    if not approved_business_requirements:
+        raise ValueError("No usable business requirements were available for Functional Requirements generation")
     approved_ids = {item["business_requirement_id"] for item in approved_business_requirements}
     retrieved_evidence = _rag_context_for_prompt(rag_context, max_evidence=20, max_fragment_characters=700, max_rules=12, max_rule_characters=320)
     if not retrieved_evidence.get("evidence"):
@@ -2577,7 +2852,15 @@ def _generate_functional_contract(package, items, fragments, approved_business_r
         for ref in business.get("source_references", [])
         if ref.get("fragment_id")
     }
-    allowed_fragments = [item for item in fragments if item.get("fragment_id") in evidence_ids | approved_reference_ids]
+    # Retrieval returns Knowledge Base chunk IDs, while the package fragment
+    # table contains the original extractor fragment IDs. Keep the retrieved
+    # chunks as citation-valid fragments so the LLM can ground requirements in
+    # both BRD and technical evidence without losing the source references.
+    retrieved_fragments = (rag_context or {}).get("brd_fragments", []) + (rag_context or {}).get("technical_fragments", [])
+    allowed_fragments = [
+        item for item in [*fragments, *retrieved_fragments]
+        if item.get("fragment_id") in evidence_ids | approved_reference_ids
+    ]
     fragment_metadata = {item.get("fragment_id"): item for item in allowed_fragments}
     for business in approved_business_requirements:
         for ref in business.get("source_references", []):
@@ -2589,20 +2872,20 @@ def _generate_functional_contract(package, items, fragments, approved_business_r
                 ) if fragment.get(field) is not None})
     from openai import OpenAI
     payload = {
-        "approved_business_use_cases": approved_business_requirements,
+        "source_business_rules": approved_business_requirements,
         "retrieved_knowledge_base_evidence": retrieved_evidence,
     }
     prompt = (
-        "Generate Functional Requirements using only the approved_business_use_cases and retrieved_knowledge_base_evidence below. "
-        "The approved business use cases define the allowed scope. Use the Knowledge Base to provide the package context, system behavior, entities, rules, and implementation detail needed to make each requirement testable. "
-        "Do not use or infer from any other package sources or structured context. Do not expand scope beyond approved use cases. "
-        "Every requirement must link to one or more supplied business_requirement_ids and cite only source fragments from the approved use cases or retrieved Knowledge Base evidence. "
+        "Generate internal functional behavior context using only the source_business_rules and retrieved_knowledge_base_evidence below. "
+        "The source rules define the allowed scope. Use the Knowledge Base to provide the package context, system behavior, entities, rules, and implementation detail needed to make each requirement testable. "
+        "Do not use or infer from any other package sources or structured context. Do not expand scope beyond the source rules. "
+        "Every requirement must link to one or more supplied business_requirement_ids and cite only source fragments from the source rules or retrieved Knowledge Base evidence. "
         "Set knowledge_context_ids to an empty array; cite Knowledge Base evidence using source_references. Create clear system behaviors, business rules, flow steps, testable acceptance criteria, and at least one observable expected outcome for every requirement. "
         "Each acceptance criterion must include a concise scenario and one or more Given conditions. Report a technical gap only when retrieved technical evidence directly supports it, and copy the exact source_reference into technical_reference. "
-        "Do not introduce thresholds, values, or behavior that are absent from the cited evidence. Do not return unapproved business use cases.\n\nINPUT JSON:\n"
+        "Do not introduce thresholds, values, or behavior that are absent from the cited evidence.\n\nINPUT JSON:\n"
         + json.dumps(payload, ensure_ascii=False)
     )
-    client = OpenAI(api_key=key, timeout=OPENAI_TIMEOUT_SECONDS)
+    client = OpenAI(api_key=key, timeout=OPENAI_TIMEOUT_SECONDS, max_retries=0)
     previous_output = None
     validation_error = None
     response = None
@@ -2613,6 +2896,7 @@ def _generate_functional_contract(package, items, fragments, approved_business_r
                 "Repair the previous Functional Requirements JSON. Return the complete corrected object. "
                 "Use only the exact fragment_id and source_reference pairs present in the supplied approved use cases "
                 "and retrieved Knowledge Base evidence. Do not cite acceptance-criterion IDs or invent evidence IDs. "
+                "For every technical gap, set technical_reference to exactly one source_reference value from that gap's source_references array. "
                 f"Validation error: {validation_error}\n\nPREVIOUS INVALID RESPONSE:\n{previous_output}\n\nORIGINAL INPUT:\n{prompt}"
             )
         response = responses_create(client,
@@ -2645,7 +2929,7 @@ def _generate_functional_contract(package, items, fragments, approved_business_r
         requirement["approved"] = False
         requirement["review_status"] = "pending"
         requirement["business_rules"] = [
-            {"rule_id": business["business_requirement_id"], "text": business["text"], "approved": True, "review_status": "approved", "mapping_basis": "Linked by the Functional Requirement generator to an approved Business Use Case", "origin": "approved_business_use_case", "source_references": business.get("source_references", [])}
+            {"rule_id": business["business_requirement_id"], "text": business.get("text") or business.get("description") or "", "approved": True, "review_status": "approved", "mapping_basis": "Linked by the Functional Requirement generator to an approved Business Use Case", "origin": "approved_business_use_case", "source_references": business.get("source_references", [])}
             for business in approved_business_requirements if business["business_requirement_id"] in requirement["business_requirement_ids"]
         ]
         for criterion in requirement.get("acceptance_criteria", []):
@@ -2679,6 +2963,73 @@ def _generate_functional_contract(package, items, fragments, approved_business_r
     contract["conflicts"] = contract.get("conflicting_requirements", [])
     return contract
 
+def _generate_functional_contract_with_timeout(package, items, fragments, approved_business_requirements, rag_context):
+    result, failure = [], []
+
+    def run():
+        try:
+            with usage_scope("functional_requirements", project_id=package.get("project_id"), package_id=package.get("package_id")):
+                result.append(_generate_functional_contract(package, items, fragments, approved_business_requirements, rag_context))
+        except Exception as exc:
+            failure.append(exc)
+
+    worker_context = copy_context()
+    worker = threading.Thread(target=lambda: worker_context.run(run), daemon=True)
+    worker.start()
+    worker.join(OPENAI_TIMEOUT_SECONDS + 5)
+    if result:
+        return result[0]
+    if failure:
+        raise failure[0]
+    raise TimeoutError(f"Functional Requirements timed out after {OPENAI_TIMEOUT_SECONDS + 5:g} seconds")
+
+def _build_internal_generation_context(package, items, fragments, source_rules):
+    """Create traceable working context without an intermediate LLM call."""
+    fragment_map = {item.get("fragment_id"): item for item in fragments}
+    requirements = []
+    for index, rule in enumerate(source_rules, 1):
+        # Package rule primary keys are opaque database IDs. Use stable
+        # contract IDs for the LLM schema and traceability fields.
+        rule_id = f"BR-{index:03d}"
+        statement = str(rule.get("text") or "").strip()
+        if not statement:
+            continue
+        refs = [ref for ref in rule.get("source_references", []) if ref.get("fragment_id") in fragment_map]
+        requirement_id = f"FR-{index:03d}"
+        criterion = {
+            "acceptance_id": f"AC-{index:03d}",
+            "scenario": "The documented behavior is evaluated",
+            "given": ["The documented preconditions are satisfied."],
+            "when": statement,
+            "then": "The system follows the documented behavior.",
+            "text": "The system follows the documented behavior.",
+            "source_references": refs,
+            "review_status": "generated",
+        }
+        requirements.append({
+            "requirement_id": requirement_id, "title": statement[:160], "type": "source_rule",
+            "statement": statement, "priority": "Must have", "actors": ["System"], "entities": [],
+            "business_requirement_ids": [rule_id], "business_rules": [{
+                "rule_id": rule_id, "text": statement, "approved": True,
+                "review_status": "generated", "source_references": refs,
+            }], "acceptance_criteria": [criterion],
+            "expected_outcomes": [{"outcome_id": f"EO-{index:03d}", "text": "The documented outcome is observable.", "source_references": refs}],
+            "flow_steps": [statement], "ambiguities": [], "assumptions": [],
+            "source_references": refs, "review_status": "generated", "approved": True,
+        })
+    timestamp = now()
+    return {
+        "contract_version": "internal-context-1.0", "document_type": "test_generation_context",
+        "schema_version": "testiq.test-generation-context.v1", "package_id": package["package_id"],
+        "project_id": package["project_id"], "package_scope": package.get("scope"),
+        "requirements": requirements, "approved_items": [item["requirement_id"] for item in requirements],
+        "approved_business_requirements": source_rules,
+        "source_package_items": [{"source_id": item["source_id"], "revision_id": item["revision_id"], "source_type": item["source_type"], "logical_name": item["logical_name"], "sha256": item["sha256"]} for item in items],
+        "generated_at": timestamp, "generation_mode": "deterministic_source_context",
+        "functional_requirements_generation": True, "quality_controls": {"source_citations_required": True, "human_review_required": False},
+        "readiness": {"status": "ready", "checks": [], "gaps": []}, "conflicts": [],
+    }
+
 
 @app.post("/api/v1/packages/{package_id}/functional-requirements/generate", status_code=201)
 @usage_step("functional_requirements")
@@ -2691,24 +3042,6 @@ def generate_functional_requirements(package_id: str):
         not_ready = [item["logical_name"] for item in source_items if item["extraction_status"] != "succeeded"]
         if not_ready:
             raise HTTPException(422, f"Functional Requirements cannot be generated until extraction succeeds for: {', '.join(not_ready)}")
-        prior_analyses = conn.execute("SELECT * FROM requirement_analysis WHERE package_id=%s ORDER BY analysis_version DESC", (package_id,)).fetchall()
-        approved = []
-        for prior in prior_analyses:
-            prior_contract = json.loads(prior["contract_json"])
-            if prior_contract.get("functional_requirements_generation"):
-                continue
-            approved = _approved_business_requirements(prior_contract)
-            if approved:
-                break
-        if not approved:
-            for prior in prior_analyses:
-                prior_contract = json.loads(prior["contract_json"])
-                if prior_contract.get("functional_requirements_generation"):
-                    approved = prior_contract.get("approved_business_requirements", [])
-                    if approved:
-                        break
-        if not approved:
-            raise HTTPException(409, "Approve at least one Business Use Case before generating Functional Requirements")
         revision_ids = [item["revision_id"] for item in source_items]
         fragments = conn.execute(f"SELECT * FROM source_fragment WHERE revision_id IN ({','.join('%s' for _ in revision_ids)}) ORDER BY revision_id,fragment_index", revision_ids).fetchall()
         package_row = row_dict(package)
@@ -2717,33 +3050,32 @@ def generate_functional_requirements(package_id: str):
         source_types = {item["revision_id"]: item["source_type"] for item in item_rows}
         for fragment in fragment_rows:
             fragment["source_type"] = source_types.get(fragment.get("revision_id"))
-    if not os.getenv("OPENAI_API_KEY"):
-        raise HTTPException(503, "Functional Requirement generation requires OpenAI. Configure OPENAI_API_KEY and retry.")
     try:
         rag = _require_package_context(package_id, requested_by="Functional Requirements")
-    except HTTPException as exc:
-        if exc.status_code in {409, 422, 502, 503}:
-            raise HTTPException(409, "Build the Knowledge Base for this Resource Package before generating Functional Requirements.") from exc
+        if not rag.get("brd_fragments"):
+            raise HTTPException(422, "Functional Requirements require a BRD in the ready Knowledge Base")
+        # Generate business scope and functional behavior from the same
+        # package-scoped Knowledge Base. No human approval gate is involved;
+        # the generated contract is the working source for test generation.
+        business_items = _business_requirements_with_timeout(package_row, item_rows, fragment_rows, rag)
+        if not business_items:
+            raise HTTPException(422, "The LLM returned no business requirements from the BRD evidence")
+        contract = _generate_functional_contract_with_timeout(package_row, item_rows, fragment_rows, business_items, rag)
+    except HTTPException:
         raise
-    try:
-        contract = _generate_functional_contract(package_row, item_rows, fragment_rows, approved, rag)
     except Exception as exc:
         detail = safe_llm_error_message(exc)
-        if isinstance(exc, TimeoutError):
-            message = "OpenAI timed out while generating Functional Requirements. Check service availability and retry."
-        elif "api key" in detail.lower() or "invalid_api_key" in detail.lower():
-            message = "OpenAI rejected the configured API key. Check OPENAI_API_KEY and retry."
-        elif isinstance(exc, ValueError):
-            message = f"OpenAI returned Functional Requirements that failed validation: {detail}. Review the model response or configuration and retry."
-        else:
-            message = f"OpenAI Functional Requirement generation failed: {detail}. Review the OpenAI configuration and retry."
-        raise HTTPException(502, message) from exc
-    contract["rag_metadata"] = _rag_metadata_or_none(rag)
+        if isinstance(exc, TimeoutError) or "timed out" in detail.lower() or "timeout" in detail.lower():
+            raise HTTPException(502, "OpenAI timed out while generating grounded Functional Requirements. Check service availability and retry.") from exc
+        if "api key" in detail.lower() or "invalid_api_key" in detail.lower():
+            raise HTTPException(502, "OpenAI rejected the configured API key. Check OPENAI_API_KEY and retry.") from exc
+        raise HTTPException(502, f"Grounded Functional Requirements generation failed: {detail}") from exc
+    contract["rag_metadata"] = rag.get("rag_metadata")
     contract["rag_status"] = _rag_status(rag, required=True)
     with connection() as conn:
         version = conn.execute("SELECT COALESCE(MAX(analysis_version),0)+1 AS v FROM requirement_analysis WHERE package_id=%s", (package_id,)).fetchone()["v"]
         analysis_id, timestamp = uid("req"), now()
-        conn.execute("INSERT INTO requirement_analysis (analysis_id,package_id,project_id,analysis_version,status,analysis_kind,contract_json,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)", (analysis_id, package_id, package_row["project_id"], version, "needs_review", "functional", json.dumps(contract), timestamp, timestamp))
+        conn.execute("INSERT INTO requirement_analysis (analysis_id,package_id,project_id,analysis_version,status,analysis_kind,contract_json,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)", (analysis_id, package_id, package_row["project_id"], version, "generated", "functional", json.dumps(contract), timestamp, timestamp))
         return _analysis_response(conn.execute("SELECT * FROM requirement_analysis WHERE analysis_id=%s", (analysis_id,)).fetchone(), 0)
 
 
@@ -2956,7 +3288,7 @@ def generate_test_cases_from_analysis(analysis_id: str, request: TestCaseGenerat
         if not analysis: raise HTTPException(404, "Requirement analysis not found")
         contract = _clean_requirement_contract(json.loads(analysis["contract_json"]))
         approved_requirements = _approved_requirement_payload(contract)
-        if not approved_requirements: raise HTTPException(422, "Approve at least one requirement before generating test cases")
+        if not approved_requirements: raise HTTPException(422, "Generate the project requirements context before generating test cases")
         package = conn.execute("SELECT * FROM source_package_manifest WHERE package_id=%s", (analysis["package_id"],)).fetchone()
         if not package: raise HTTPException(404, "Source package not found")
         package_row = row_dict(package)
@@ -2975,6 +3307,7 @@ def generate_test_cases_from_analysis(analysis_id: str, request: TestCaseGenerat
         for test_case in generated.get("test_cases", []):
             test_case["review_status"] = "pending"
             test_case["approved"] = False
+            test_case["execution_status"] = "not_run"
         _apply_coverage_and_quality_review(generated, approved_requirements, timestamp)
         conn.execute("INSERT INTO test_case_generation (generation_id,analysis_id,package_id,project_id,status,contract_json,model_name,prompt_version,prompt_hash,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (generation_id, analysis_id, package["package_id"], package["project_id"], "ready", json.dumps(generated), generated["generation_model"], TEST_CASE_GENERATION_PROMPT_VERSION, test_case_generation_prompt_hash(), timestamp, timestamp))
         return {"generation_id": generation_id, **generated}
@@ -3052,7 +3385,7 @@ def regenerate_test_cases(generation_id: str, request: TestCaseRegenerationReque
         requirement_contract = json.loads(analysis["contract_json"])
         approved_requirements = _approved_requirement_payload(requirement_contract)
         if not approved_requirements:
-            raise HTTPException(422, "Approve at least one requirement before regenerating test cases")
+            raise HTTPException(422, "Generate the project requirements context before regenerating test cases")
 
         parent_contract = json.loads(parent["contract_json"])
         parent_cases = parent_contract.get("test_cases", [])
@@ -3115,6 +3448,7 @@ def regenerate_test_cases(generation_id: str, request: TestCaseRegenerationReque
         for test_case in generated.get("test_cases", []):
             test_case["review_status"] = "pending"
             test_case["approved"] = False
+            test_case["execution_status"] = "not_run"
             test_case["regenerated_from_generation_id"] = generation_id
             if selected_ids:
                 test_case["regeneration_source_test_case_ids"] = selected_ids
@@ -3208,6 +3542,32 @@ def _create_execution_run(conn, generation_id: str, request: ExecutionRunRequest
     conn.execute("INSERT INTO test_run (run_id,package_id,project_id,status,configuration_snapshot,generation_id,selected_test_case_ids_json,frozen_contract_json,baseline_hash,reviewer,review_comments,lifecycle_state,approved_at,immutable_observations_json,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (run_id, row["package_id"], row["project_id"], "selected", json.dumps(configuration_snapshot), generation_id, json.dumps(request.selected_test_case_ids), json.dumps(frozen_contract), baseline_hash, request.reviewer, request.comments, "selected", timestamp, json.dumps(observations), timestamp))
     return _test_run_response(conn.execute("SELECT * FROM test_run WHERE run_id=%s", (run_id,)).fetchone(), conn)
 
+def _persist_generation_execution_statuses(conn, generation_id: str, test_case_ids: list[str], statuses: list[str]) -> None:
+    """Reflect completed execution outcomes on the generated test-case contract."""
+    # The local SQLite adapter does not support PostgreSQL's FOR UPDATE clause;
+    # the surrounding execution transaction already serializes this update.
+    row = conn.execute("SELECT contract_json FROM test_case_generation WHERE generation_id=%s", (generation_id,)).fetchone()
+    if not row:
+        return
+    contract = json.loads(row["contract_json"] or "{}")
+    status_by_case = dict(zip(test_case_ids, statuses))
+    changed = False
+    for test_case in contract.get("test_cases", []) or []:
+        outcome = status_by_case.get(test_case.get("test_case_id"))
+        if outcome == "passed":
+            next_status = "pass"
+        elif outcome == "failed":
+            next_status = "fail"
+        else:
+            # CDP is still processing; retain the explicit not-run state until
+            # a completed pass/fail result is available.
+            next_status = "not_run"
+        if test_case.get("execution_status") != next_status:
+            test_case["execution_status"] = next_status
+            changed = True
+    if changed:
+        conn.execute("UPDATE test_case_generation SET contract_json=%s,updated_at=%s WHERE generation_id=%s", (json.dumps(contract), now(), generation_id))
+
 
 @app.get("/api/v1/test-case-generations/{generation_id}/execution-runs")
 def list_execution_runs_for_generation(generation_id: str):
@@ -3261,6 +3621,7 @@ def execute_run(run_id: str, request: ExecutionRunExecuteRequest | None = None):
             )
             for test_case_id in selected_case_ids
         ]
+        _persist_generation_execution_statuses(conn, row["generation_id"], selected_case_ids, statuses)
         completed_at = now()
         passed = sum(status == "passed" for status in statuses)
         failed = sum(status == "failed" for status in statuses)
@@ -3640,7 +4001,7 @@ def _derive_test_data_templates_with_openai(case_ids, cases, rag_context):
     from openai import OpenAI
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=OPENAI_TIMEOUT_SECONDS)
     selected_cases = [
-        {key: cases[case_id].get(key) for key in ("test_case_id", "title", "description", "scenario", "preconditions", "test_data_setup", "data_needs", "steps", "expected_results", "deterministic_inputs") if cases[case_id].get(key) is not None}
+        {key: cases[case_id].get(key) for key in ("test_case_id", "title", "description", "scenario", "preconditions", "data_needs", "steps", "expected_results", "deterministic_inputs") if cases[case_id].get(key) is not None}
         for case_id in case_ids
     ]
     prompt = {
@@ -3694,7 +4055,7 @@ _TEST_DATA_DOMAIN_ENTITIES = ("member", "prescription", "refill", "communication
 
 def _test_case_text(test_case):
     parts = []
-    for key in ("test_case_id", "title", "description", "scenario", "preconditions", "test_data_setup", "data_needs", "steps", "expected_results", "deterministic_inputs"):
+    for key in ("test_case_id", "title", "description", "scenario", "preconditions", "data_needs", "steps", "expected_results", "deterministic_inputs"):
         value = test_case.get(key)
         if value is not None:
             parts.append(json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value))
@@ -3773,13 +4134,6 @@ def _required_test_data_sections(test_case):
     for section, terms in _TEST_DATA_SECTION_TERMS.items():
         if any(term in text for term in terms):
             sections.add(section)
-    for item in test_case.get("test_data_setup") or []:
-        if not isinstance(item, dict):
-            continue
-        name = str(item.get("name") or "").lower()
-        for section, terms in _TEST_DATA_SECTION_TERMS.items():
-            if section in name or any(term in name for term in terms):
-                sections.add(section)
     if len(sections) == 1:
         sections.add("member")
     if {"prescription", "communication", "campaign", "eligibility_decision"} & sections:
@@ -3994,7 +4348,7 @@ def _generate_test_data_with_openai(templates):
         prompt = {
             "instructions": "Generate synthetic scenario data for each approved test case using only the supplied versioned BronzeBox template and the approved case including its pre-step setup. Return exactly one complete template-shaped record for every listed test case. Preserve every key and value type. Every array must keep exactly the same number of items as the corresponding template array: fill existing object entries, do not add or remove items, and keep empty template arrays empty. Make values satisfy the case, including negative, boundary, eligibility, refill, and member-to-prescription relationship requirements. If required_prescription_eligibleInd is supplied, copy it into the template's eligible_ind field exactly. Use fictional test data. Copy source_event_id and source_correlation_id from the template; TestIQ replaces those values with run-specific trace IDs before Bronze insertion. Do not add fields or explanations.",
             "template": {"entity_name": template["entity_name"], "template_name": template["template_name"], "payload_shape_and_examples": template["payload"]},
-            "approved_test_cases": [{**{key: case.get(key) for key in ("test_case_id", "title", "description", "scenario", "preconditions", "test_data_setup", "data_needs", "actions", "steps", "expected_results", "deterministic_inputs") if case.get(key) is not None}, **({"required_prescription_eligibleInd": _test_data_eligibility_expectation(case)} if "eligible_ind" in template["payload"] and _test_data_eligibility_expectation(case) is not None else {})} for case in case_batch],
+            "approved_test_cases": [{**{key: case.get(key) for key in ("test_case_id", "title", "description", "scenario", "preconditions", "data_needs", "actions", "steps", "expected_results", "deterministic_inputs") if case.get(key) is not None}, **({"required_prescription_eligibleInd": _test_data_eligibility_expectation(case)} if "eligible_ind" in template["payload"] and _test_data_eligibility_expectation(case) is not None else {})} for case in case_batch],
         }
         response = responses_create(client,
             model=OPENAI_MODEL,
@@ -4083,7 +4437,7 @@ def _stamp_pharmacy_event_fields(payload, generation_id, test_case_id, timestamp
     return payload
 
 def _pharmacy_case_text(test_case):
-    return " ".join(str(test_case.get(key) or "") for key in ("title", "description", "scenario", "preconditions", "steps", "expected_results", "assertions", "test_data_setup", "data_needs")).lower()
+    return " ".join(str(test_case.get(key) or "") for key in ("title", "description", "scenario", "preconditions", "steps", "expected_results", "assertions", "data_needs")).lower()
 
 def _validate_pharmacy_notification(payload, test_case, seen_member_ids=None, seen_phones=None, seen_event_ids=None, seen_correlations=None, seen_times=None):
     template = _pharmacy_notification_template()["payload"]
@@ -4242,7 +4596,7 @@ def generate_test_data(generation_id: str, request: TestDataGenerationRequest):
                 )
                 _validate_domain_template_payload(prescription_payload, prescription_template, test_case, member_id)
                 case_payloads.append((prescription_template, prescription_payload))
-            pre_steps = test_case.get("test_data_setup") or []
+            pre_steps = []
             schema_context = []
             for record_template, payload in case_payloads:
                 template_version = record_template["version"]
@@ -5241,4 +5595,3 @@ def get_token_usage(project_id: str | None = None, package_id: str | None = None
 
 @app.exception_handler(ValueError)
 async def value_error(_, exc): return JSONResponse(status_code=422, content={"detail":str(exc)})
-

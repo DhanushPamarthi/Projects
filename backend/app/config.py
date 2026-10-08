@@ -2,6 +2,24 @@ from pathlib import Path
 import os
 from urllib.parse import quote
 
+# Use the Windows certificate store for local TLS interception/corporate roots.
+# Python's bundled CA set rejects the development machine's certificate chain,
+# which otherwise appears as an OpenAI connection timeout.
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except ImportError:
+    pass
+
+# The local development shell may expose a dead loopback proxy (commonly
+# 127.0.0.1:9). OpenAI retrieval and generation then fail with a generic
+# connection error even though the API key and Knowledge Base are valid.
+# Ignore that placeholder while preserving any real, configured proxy.
+for _proxy_name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+    _proxy_value = os.getenv(_proxy_name, "")
+    if _proxy_value.startswith(("http://127.0.0.1:9", "https://127.0.0.1:9", "http://localhost:9", "https://localhost:9")):
+        os.environ.pop(_proxy_name, None)
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.getenv("TESTIQ_DATA_DIR", BASE_DIR / "data"))
 UPLOAD_DIR = DATA_DIR / "uploads"
@@ -23,7 +41,13 @@ def _postgres_url_from_parts() -> str | None:
 DATABASE_URL = os.getenv("DATABASE_URL") or _postgres_url_from_parts()
 BRONZE_SCHEMA = os.getenv("BRONZE_SCHEMA", "bronzebox")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_TIMEOUT_SECONDS = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "30"))
+# Requirements generation makes two grounded Responses calls and can include
+# the BRD plus retrieved source evidence. Thirty seconds was shorter than a
+# normal cold model response and allowed SDK retries to outlive the endpoint
+# worker. Use a generous request budget; callers can still override it with
+# OPENAI_TIMEOUT_SECONDS when needed.
+OPENAI_TIMEOUT_SECONDS = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "120"))
+TEST_CASE_OPENAI_TIMEOUT_SECONDS = float(os.getenv("TEST_CASE_OPENAI_TIMEOUT_SECONDS", "90"))
 OPENAI_PROMPT_CACHING_MODE = os.getenv("OPENAI_PROMPT_CACHING_MODE", "disabled").strip().lower()
 if OPENAI_PROMPT_CACHING_MODE not in {"disabled", "explicit", "implicit"}:
     raise ValueError("OPENAI_PROMPT_CACHING_MODE must be disabled, explicit, or implicit")

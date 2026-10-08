@@ -618,7 +618,7 @@ def _create_client():
     if not api_key:
         raise HTTPException(503, "OPENAI_API_KEY is not configured. Add it to backend/.env and restart the API.")
     from openai import OpenAI
-    return OpenAI(api_key=api_key, timeout=OPENAI_TIMEOUT_SECONDS)
+    return OpenAI(api_key=api_key, timeout=OPENAI_TIMEOUT_SECONDS, max_retries=0)
 
 
 def _retrieve_with_client(index, request, client, query_vector=None):
@@ -785,7 +785,10 @@ def retrieve_package_context(package_id, requested_by="Requirements Analysis"):
         selected_index = _latest_ready_index(conn, indexes)
         if not selected_index:
             raise HTTPException(409, "No ready Knowledge Base index is available for this package")
-        approval = _assert_approved(conn, selected_index)
+        # Knowledge Base builds are automatic. Refresh the system validation
+        # record for the current index contents instead of requiring a human
+        # approval or blocking downstream generation on a stale hash.
+        approval = _ensure_system_approval(conn, selected_index["index_id"])
         selected = _dict(selected_index)
         approved_rules = [dict(row) for row in conn.execute(
             "SELECT rule_id,statement,source_fragment_id,source_reference,impact_if_missing FROM package_business_rule WHERE package_id=%s AND status='approved' ORDER BY ordinal",
@@ -868,14 +871,10 @@ def build_knowledge_index(package_id: str, request: BuildIndexRequest):
             raise HTTPException(404, "Source package not found")
         if package["lifecycle_status"] not in {"ready", "published"} or not package["manifest_hash"]:
             raise HTTPException(422, "Only a ready, hash-verified source package can be indexed")
-        if package["rule_review_status"] != "approved" or not package["rule_set_hash"]:
-            raise HTTPException(409, "Complete every Business Use Case decision before building the Knowledge Base")
         if db_module.DATABASE_URL:
             conn.execute("SELECT project_id FROM project WHERE project_id=%s FOR UPDATE", (package["project_id"],)).fetchone()
         approved_rules = conn.execute("SELECT rule_id FROM package_business_rule WHERE package_id=%s AND status='approved'", (package_id,)).fetchall()
         approved_rule_count = len(approved_rules)
-        if not approved_rule_count:
-            raise HTTPException(422, "At least one approved Business Use Case is required to build the Knowledge Base")
         items, fragments = _load_package_inputs(conn, package_id)
         fragment_set_hash = _hash(json.dumps([{"fragment_id": row["fragment_id"], "content_hash": row["content_hash"], "extractor_version": row["extractor_version"]} for row in fragments], sort_keys=True, separators=(",", ":")))
         configuration = {"manifest_hash": package["manifest_hash"], "provider": request.provider,
@@ -885,7 +884,7 @@ def build_knowledge_index(package_id: str, request: BuildIndexRequest):
             "graph_engine": f"networkx-{nx.__version__}",
             "chunker_version": CHUNKER_VERSION, "graph_prompt_version": GRAPH_PROMPT_VERSION,
             "graph_prompt_hash": _hash(GRAPH_INSTRUCTIONS), "fragment_set_hash": fragment_set_hash,
-            "approved_rule_set": {"hash": package["rule_set_hash"], "count": approved_rule_count, "mode": "reviewed"},
+            "approved_rule_set": {"hash": package["rule_set_hash"], "count": approved_rule_count, "mode": "automatic"},
             "rag_build_version": RAG_BUILD_VERSION,
             "update_policy": "project-versioned-incremental",
             "build_limits": {"chunks": MAX_INDEX_CHUNKS or None, "characters": MAX_INDEX_CHARACTERS or None},

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
-import { ChevronDown, ChevronRight, FileSearch } from "lucide-react";
+import { FileSearch } from "lucide-react";
 import { LoadingSpinner } from "./LoadingSpinner.jsx";
-import { getProject, listGeneratedTestCases, listManifests, listProjects, listRequirementAnalyses } from "../api/client.js";
+import { getProject, getTestCaseCoverageReview, listGeneratedTestCases, listManifests, listProjects, listRequirementAnalyses } from "../api/client.js";
 
 function readStoredJson(key) {
   try {
@@ -33,10 +33,6 @@ function latestTimestamp(item) {
   return String(item?.created_at || item?.updated_at || item?.contract?.generated_at || item?.contract?.created_at || "");
 }
 
-function nodeKey(...parts) {
-  return parts.filter(Boolean).join("::");
-}
-
 export function TraceabilityPage() {
   const [projects, setProjects] = useState([]);
   const [project, setProject] = useState(() => readStoredJson("testiq_current_project"));
@@ -44,7 +40,7 @@ export function TraceabilityPage() {
   const [packageId, setPackageId] = useState(() => readStoredJson("testiq_current_package")?.package_id || "");
   const [analysis, setAnalysis] = useState(null);
   const [testGeneration, setTestGeneration] = useState(null);
-  const [expanded, setExpanded] = useState([]);
+  const [coverageReview, setCoverageReview] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
@@ -86,6 +82,7 @@ export function TraceabilityPage() {
     async function loadAnalysis() {
       setAnalysis(null);
       setTestGeneration(null);
+      setCoverageReview(null);
       if (!packageId) { setLoading(false); return; }
       setLoading(true);
       setError("");
@@ -94,9 +91,14 @@ export function TraceabilityPage() {
         const latestAnalysis = analyses[0] || null;
         const generationGroups = await Promise.all(analyses.map((item) => listGeneratedTestCases(item.analysis_id).catch(() => [])));
         const generations = generationGroups.flat().sort((left, right) => latestTimestamp(right).localeCompare(latestTimestamp(left)));
+        const latestGeneration = generations[0] || null;
+        const review = latestGeneration?.generation_id
+          ? await getTestCaseCoverageReview(latestGeneration.generation_id).catch(() => null)
+          : null;
         if (!cancelled) {
           setAnalysis(latestAnalysis);
-          setTestGeneration(generations[0] || null);
+          setTestGeneration(latestGeneration);
+          setCoverageReview(review);
         }
       } catch (err) {
         if (!cancelled) setError(err.message || "Unable to load traceability data.");
@@ -109,7 +111,7 @@ export function TraceabilityPage() {
   }, [packageId]);
 
   async function selectProject(projectId) {
-    setProject(null); setPackages([]); setPackageId(""); setAnalysis(null); setTestGeneration(null);
+    setProject(null); setPackages([]); setPackageId(""); setAnalysis(null); setTestGeneration(null); setCoverageReview(null);
     if (!projectId) { setLoading(false); localStorage.removeItem("testiq_current_project"); return; }
     setLoading(true); setError("");
     try {
@@ -132,10 +134,6 @@ export function TraceabilityPage() {
     setPackageId(id);
     const selectedPackage = packages.find((item) => item.package_id === id);
     if (selectedPackage) localStorage.setItem("testiq_current_package", JSON.stringify(selectedPackage));
-  }
-
-  function toggle(key) {
-    setExpanded((items) => items.includes(key) ? items.filter((item) => item !== key) : [...items, key]);
   }
 
   const tree = useMemo(() => {
@@ -178,81 +176,45 @@ export function TraceabilityPage() {
     return [...businessMap.values()].sort((left, right) => left.brId.localeCompare(right.brId));
   }, [analysis, testGeneration]);
 
-  const allExpandableKeys = useMemo(() => tree.flatMap((business) => [
-    nodeKey("br", business.brId),
-    ...business.requirements.map((requirement) => nodeKey("fr", business.brId, requirement.frId)),
-    ...business.requirements.flatMap((requirement) => requirement.acceptanceCriteria.map((criterion) => nodeKey("ac", business.brId, requirement.frId, criterion.acId))),
-  ]), [tree]);
-
-  useEffect(() => {
-    setExpanded(allExpandableKeys.filter((_, index) => index < 20));
-  }, [allExpandableKeys]);
-
-  function expandAll() {
-    setExpanded(allExpandableKeys);
-  }
-
-  function collapseAll() {
-    setExpanded([]);
-  }
+  const coverage = useMemo(() => {
+    const review = coverageReview || testGeneration?.coverage_review || testGeneration?.contract?.coverage_review || {};
+    const summary = review.summary || {};
+    const testCases = testGeneration?.contract?.test_cases || testGeneration?.test_cases || [];
+    const testCaseById = new Map(testCases.map((item) => [item.test_case_id, item]));
+    const rows = (review.matrix || []).flatMap((requirement) => (requirement.business_rules || []).flatMap((rule) => {
+      const ids = rule.test_case_ids || [];
+      return (ids.length ? ids : [null]).map((id) => ({
+        requirementId: requirement.requirement_id,
+        requirementTitle: requirement.title || requirement.requirement_id,
+        ruleId: rule.id || rule.label || "Business requirement",
+        description: rule.label || rule.id || "",
+        testCaseId: id,
+        testCase: id ? testCaseById.get(id) : null,
+        status: String(rule.status || (ids.length ? "covered" : "missing")).toLowerCase(),
+      }));
+    }));
+    const total = Number(summary.business_rules_total ?? rows.length);
+    const covered = Number(summary.business_rules_covered ?? rows.filter((row) => row.status === "covered").length);
+    return { rows, total, covered, percent: total ? Math.round((covered / total) * 100) : 0 };
+  }, [coverageReview, testGeneration]);
 
   function emptyBadge(text) {
     return <span className="traceability-gap">{text}</span>;
   }
 
-  function expander(key, label) {
-    const isOpen = expanded.includes(key);
-    return <button type="button" className="traceability-toggle" aria-label={`${isOpen ? "Collapse" : "Expand"} ${label}`} onClick={() => toggle(key)}>{isOpen ? <ChevronDown size={15} /> : <ChevronRight size={15} />}</button>;
-  }
-
-  const visibleRows = useMemo(() => {
-    const rows = [];
-    for (const business of tree) {
-      const brKey = nodeKey("br", business.brId);
-      rows.push({ kind: "br", key: brKey, business, expandable: true });
-      if (!expanded.includes(brKey)) continue;
-      if (!business.requirements.length) {
-        rows.push({ kind: "gap", key: `${brKey}:missing-fr`, brId: business.brId, message: "No functional requirement mapped" });
-        continue;
-      }
-      for (const requirement of business.requirements) {
-        const frKey = nodeKey("fr", business.brId, requirement.frId);
-        rows.push({ kind: "fr", key: frKey, business, requirement, expandable: true });
-        if (!expanded.includes(frKey)) continue;
-        if (!requirement.acceptanceCriteria.length) {
-          rows.push({ kind: "gap", key: `${frKey}:missing-ac`, brId: business.brId, frId: requirement.frId, message: "No acceptance criteria mapped" });
-          continue;
-        }
-        for (const criterion of requirement.acceptanceCriteria) {
-          const acKey = nodeKey("ac", business.brId, requirement.frId, criterion.acId);
-          rows.push({ kind: "ac", key: acKey, business, requirement, criterion, expandable: true });
-          if (!expanded.includes(acKey)) continue;
-          if (!criterion.testCases.length) {
-            rows.push({ kind: "gap", key: `${acKey}:missing-tc`, brId: business.brId, frId: requirement.frId, acId: criterion.acId, message: "No test case mapped" });
-            continue;
-          }
-          for (const testCase of criterion.testCases) rows.push({ kind: "tc", key: `${acKey}:${testCase.test_case_id}`, business, requirement, criterion, testCase });
-        }
-      }
-    }
-    return rows;
-  }, [tree, expanded]);
-
-  function renderRow(row) {
-    if (row.kind === "br") return <tr key={row.key} className="traceability-row traceability-br"><td><div className="traceability-cell-heading">{expander(row.key, row.business.brId)}<strong>{row.business.brId}</strong></div></td><td>{row.business.brText || emptyBadge("No business description")}</td><td /><td /><td /><td /><td /></tr>;
-    if (row.kind === "fr") return <tr key={row.key} className="traceability-row traceability-fr"><td /><td /><td><div className="traceability-cell-heading indent-one">{expander(row.key, row.requirement.frId)}<strong>{row.requirement.frId}</strong></div></td><td>{row.requirement.frText || emptyBadge("No functional description")}</td><td /><td /><td /></tr>;
-    if (row.kind === "ac") return <tr key={row.key} className="traceability-row traceability-ac"><td /><td /><td /><td /><td><div className="traceability-cell-heading indent-two">{expander(row.key, row.criterion.acId)}<strong>{row.criterion.acId}</strong><span>{row.criterion.acText || "No acceptance criteria text"}</span></div></td><td /><td /></tr>;
-    if (row.kind === "tc") return <tr key={row.key} className="traceability-row traceability-tc"><td /><td /><td /><td /><td /><td><strong className="traceability-id indent-three">{row.testCase.test_case_id}</strong></td><td>{row.testCase.title || row.testCase.scenario || emptyBadge("No test case description")}</td></tr>;
-    return <tr key={row.key} className="traceability-row traceability-missing"><td>{row.brId || ""}</td><td /><td>{row.frId || ""}</td><td /><td>{row.acId || ""}</td><td colSpan={2}>{emptyBadge(row.message)}</td></tr>;
-  }
-
   return <div className="requirements-page">
-    <div className="page-heading"><div><div className="eyebrow">TRACEABILITY MATRIX</div><h1>Traceability</h1><p>Expand each business requirement to inspect linked functional requirements, acceptance criteria, and generated test cases.</p></div></div>
+    <div className="page-heading"><div><div className="eyebrow">TRACEABILITY MATRIX</div><h1>Traceability</h1><p>Review business requirement coverage and the generated test cases linked to each requirement.</p></div></div>
     <div className="requirements-toolbar"><div><label>Project</label><select value={project?.project_id || ""} onChange={(event) => selectProject(event.target.value)}><option value="">Select project</option>{projects.map((item) => <option key={item.project_id} value={item.project_id}>{item.project_name}</option>)}</select></div><div><label>Source package</label><select value={packageId} onChange={(event) => selectPackage(event.target.value)} disabled={!packages.length}><option value="">Select package</option>{packages.map((item) => <option key={item.package_id} value={item.package_id}>{item.package_name || item.scope || "Source package"} - v{item.package_version || "?"}</option>)}</select></div></div>
     {error && <div className="error-message">{error}</div>}
     {loading ? <LoadingSpinner variant="page" label="Loading traceability" detail="Linking source evidence to requirements and generated artifacts." />
       : !analysis ? <section className="requirements-empty"><div className="empty-state-icon"><FileSearch size={25} /></div><h2>No analysis available yet</h2><p>Run Functional Requirements for a source package to view traceability links.</p></section>
-        : tree.length ? <section className="requirements-panel traceability-panel"><div className="panel-title-row"><div><h2>Requirement traceability tree</h2><p className="panel-helper">Expand or collapse each branch to follow coverage from BRD through test cases.</p></div><span>{tree.length} BRD item{tree.length === 1 ? "" : "s"}</span></div><div className="traceability-actions"><button type="button" className="secondary-button compact-button" onClick={expandAll}>Expand all</button><button type="button" className="secondary-button compact-button" onClick={collapseAll}>Collapse all</button></div><div className="traceability-table-wrap"><table className="traceability-table"><thead><tr><th>BRD ID</th><th>Business Description</th><th>FR ID</th><th>Functional Description</th><th>Acceptance Criteria</th><th>Test Case ID</th><th>Test Case Description</th></tr></thead><tbody>{visibleRows.map(renderRow)}</tbody></table></div></section>
+        : tree.length ? <>
+          <section className="traceability-coverage-card">
+            <div className="traceability-coverage-header"><div><div className="eyebrow">COVERAGE REVIEW</div><h2>Business requirement coverage</h2><p>Every business requirement is listed with the generated test case evidence linked to it.</p></div><div className={`traceability-coverage-score ${coverage.percent === 100 ? "complete" : ""}`}><strong>{coverage.percent}%</strong><span>covered</span></div></div>
+            <div className="traceability-coverage-summary"><span><strong>{coverage.covered}</strong> of {coverage.total} requirements covered</span><span>{coverage.rows.filter((row) => row.testCaseId).length} linked test cases</span></div>
+            <div className="traceability-coverage-table-wrap"><table className="traceability-coverage-table"><thead><tr><th>Status</th><th>Business requirement</th><th>Description</th><th>Test case ID</th><th>Test case description</th></tr></thead><tbody>{coverage.rows.length ? coverage.rows.map((row) => <tr key={`${row.ruleId}-${row.testCaseId || "missing"}`}><td><span className={`traceability-coverage-status ${row.status === "covered" ? "covered" : "missing"}`}>{row.status === "covered" ? "Covered" : "Missing"}</span></td><td><strong>{row.ruleId}</strong><small>{row.requirementId}</small></td><td>{row.description || "No business requirement description"}</td><td>{row.testCaseId || emptyBadge("No test case linked")}</td><td>{row.testCase ? (row.testCase.title || row.testCase.scenario || "No description") : emptyBadge("Coverage required")}</td></tr>) : <tr><td colSpan="5">{emptyBadge("Coverage review is not available for this generation")}</td></tr>}</tbody></table></div>
+          </section>
+        </>
           : <section className="requirements-empty"><div className="empty-state-icon"><FileSearch size={25} /></div><h2>No traceability mappings found</h2><p>This analysis does not contain business requirement mappings to trace.</p></section>}
   </div>;
 }
