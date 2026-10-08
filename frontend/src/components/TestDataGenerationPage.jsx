@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ClipboardList, LoaderCircle } from "lucide-react";
+import { ClipboardList } from "lucide-react";
 import { listGeneratedTestCases, listRequirementAnalyses } from "../api/client.js";
 import { TestDataStage } from "./TestDataStage.jsx";
 import { LoadingSpinner } from "./LoadingSpinner.jsx";
