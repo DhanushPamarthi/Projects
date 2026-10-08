@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { AlertCircle, ArrowLeft, Check, CheckCircle2, ClipboardList, LoaderCircle, Pencil, RefreshCw, ShieldCheck, X } from "lucide-react";
-import { generateFunctionalRequirements, generateTestCasesFromAnalysis, getRequirementAnalysis, listGeneratedTestCases, listTestData, reviewTestCaseGeneration } from "../api/client.js";
+import { generateFunctionalRequirements, generateTestCasesFromAnalysis, getRequirementAnalysis, listGeneratedTestCases, listRequirementAnalyses, listTestData, reviewTestCaseGeneration } from "../api/client.js";
 
 function lines(value) {
   return String(value || "")
@@ -107,7 +107,10 @@ export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData,
   const [generatedDataByCase, setGeneratedDataByCase] = useState({});
   const [workflowProgress, setWorkflowProgress] = useState(null);
 
-  const currentAnalysis = verifiedAnalysis?.analysis_id === analysis?.analysis_id ? verifiedAnalysis : null;
+  const currentAnalysis = verifiedAnalysis && (
+    verifiedAnalysis.analysis_id === analysis?.analysis_id ||
+    (analysis?.generation_pipeline && verifiedAnalysis.package_id === analysis?.package_id)
+  ) ? verifiedAnalysis : null;
   const isAnalysisLoading = analysisLoading || Boolean(analysis?.analysis_id && !currentAnalysis && !analysisError);
   const requirements = currentAnalysis?.contract?.requirements || [];
   const approvedIds = new Set(currentAnalysis?.contract?.approved_items || []);
@@ -173,6 +176,30 @@ export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData,
       .finally(() => { if (active) setAnalysisLoading(false); });
     return () => { active = false; };
   }, [analysis?.analysis_id, onAnalysisUnavailable]);
+
+  // Project-level generation can finish in the backend while the user navigates
+  // away or refreshes. Recover its saved functional analysis and generated cases
+  // when returning, instead of leaving the page at the initial project prompt.
+  useEffect(() => {
+    if (!analysis?.generation_pipeline || !analysis?.package_id || analysis?.analysis_id) return undefined;
+    let active = true;
+    setAnalysisLoading(true);
+    setError("");
+    listRequirementAnalyses(analysis.package_id)
+      .then(async (items) => {
+        if (!active) return;
+        const savedAnalysis = (items || []).find((item) => item.analysis_kind === "functional");
+        if (!savedAnalysis) return;
+        setVerifiedAnalysis(savedAnalysis);
+        const savedGenerations = await listGeneratedTestCases(savedAnalysis.analysis_id);
+        if (active) applyGeneration(savedGenerations?.[0] || null);
+      })
+      .catch((err) => {
+        if (active) setError(err.message || "Could not load the saved test-generation results.");
+      })
+      .finally(() => { if (active) setAnalysisLoading(false); });
+    return () => { active = false; };
+  }, [analysis?.generation_pipeline, analysis?.package_id, analysis?.analysis_id]);
 
   useEffect(() => {
     if (isAnalysisLoading || !currentAnalysis?.analysis_id) return;

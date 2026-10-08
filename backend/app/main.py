@@ -4109,12 +4109,15 @@ def _test_data_eligibility_expectation(test_case):
 
 def _test_case_requires_prescription(test_case):
     text = _test_case_text(test_case).lower()
-    return bool(re.search(r"\b(?:prescriptions?|rx|refills?|drugs?|medications?|pharmacy)\b", text))
+    # Test-case data_needs commonly use snake_case identifiers (rx_number,
+    # prescription_id, refills_remaining). Treat an underscore as a field-name
+    # boundary so those cases are classified just like natural-language terms.
+    return bool(re.search(r"\b(?:prescriptions?|rx|refills?|drugs?|medications?|pharmacy|ndc|prescriber)(?:\b|_)", text))
 
 
 def _test_case_requires_membership(test_case):
     text = _test_case_text(test_case).lower()
-    return bool(re.search(r"\b(?:members?|membership|subscribers?|dependents?|contact|communication|consent|phone|email|address)\b", text))
+    return bool(re.search(r"\b(?:members?|membership|subscribers?|dependents?|contact|communication|consent|phone|email|address)(?:\b|_)", text))
 
 
 def _constrain_template_eligibility(schema, payload, test_case):
@@ -5013,9 +5016,12 @@ def generate_test_data(generation_id: str, request: TestDataGenerationRequest):
             case_id: [entity for entity, required in (("membership", membership_cases[case_id]), ("prescription", prescription_cases[case_id])) if required]
             for case_id in assignment_case_ids
         }
-        ambiguous_cases = [case_id for case_id, entities in required_entities.items() if not entities]
-        if ambiguous_cases:
-            raise HTTPException(422, f"Could not determine whether these cases need Membership or Prescription data: {', '.join(ambiguous_cases)}. Clarify the approved scenario and retry.")
+        # If a case has no recognizable domain terms or field names, use the
+        # supported paired-record shape. Prescription fixtures need a linked
+        # member, and both records provide a usable default for generic cases.
+        for case_id, entities in required_entities.items():
+            if not entities:
+                required_entities[case_id] = ["membership", "prescription"]
         rag_context = _require_test_data_knowledge(generation["package_id"])
         schema_evidence = [
             {"source_reference": item.get("source_reference"), "text": str(item.get("fragment_text") or "")[:1800]}
