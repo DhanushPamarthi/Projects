@@ -136,19 +136,17 @@ export function ProjectsPage({ onOpenTestCases }) {
     catch (err) { setError(err.message); setReplacingBrdProjectId(""); setPreviousPackageId(""); } finally { setBusy(false); setProcessingProjectId(""); }
   }
 
-  async function generateProjectTestCases(project) {
-    if (!project || generatingProjectId) return;
-    setGeneratingProjectId(project.project_id); setError("");
-    try {
-      const packages = await listManifests(project.project_id, { cache: "no-store" });
-      const packageItem = packages[0];
-      if (!packageItem) throw new Error("No Resource Package is ready for this project yet.");
-      localStorage.setItem("testiq_current_project", JSON.stringify(project));
-      localStorage.setItem("testiq_current_package", JSON.stringify(packageItem));
-      const analysis = await generateFunctionalRequirements(packageItem.package_id);
-      onOpenTestCases?.(analysis);
-    } catch (err) { setError(err.message || "Could not generate test cases."); }
-    finally { setGeneratingProjectId(""); }
+  function generateProjectTestCases(project) {
+    const packageItem = dashboardMap[project?.project_id]?.packages?.[0];
+    if (!project || !packageItem?.package_id || generatingProjectId) return;
+    localStorage.setItem("testiq_current_project", JSON.stringify(project));
+    localStorage.setItem("testiq_current_package", JSON.stringify(packageItem));
+    onOpenTestCases?.({
+      package_id: packageItem.package_id,
+      project_id: project.project_id,
+      project_name: project.project_name,
+      generation_pipeline: true,
+    });
   }
 
   async function retryProjectProcessing(packageId) {

@@ -108,8 +108,11 @@ export function getActivities() { return activities; }
 export function subscribeActivities(listener) { listeners.add(listener); return () => listeners.delete(listener); }
 export function useActivities() { return useSyncExternalStore(subscribeActivities, getActivities, getActivities); }
 
-window.addEventListener("storage", (event) => {
-  if (event.key !== STORAGE_KEY) return;
-  activities = loadActivities();
-  listeners.forEach((listener) => listener());
-});
+if (typeof window !== "undefined") {
+  window.addEventListener("pagehide", recoverInterruptedTabActivities);
+  window.addEventListener("storage", (event) => {
+    if (event.key !== STORAGE_KEY) return;
+    activities = loadActivities();
+    listeners.forEach((listener) => listener());
+  });
+}
