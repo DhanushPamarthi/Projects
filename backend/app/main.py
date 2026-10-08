@@ -167,8 +167,8 @@ def extraction_config_hash() -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 REQUIREMENTS_ANALYSIS_PROMPT = f"{read_skill_instructions('requirements-analysis')}\n\nSOURCE FRAGMENTS:\n"
-TEST_CASE_GENERATION_PROMPT = f"{read_skill_instructions('test-case-generation')}\n\nUse the package-scoped source_package_evidence and retrieved_knowledge_evidence in the input to ground API behavior, database fields, validation locations, and test steps. The direct BRD and technical source-package fragments are authoritative evidence and must be used alongside the Knowledge Base context. Treat the generated requirement contract as the behavior scope; business use cases and functional requirements are internal generation artifacts and do not require human approval. For each supported acceptance_criteria_id and business_rule_id in coverage_plan, include the exact ID only on a case whose executable content exercises it. Do not attach IDs merely to satisfy metadata coverage; unsupported categories and rules belong in global_gaps. Traceability IDs are requirement-scoped: never place an acceptance criterion or business-rule ID on a test case whose requirement_id does not own that ID. For every evidence.source_references entry, copy an exact fragment_id and source_reference pair from the supplied generated requirements or retrieved Knowledge Base evidence; never invent or alter either value. Generate positive and negative test cases when the BRD or source package supports both behaviors. Never invent an unsupported negative, boundary, channel, or failure scenario; record unsupported coverage in global_gaps. A traceability ID counts as covered only when the case steps, data_needs, assertions, and expected_results exercise that rule or criterion. Put required test-data field names such as member_id, prescription_id, status, or due_date in data_needs. Do not generate pre-steps, setup instructions, setup records, or production identifier values. Keep each generated case concise: short title, one-sentence description, one or more numbered execution steps (normally three to five when the source supports them), one or two expected results, and focused data fields only. Do not add pre-steps, setup records, or production values.\n\nGENERATED REQUIREMENTS:\n"
-TEST_CASE_GENERATION_MAX_ATTEMPTS = 2
+TEST_CASE_GENERATION_PROMPT = f"{read_skill_instructions('test-case-generation')}\n\nUse the package-scoped source_package_evidence and retrieved_knowledge_evidence in the input to ground API behavior, database fields, validation locations, and test steps. The direct BRD and technical source-package fragments are authoritative evidence and must be used alongside the Knowledge Base context. Treat the generated requirement contract as the behavior scope; business use cases and functional requirements are internal generation artifacts and do not require human approval. For each supported acceptance_criteria_id and business_rule_id in coverage_plan, include the exact ID only on a case whose executable content exercises it. Do not attach IDs merely to satisfy metadata coverage; unsupported categories and rules belong in global_gaps. Traceability IDs are requirement-scoped: never place an acceptance criterion or business-rule ID on a test case whose requirement_id does not own that ID. For every evidence.source_references entry, copy an exact fragment_id and source_reference pair from the supplied generated requirements or retrieved Knowledge Base evidence; never invent or alter either value. Generate positive and negative test cases when the BRD or source package supports both behaviors. Never invent an unsupported negative, boundary, channel, or failure scenario; record unsupported coverage in global_gaps. A traceability ID counts as covered only when the case steps, data_needs, assertions, and expected_results exercise that rule or criterion. Put required test-data field names such as member_id, prescription_id, status, or due_date in data_needs. Do not generate pre-steps, setup instructions, setup records, or production identifier values. Never place concrete record identifiers or sample values such as MEM-001, CAMP-001, account numbers, customer IDs, or UUIDs in titles, scenarios, descriptions, steps, expected results, assertions, or data_needs. Refer to the corresponding data field by name (for example, use member_id from test data) and let test-data generation supply the value. Keep each generated case concise: short title, one-sentence description, one or more numbered execution steps (normally three to five when the source supports them), one or two expected results, and focused data fields only. Before returning, cross-check each case as a whole: the condition in its steps and data must produce its stated expected result; negative or exclusion cases must state the behavior that should be absent; assertions must test the expected result; and no step, input, assertion, or result may contradict another or exceed the cited evidence. Each numbered step must have exactly one matching action, each action's data_inputs must refer to fields listed in data_needs, and every data_needs field must be used by an action. Do not add pre-steps, setup records, or production values.\n\nGENERATED REQUIREMENTS:\n"
+TEST_CASE_GENERATION_MAX_ATTEMPTS = 3
 
 def test_case_generation_prompt_hash() -> str:
     return hashlib.sha256(TEST_CASE_GENERATION_PROMPT.encode("utf-8")).hexdigest()
@@ -1379,18 +1379,32 @@ def _test_case_coverage_plan(approved_requirements, requested_count=None):
     ]
     plan, gaps = [], []
     if requested_count is None:
+        supported_scenarios = [
+            ("exclusion", "Exclusion or missing-data behavior", ("ineligible", "inactive", "excluded", "exclude", "suppress", "missing data", "not eligible", "no reminder", "no communication")),
+            ("negative_validation", "Invalid-input or failure behavior", ("invalid", "failure", "fails", "error", "reject", "denied", "malformed")),
+            ("boundary", "Documented boundary behavior", ("threshold", "boundary", "window", "within", "before", "after", "between", "date range", "effective date")),
+            ("channel_fallback", "Channel-fallback behavior", ("fallback", "alternate channel", "sms failure", "delivery failure", "primary channel failure")),
+            ("retry_failure", "Retry or service-failure behavior", ("retry", "idempot", "partial failure", "service failure", "timeout")),
+        ]
         for requirement in approved_requirements:
             criteria = [item for item in requirement.get("acceptance_criteria", []) if isinstance(item, dict)]
             rules = [item for item in requirement.get("business_rules", []) if isinstance(item, dict)]
             plan.append({"category": "happy_path", "label": "Positive behavior", "requirement": requirement,
                          "acceptance_criteria": criteria, "business_rules": rules})
             requirement_text = _requirement_text(requirement)
-            negative_terms = ("ineligible", "inactive", "exclude", "excluded", "suppress", "missing", "invalid", "failure", "fail", "denied", "reject", "not eligible", "no communication")
-            if any(term in requirement_text for term in negative_terms):
-                plan.append({"category": "negative_validation", "label": "Negative behavior", "requirement": requirement,
-                             "acceptance_criteria": criteria, "business_rules": rules})
-            else:
+            has_negative = False
+            for category, label, terms in supported_scenarios:
+                if not any(term in requirement_text for term in terms):
+                    continue
+                has_negative = has_negative or category in {"exclusion", "negative_validation"}
+                matching_criteria = [criterion for criterion in criteria if any(term in " ".join(str(criterion.get(key) or "").lower() for key in ("given", "when", "then")) for term in terms)]
+                matching_rules = [rule for rule in rules if any(term in str(rule.get("text") or "").lower() for term in terms)]
+                plan.append({"category": category, "label": label, "requirement": requirement,
+                             "acceptance_criteria": matching_criteria, "business_rules": matching_rules})
+            if not has_negative:
                 gaps.append(f"Negative behavior is not supported by the BRD or source package for {requirement.get('requirement_id')}.")
+        if len(plan) > 100:
+            gaps.append(f"The supported coverage plan contains {len(plan)} scenarios; only the first 100 can be generated in one request.")
         return plan[:100], gaps
 
     first_requirement = approved_requirements[0] if approved_requirements else None
@@ -1579,7 +1593,7 @@ def _sanitize_test_case_traceability(contract, approved_requirements):
             })
     return findings
 
-def _validate_test_case_contract(contract, approved_requirements, requested_count=None, discovery_contexts=None, rag_context=None, enforce_coverage=True):
+def _validate_test_case_contract(contract, approved_requirements, requested_count=None, discovery_contexts=None, rag_context=None, enforce_coverage=True, enforce_data_alignment=True):
     discovery_contexts = discovery_contexts or []
     if not isinstance(contract, dict) or not contract.get("test_cases"):
         raise ValueError("The AI returned no test cases")
@@ -1601,6 +1615,7 @@ def _validate_test_case_contract(contract, approved_requirements, requested_coun
     generated_categories = {case.get("category") for case in contract["test_cases"]}
     missing_categories = sorted(required_categories - generated_categories)
     coverage_findings = []
+    quality_findings = []
     if missing_categories:
         coverage_findings.extend({
             "finding_id": f"GEN-{len(coverage_findings)+1:03d}",
@@ -1611,8 +1626,6 @@ def _validate_test_case_contract(contract, approved_requirements, requested_coun
             "scenario": category,
             "message": f"No generated test case covered the required {category} scenario.",
         } for category in missing_categories)
-        if enforce_coverage:
-            pass
     for entry in plan:
         requirement_id = entry["requirement"].get("requirement_id")
         requirement_cases = [case for case in contract["test_cases"] if case.get("requirement_id") == requirement_id]
@@ -1670,6 +1683,33 @@ def _validate_test_case_contract(contract, approved_requirements, requested_coun
             raise ValueError(f"AI returned {case_id} without an executable step")
         if len(test_case.get("steps", [])) > 5:
             raise ValueError(f"AI returned {case_id} with {len(test_case.get('steps', []))} steps; execution cases allow at most 5 numbered steps")
+        actions = test_case.get("actions") or []
+        if len(actions) != len(test_case["steps"]):
+            raise ValueError(f"test case {case_id} action-step alignment: provide exactly one action for each numbered step")
+        action_steps = [action.get("step") for action in actions]
+        if action_steps != list(range(1, len(test_case["steps"]) + 1)):
+            raise ValueError(f"test case {case_id} action-step alignment: action step numbers must match the numbered steps in order")
+        data_names = {
+            str(need if isinstance(need, str) else need.get("name") or "").strip().casefold()
+            for need in test_case.get("data_needs", [])
+        }
+        data_names.discard("")
+        action_data_names = {
+            str(field).strip().casefold()
+            for action in actions
+            for field in action.get("data_inputs", [])
+            if str(field).strip()
+        }
+        if action_data_names - data_names:
+            message = f"test case {case_id} data alignment: action data_inputs must be listed in data_needs"
+            if enforce_data_alignment:
+                raise ValueError(message)
+            quality_findings.append({"finding_id": f"GEN-{len(coverage_findings) + len(quality_findings) + 1:03d}", "type": "data_alignment", "severity": "medium", "status": "requires_qa_confirmation", "requirement_id": requirement_id, "scenario": case_id, "message": message})
+        if data_names - action_data_names:
+            message = f"test case {case_id} data alignment: every data_needs field must be used by an action data_inputs list"
+            if enforce_data_alignment:
+                raise ValueError(message)
+            quality_findings.append({"finding_id": f"GEN-{len(coverage_findings) + len(quality_findings) + 1:03d}", "type": "data_alignment", "severity": "medium", "status": "requires_qa_confirmation", "requirement_id": requirement_id, "scenario": case_id, "message": message})
         for field in required_fields:
             if not test_case.get(field):
                 raise ValueError(f"AI returned test case {case_id} without {field}")
@@ -1735,7 +1775,7 @@ def _validate_test_case_contract(contract, approved_requirements, requested_coun
             for ref in test_case.get("source_references", []):
                 if ref.get("fragment_id") and ref.get("fragment_id") not in valid_fragments:
                     raise ValueError(f"AI returned an unknown source fragment for {case_id}")
-    return coverage_findings
+    return coverage_findings + quality_findings
 
 @usage_step("test_cases")
 def _test_cases_with_openai(approved_requirements, package, requested_count, discovery_contexts=None, rag_context=None):
@@ -1757,6 +1797,11 @@ def _test_cases_with_openai(approved_requirements, package, requested_count, dis
                     "Do not add pre-steps, setup instructions, setup records, or production identifier values. "
                     "List required test-data field names in data_needs and cite the requirement through the case evidence. "
                 )
+                if "data alignment" in previous_error.lower():
+                    repair_guidance += (
+                        "Repair data mapping throughout the complete test-case contract: for each action, put the exact data_needs field names used by that step in actions[].data_inputs; "
+                        "ensure every data_needs field is mapped to at least one matching action; do not remove a supported data field or invent a field. "
+                    )
                 missing_case = re.search(r"test case (TC-\d{3})", previous_error, re.IGNORECASE)
                 if missing_case:
                     case_id = missing_case.group(1)
@@ -1816,6 +1861,27 @@ def _test_cases_with_openai(approved_requirements, package, requested_count, dis
                                 "The case must exercise the rule's behavior, not merely add an unrelated citation. "
                             )
                             break
+                missing_category = re.search(r"required category coverage: ([a-z_]+)", previous_error, re.IGNORECASE)
+                if missing_category:
+                    category = missing_category.group(1).lower()
+                    plan, _ = _test_case_coverage_plan(approved_requirements, requested_count)
+                    category_scenarios = [entry for entry in plan if entry.get("category") == category]
+                    scenario_context = []
+                    for entry in category_scenarios:
+                        requirement = entry.get("requirement") or {}
+                        scenario_context.append({
+                            "requirement_id": requirement.get("requirement_id"),
+                            "title": requirement.get("title"),
+                            "statement": requirement.get("statement") or requirement.get("description"),
+                            "acceptance_criteria": entry.get("acceptance_criteria", []),
+                            "business_rules": entry.get("business_rules", []),
+                        })
+                    repair_guidance += (
+                        f"The required supported scenario category '{category}' is missing. Add or correct a case in that category, "
+                        "grounded in the supplied requirement evidence, and keep all IDs requirement-scoped. Relevant approved "
+                        f"scenario context: {json.dumps(scenario_context, ensure_ascii=False)}. "
+                        "If the evidence does not actually support this scenario, do not invent behavior; record that limitation in global_gaps. "
+                    )
                 request_prompt = (
                     f"{base_prompt}\n\n"
                     "VALIDATION REPAIR REQUIRED: Your previous test-case response failed validation. "
@@ -1836,6 +1902,17 @@ def _test_cases_with_openai(approved_requirements, package, requested_count, dis
             _normalize_test_case_format(contract)
             traceability_findings = _sanitize_test_case_traceability(contract, approved_requirements)
             coverage_findings = _validate_test_case_contract(contract, approved_requirements, requested_count, discovery_contexts, rag_context)
+            missed_coverage = next((finding for finding in coverage_findings if finding.get("type") in {
+                "missing_category", "missing_acceptance_criterion", "unexercised_acceptance_criterion", "missing_business_rule", "unexercised_business_rule"
+            }), None)
+            if missed_coverage:
+                scenario = missed_coverage.get("scenario") or ""
+                if missed_coverage.get("type") == "missing_category":
+                    raise ValueError(f"required category coverage: {scenario}. {missed_coverage.get('message', '')}")
+                if scenario.startswith("AC-"):
+                    raise ValueError(f"acceptance criterion coverage: {scenario}. {missed_coverage.get('message', '')}")
+                if scenario.startswith("BR-"):
+                    raise ValueError(f"business rule coverage: {scenario}. {missed_coverage.get('message', '')}")
             all_findings = traceability_findings + coverage_findings
             contract["agent_attempts"] = [{"attempt": attempt, "status": "passed_with_findings" if all_findings else "passed", "details": "Schema and evidence validation passed; generation findings require QA confirmation." if all_findings else "Schema, evidence, and coverage validation passed."}]
             contract.setdefault("global_gaps", []).extend(payload["context"]["gaps"] + payload.get("coverage_gaps", []))
@@ -1855,14 +1932,34 @@ def _test_cases_with_openai(approved_requirements, package, requested_count, dis
             candidate_contract = {**previous_invalid_output, "test_cases": [candidate]}
             try:
                 traceability_findings = _sanitize_test_case_traceability(candidate_contract, approved_requirements)
-                _validate_test_case_contract(candidate_contract, approved_requirements, requested_count, discovery_contexts, rag_context, enforce_coverage=False)
+                candidate_findings = _validate_test_case_contract(candidate_contract, approved_requirements, discovery_contexts=discovery_contexts, rag_context=rag_context, enforce_coverage=False, enforce_data_alignment=False)
                 usable_cases.append(candidate)
-                findings.extend(traceability_findings)
+                findings.extend(traceability_findings + [
+                    finding for finding in candidate_findings
+                    if finding.get("type") not in {
+                        "missing_category", "missing_acceptance_criterion", "unexercised_acceptance_criterion",
+                        "missing_business_rule", "unexercised_business_rule",
+                    }
+                ])
             except Exception as exc:
                 findings.append({"finding_id": f"GEN-{len(findings)+1:03d}", "type": "generation_failure", "severity": "high", "status": "requires_qa_confirmation", "requirement_id": candidate.get("requirement_id"), "scenario": candidate.get("test_case_id"), "message": safe_llm_error_message(exc)})
         if usable_cases:
             salvaged = dict(previous_invalid_output)
             salvaged["test_cases"] = usable_cases
+            salvage_validation = _validate_test_case_contract(
+                salvaged,
+                approved_requirements,
+                requested_count=requested_count,
+                discovery_contexts=discovery_contexts,
+                rag_context=rag_context,
+                enforce_coverage=False,
+                enforce_data_alignment=False,
+            )
+            coverage_types = {
+                "missing_category", "missing_acceptance_criterion", "unexercised_acceptance_criterion",
+                "missing_business_rule", "unexercised_business_rule",
+            }
+            findings.extend(finding for finding in salvage_validation if finding.get("type") in coverage_types)
             salvaged["generation_findings"] = findings + [{"finding_id": f"GEN-{len(findings)+1:03d}", "type": "generation_attempt", "severity": "high", "status": "requires_qa_confirmation", "requirement_id": None, "scenario": None, "message": failures[-1]["details"]}]
             salvaged["agent_attempts"] = [{"attempt": TEST_CASE_GENERATION_MAX_ATTEMPTS, "status": "passed_with_findings", "details": "Usable test cases were retained; failed scenarios were recorded for QA confirmation."}]
             return salvaged

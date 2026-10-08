@@ -67,36 +67,34 @@ async function request(path, options = {}) {
   const { activity: _activity, cacheTtl: _cacheTtl, ...fetchOptions } = options;
   const generation = cacheGeneration;
   const operation = (async () => {
-    let response;
     try {
-      response = await fetch(url, { ...fetchOptions, headers });
+      const response = await fetch(url, { ...fetchOptions, headers });
+      const text = await response.text();
+      let data = null;
+      try {
+        data = text ? JSON.parse(text) : null;
+      } catch {
+        data = { detail: text || `${response.status} ${response.statusText}` };
+      }
+      if (!response.ok) {
+        const detail = data?.detail;
+        const message = typeof detail === "string"
+          ? detail
+          : detail?.validation_messages?.join("; ") || data?.validation_messages?.join("; ") || detail?.message || `${response.status} ${response.statusText}`;
+        const error = new Error(message);
+        error.status = response.status;
+        throw error;
+      }
+      if (method !== "GET") invalidateApiCache();
+      if (cacheEnabled && generation === cacheGeneration) {
+        responseCache.set(cacheKey, { data, expiresAt: Date.now() + Number(options.cacheTtl || DEFAULT_GET_CACHE_MS) });
+      }
+      if (activityId) completeActivity(activityId, "Completed successfully.");
+      return data;
     } catch (error) {
       if (activityId) failActivity(activityId, error);
       throw error;
     }
-    const text = await response.text();
-    let data = null;
-    try {
-      data = text ? JSON.parse(text) : null;
-    } catch {
-      data = { detail: text || `${response.status} ${response.statusText}` };
-    }
-    if (!response.ok) {
-      const detail = data?.detail;
-      const message = typeof detail === "string"
-        ? detail
-        : detail?.validation_messages?.join("; ") || data?.validation_messages?.join("; ") || detail?.message || `${response.status} ${response.statusText}`;
-      const error = new Error(message);
-      error.status = response.status;
-      if (activityId) failActivity(activityId, error);
-      throw error;
-    }
-    if (method !== "GET") invalidateApiCache();
-    if (activityId) completeActivity(activityId, "Completed successfully.");
-    if (cacheEnabled && generation === cacheGeneration) {
-      responseCache.set(cacheKey, { data, expiresAt: Date.now() + Number(options.cacheTtl || DEFAULT_GET_CACHE_MS) });
-    }
-    return data;
   })();
   if (cacheEnabled) inFlightGets.set(cacheKey, operation);
   try {

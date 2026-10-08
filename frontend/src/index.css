@@ -3127,11 +3127,22 @@ button {
 .test-case-execution-table td { padding: 8px 10px; border: 1px solid #c7cbd1; vertical-align: top; min-height: 42px; }
 .test-case-execution-table td strong { display: block; font-weight: 600; }
 .test-case-execution-table td small { display: block; margin-top: 5px; color: #91a0b3; }
-.test-case-grid-id { width: 124px; white-space: nowrap; vertical-align: middle !important; }
+.test-case-grid-id { width: 88px; white-space: nowrap; vertical-align: middle !important; }
+.test-case-review-badge { display: inline-flex; padding: 3px 6px; border-radius: 999px; color: #68788d; background: #eef1f5; font-size: 9px; font-weight: 700; line-height: 1.2; white-space: nowrap; }
+.test-case-review-badge.approved { color: #188957; background: #e8f7ef; }
+.test-case-review-badge.rejected { color: #b94338; background: #feebe9; }
+.test-case-review-status { vertical-align: middle !important; }
 .test-case-grid-select { width: 42px; text-align: center; vertical-align: middle !important; }
 .test-case-grid-select-heading { width: 42px; }
-.test-case-grid-edit { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; margin-right: 6px; padding: 0; border: 1px solid #d6dce5; border-radius: 5px; background: #fff; color: #5d718b; cursor: pointer; vertical-align: middle; }
-.test-case-grid-edit:hover { border-color: #ff6b5f; color: #e9574e; }
+.test-case-grid-actions { width: 46px; min-width: 46px; text-align: center; vertical-align: middle !important; }
+.test-case-grid-edit-action { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; padding: 0; border: 1px solid #d6dce5; border-radius: 6px; background: #fff; color: #52667e; cursor: pointer; }
+.test-case-grid-edit-action:hover { border-color: #ff6b5f; color: #e9574e; background: #fff9f7; }
+.test-case-grid-input { width: 100%; min-width: 0; box-sizing: border-box; padding: 7px 8px; border: 1px solid #d6dce5; border-radius: 5px; color: #182b43; background: #fff; font: inherit; }
+.test-case-grid-textarea { min-height: 86px; resize: vertical; line-height: 1.45; }
+.case-edit-modal { width: min(100%, 620px); max-height: calc(100vh - 40px); overflow-y: auto; }
+.case-edit-modal h2 { margin: 7px 0 20px; }
+.case-edit-field { display: grid; gap: 6px; margin: 14px 0; color: #526176; font-size: 12px; font-weight: 700; }
+.case-edit-modal .test-case-grid-textarea { min-height: 100px; }
 .review-move-actions .review-icon-action { display: inline-flex; align-items: center; justify-content: center; gap: 7px; width: auto; min-width: 104px; height: 36px; padding: 0 14px; border-radius: 8px; font-size: 13px; font-weight: 700; line-height: 1; white-space: nowrap; }
 .review-move-actions .approved-action { border-color: #b9e1ca; background: #f3fbf6; color: #188957; }
 .review-move-actions .approved-action:hover:not(:disabled) { border-color: #188957; background: #e8f7ef; }

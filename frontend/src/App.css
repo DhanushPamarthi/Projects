@@ -273,6 +273,21 @@
 .review-bucket.rejected { border-color: #f0c7c4; background: #fffafa; }
 .test-generation-page .generation-next-card { align-items: flex-start; }
 .test-generation-page .generation-next-card > div:first-child { min-width: 0; }
+.test-generation-page .project-generation-controls { min-width: min(330px, 100%); align-items: stretch; flex-direction: column; }
+.test-case-inline-progress { width: 100%; }
+.test-case-inline-progress .project-progress-meta { margin-top: 6px; font-size: 10px; }
+.test-generation-page .project-generation-controls > .primary-button { margin-left: 0; align-self: flex-end; }
+.test-generation-page .project-test-generation-card { align-items: center; gap: 40px; min-height: 150px; padding: 26px 30px; border-color: #e1e8f0; background: linear-gradient(115deg, #fff 0%, #f8fbff 100%); }
+.test-generation-page .project-test-generation-card > div:first-child { flex: 1; max-width: 760px; }
+.test-generation-page .project-test-generation-card h2 { margin: 6px 0 8px; font-size: 22px; letter-spacing: -.35px; }
+.test-generation-page .project-test-generation-card p { max-width: 680px; font-size: 14px; line-height: 1.6; }
+.test-generation-page .project-test-generation-card .project-generation-controls { flex: 0 0 300px; min-width: 270px; justify-content: center; }
+.test-generation-page .project-test-generation-card .project-generation-controls > .primary-button { align-self: stretch; justify-content: center; min-height: 48px; margin: 0; }
+@media (max-width: 800px) {
+  .test-generation-page .project-test-generation-card { align-items: stretch; flex-direction: column; gap: 22px; padding: 22px; }
+  .test-generation-page .project-test-generation-card > div:first-child { max-width: none; }
+  .test-generation-page .project-test-generation-card .project-generation-controls { flex: 1 1 auto; width: 100%; min-width: 0; }
+}
 .generated-cases-panel { margin-top: .2rem; }
 .test-case-review-list { display: grid; gap: .7rem; margin-top: .8rem; }
 .test-case-review-item { display: flex; align-items: flex-start; gap: .75rem; padding: .95rem 1rem; border: 1px solid #e5e8ef; border-radius: 10px; background: #fff; transition: border-color .15s, background .15s; }
@@ -294,10 +309,12 @@
 .test-case-edit-text { min-height: 86px; padding: .6rem .65rem; resize: vertical; line-height: 1.45; }
 .item-actions-static { display: flex; align-items: center; gap: .55rem; margin-top: .55rem; }
 .compact-button { padding: .45rem .7rem; font-size: .75rem; }
-.test-generation-page .review-fields { width: 100%; display: grid; grid-template-columns: minmax(150px, .45fr) minmax(220px, 1fr) auto; align-items: end; gap: .75rem; margin-left: auto; }
+.test-generation-page .review-fields { width: 100%; display: grid; grid-template-columns: minmax(220px, .45fr) minmax(320px, 1fr) auto; align-items: end; gap: .75rem; margin-left: auto; }
 .test-generation-page .review-fields label { display: flex; flex-direction: column; gap: .3rem; color: #697386; font-size: .7rem; font-weight: 750; }
 .test-generation-page .review-fields input, .test-generation-page .review-fields textarea { width: 100%; box-sizing: border-box; }
-.test-generation-page .review-fields textarea { min-height: 46px; resize: vertical; }
+.test-generation-page .review-fields input, .test-generation-page .review-fields textarea { height: 58px; min-height: 58px; }
+.test-generation-page .review-fields textarea { resize: none; }
+.test-generation-page .review-fields > .primary-button { height: 58px; align-self: end; white-space: nowrap; }
 @media (max-width: 800px) { .test-generation-page .review-fields { grid-template-columns: 1fr; } .test-generation-page .review-fields .primary-button { justify-self: start; } }
 .test-generation-summary-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .85rem; }
 .test-generation-metric { display: grid; grid-template-columns: auto 1fr; gap: .25rem .55rem; align-items: center; padding: .9rem; border: 1px solid #e5e8ef; border-radius: 10px; background: #fff; color: #3d6eac; }
