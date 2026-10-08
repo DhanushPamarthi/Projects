@@ -8,14 +8,14 @@ Patterns based on the latest paired sample supplied in chat. Each row has outer 
 |---|---|---|
 | `id` | Unique integer row ID | Use a new ID or let the database assign it. Never copy the example ID. |
 | `load_id` | Batch ID string | Use the same value for membership and prescription rows in one load. |
-| `created_time` | ISO 8601 timestamp in UTC | Use one consistent batch timestamp, e.g. `YYYY-MM-DDTHH:mm:ss+00:00`. |
+| `created_time` | ISO 8601 timestamp in UTC | Use one consistent batch timestamp in 2026, e.g. `2026-MM-DDTHH:mm:ss+00:00`. |
 | `data` | JSON object | Populate the entity-specific fields below. |
 
 ## Membership `data` fields
 
 | JSON path | Pattern | Example / relationship rule |
 |---|---|---|
-| `data.member_id` | Unique synthetic member ID | `PBM7-MEMBER-{YYYYMMDD}-{sequence}`. Use the same value in the linked prescription. |
+| `data.member_id` | Unique synthetic member ID | `PBM7-MEMBER-2026MMDD-{sequence}`. Use a valid 2026 month/day and the same value in the linked prescription. |
 | `data.subscriber_id` | Subscriber ID | Same as `member_id` for a subscriber; use the subscriber's ID for a dependent. |
 | `data.first_name` | Fictional first name | Use synthetic names only; vary by generated record. |
 | `data.last_name` | Fictional last name | Use synthetic names only; vary by generated record. |
@@ -38,7 +38,7 @@ Patterns based on the latest paired sample supplied in chat. Each row has outer 
 | JSON path | Pattern | Example / relationship rule |
 |---|---|---|
 | `data.member_id` | Membership foreign key | Must equal the paired membership's `data.member_id`. |
-| `data.prescription_id` | Unique synthetic prescription ID | `PBM7-RX-{YYYYMMDD}-{sequence}`. |
+| `data.prescription_id` | Unique synthetic prescription ID | `PBM7-RX-2026MMDD-{sequence}`. Use a valid 2026 month/day. |
 | `data.rx_number` | Prescription number | Unique per prescription; can match `prescription_id` if accepted by the target schema. |
 | `data.drug_name` | Synthetic medication name | Use a fictional test medication, or a valid test fixture when drug lookup is enforced. |
 | `data.strength` | Medication strength | Use a schema-valid value such as `25 MG`; keep consistent with the chosen medication. |
@@ -46,7 +46,7 @@ Patterns based on the latest paired sample supplied in chat. Each row has outer 
 | `data.therapy_code` | Supported therapy code | Use `PBM-REFILL` for refill scenarios when accepted by the target system. |
 | `data.status` | Supported prescription status | `ACTIVE` for an active prescription; use a supported inactive status for negative cases. |
 | `data.eligible_ind` | Boolean eligibility flag | `true` for eligible cases, `false` for ineligible cases. Must agree with the test case. |
-| `data.next_refill_date` | ISO date (`YYYY-MM-DD`) | Set on/before the campaign date for due cases; after it for not-yet-due cases. |
+| `data.next_refill_date` | ISO date (`YYYY-MM-DD`) | Must be a date in 2026. Set on/before the 2026 campaign date for due cases; after it for not-yet-due cases. |
 | `data.refills_allowed` | Nonnegative integer | Total refills allowed by the scenario. |
 | `data.refills_remaining` | Nonnegative integer | Usually between `0` and `refills_allowed`; use `0` for no-refills-left scenarios. |
 | `data.autofill_enrolled_ind` | Boolean enrollment flag | `false` for not enrolled; `true` for enrolled scenarios. |
@@ -66,6 +66,8 @@ Patterns based on the latest paired sample supplied in chat. Each row has outer 
 
 ## Consistency checks
 
+- All generated date values must fall in calendar year 2026, including timestamps, date-of-birth/effective/termination dates, prescribed/dispensed dates, and refill dates when those fields are present. Use valid calendar dates and keep related dates logically ordered.
+- Use a campaign date in 2026 when deciding whether a refill is due; do not compare 2026 refill dates against a date from another year.
 - The two records for one scenario share `load_id`, `member_id`, `source_event_id`, and `source_correlation_id` when the ingestion contract expects them to represent one linked event.
 - IDs must be unique across generated scenarios. Keep `member_id`, `prescription_id`, and `rx_number` distinct where the target system requires distinct identifiers.
 - Keep phone and SMS preference values identical.
