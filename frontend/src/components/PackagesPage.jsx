@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { ArrowRight, CheckCircle2, FileStack, PackageOpen, RefreshCw } from "lucide-react";
 import { listManifests, listProjects } from "../api/client.js";
 import { LoadingSpinner } from "./LoadingSpinner.jsx";
+import { AppSelect } from "./AppSelect.jsx";
 
 export function PackagesPage({ onOpenBusinessRequirements }) {
   const [project, setProject] = useState(() => JSON.parse(localStorage.getItem("testiq_current_project") || "null"));
@@ -11,7 +12,7 @@ export function PackagesPage({ onOpenBusinessRequirements }) {
   useEffect(() => { if (project?.project_id) loadPackages(project.project_id); }, [project?.project_id]);
   async function selectProject(id) { const selected = projects.find((item) => item.project_id === id) || null; setProject(selected); if (selected) localStorage.setItem("testiq_current_project", JSON.stringify(selected)); else localStorage.removeItem("testiq_current_project"); }
   return <div className="packages-page"><div className="page-heading"><div><div className="eyebrow">RESOURCE PACKAGES</div><h1>Resource Packages</h1><p>View the document versions captured for each generation flow.</p></div><button className="secondary-button" onClick={() => loadPackages(project?.project_id, true)} disabled={loading}>{loading ? <LoadingSpinner variant="inline" label="Refreshing" /> : <><RefreshCw size={16} /> Refresh</>}</button></div>
-    <div className="package-project-bar"><div><span className="muted-label">Project</span><strong>{project?.project_name || "Select a project"}</strong></div><select value={project?.project_id || ""} onChange={(event) => selectProject(event.target.value)}><option value="">Choose project</option>{projects.map((item) => <option key={item.project_id} value={item.project_id}>{item.project_name}</option>)}</select></div>
+    <div className="package-project-bar"><div><span className="muted-label">Project</span><strong>{project?.project_name || "Select a project"}</strong></div><AppSelect value={project?.project_id || ""} onChange={(event) => selectProject(event.target.value)}><option value="">Choose project</option>{projects.map((item) => <option key={item.project_id} value={item.project_id}>{item.project_name}</option>)}</AppSelect></div>
     {error && <div className="error-message">Unable to load packages: {error}</div>}
     {!project && <div className="packages-empty"><div className="empty-state-icon"><PackageOpen size={25} /></div><h2>Select a project</h2><p>Choose a project to view its Resource Packages.</p></div>}
     {project && loading && <LoadingSpinner variant="section" label="Loading Resource Packages" detail="Retrieving the latest package versions." />}

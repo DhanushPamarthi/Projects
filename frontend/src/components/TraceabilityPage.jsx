@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { FileSearch } from "lucide-react";
 import { LoadingSpinner } from "./LoadingSpinner.jsx";
 import { getProject, getTestCaseCoverageReview, listGeneratedTestCases, listManifests, listProjects, listRequirementAnalyses } from "../api/client.js";
+import { AppSelect } from "./AppSelect.jsx";
 
 function readStoredJson(key) {
   try {
@@ -204,7 +205,7 @@ export function TraceabilityPage() {
 
   return <div className="requirements-page">
     <div className="page-heading"><div><div className="eyebrow">TRACEABILITY MATRIX</div><h1>Traceability</h1><p>Review business requirement coverage and the generated test cases linked to each requirement.</p></div></div>
-    <div className="requirements-toolbar"><div><label>Project</label><select value={project?.project_id || ""} onChange={(event) => selectProject(event.target.value)}><option value="">Select project</option>{projects.map((item) => <option key={item.project_id} value={item.project_id}>{item.project_name}</option>)}</select></div><div><label>Source package</label><select value={packageId} onChange={(event) => selectPackage(event.target.value)} disabled={!packages.length}><option value="">Select package</option>{packages.map((item) => <option key={item.package_id} value={item.package_id}>{item.package_name || item.scope || "Source package"} - v{item.package_version || "?"}</option>)}</select></div></div>
+    <div className="requirements-toolbar"><div><label>Project</label><AppSelect value={project?.project_id || ""} onChange={(event) => selectProject(event.target.value)}><option value="">Select project</option>{projects.map((item) => <option key={item.project_id} value={item.project_id}>{item.project_name}</option>)}</AppSelect></div><div><label>Source package</label><AppSelect value={packageId} onChange={(event) => selectPackage(event.target.value)} disabled={!packages.length}><option value="">Select package</option>{packages.map((item) => <option key={item.package_id} value={item.package_id}>{item.package_name || item.scope || "Source package"} - v{item.package_version || "?"}</option>)}</AppSelect></div></div>
     {error && <div className="error-message">{error}</div>}
     {loading ? <LoadingSpinner variant="page" label="Loading traceability" detail="Linking source evidence to requirements and generated artifacts." />
       : !analysis ? <section className="requirements-empty"><div className="empty-state-icon"><FileSearch size={25} /></div><h2>No analysis available yet</h2><p>Run Functional Requirements for a source package to view traceability links.</p></section>

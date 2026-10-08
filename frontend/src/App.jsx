@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Activity, Bell, BookOpen, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, CircleAlert, CircleHelp, ClipboardCheck, Database, FileCheck2, FileStack, FolderPlus, FlaskConical, Gauge, LayoutDashboard, LoaderCircle, LogOut, Menu, PackageOpen, Settings, ShieldCheck, X } from "lucide-react";
+import { Activity, Bell, BookOpen, ChevronDown, ChevronLeft, ChevronRight, ClipboardCheck, Database, FileCheck2, FileStack, FlaskConical, Gauge, LayoutDashboard, LoaderCircle, LogOut, Menu, PackageOpen, ShieldCheck, UploadCloud, X } from "lucide-react";
 import { LoginPage } from "./components/LoginPage.jsx";
 import { RegisterPage } from "./components/RegisterPage.jsx";
 import { ProjectsPage } from "./components/ProjectsPage.jsx";
@@ -17,7 +17,7 @@ import { DashboardPage } from "./components/DashboardPage.jsx";
 import { logoutUser } from "./api/client.js";
 import { ToastContainer } from "react-toastify";
 import { toast } from "react-toastify";
-import { clearFinishedActivities, dismissActivity, reconcileStaleActivities, recoverInterruptedTabActivities, useActivities } from "./activity/activityStore.js";
+import { reconcileStaleActivities, recoverInterruptedTabActivities, useActivities } from "./activity/activityStore.js";
 
 function displayNameFromEmail(email) { return String(email || "").split("@")[0].replace(/[._-]+/g, " ").trim().split(/\s+/).filter(Boolean).map((part) => part[0].toUpperCase() + part.slice(1).toLowerCase()).join(" "); }
 
@@ -29,21 +29,18 @@ if (localStorage.getItem(WORKSPACE_STATE_VERSION_KEY) !== WORKSPACE_STATE_VERSIO
   Object.keys(localStorage).filter((key) => key === "testiq_current_project" || key === "testiq_current_package" || key === GENERATION_ANALYSIS_KEY || key === "testiq_workspace_activities_v1" || key.startsWith("testiq_business_rule_selection:") || key.startsWith("testiq_functional_review_draft:")).forEach((key) => localStorage.removeItem(key));
   localStorage.setItem(WORKSPACE_STATE_VERSION_KEY, WORKSPACE_STATE_VERSION);
 }
-const VALID_NAV_ITEMS = new Set(["overview", "projects", "sources", "packages", "business-requirements", "requirements", "test-cases", "test-data", "test-results", "activity", "traceability", "knowledge-base", "token-usage"]);
+const VALID_NAV_ITEMS = new Set(["projects", "sources", "packages", "business-requirements", "requirements", "test-cases", "test-data", "test-results", "traceability", "knowledge-base", "dashboard", "token-usage"]);
 const NAV_ITEMS = [
-  { id: "overview", label: "Overview", icon: LayoutDashboard },
-  { id: "projects", label: "Projects & BRD", icon: FolderPlus },
+  { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
+  { id: "projects", label: "Upload Document", icon: UploadCloud },
   { id: "test-cases", label: "Test cases", icon: ClipboardCheck },
   { id: "test-results", label: "Test Results", icon: FileCheck2 },
-  { id: "sources", label: "Source Documents", icon: FileStack },
-  { id: "packages", label: "Packages", icon: PackageOpen },
-  { id: "knowledge-base", label: "Knowledge Base", icon: BookOpen },
-  { id: "test-data", label: "Test data", icon: Database },
-  { id: "activity", label: "Activity", icon: Activity },
-  { id: "traceability", label: "Traceability", icon: ShieldCheck, section: "Workspace tools" },
-  { id: "dashboard", label: "Dashboard", icon: LayoutDashboard, section: "Workspace tools" },
-  { id: "token-usage", label: "LLM Token Usage", icon: Gauge, section: "Workspace tools" },
-  { id: "settings", label: "Settings", icon: Settings, section: "Workspace tools", disabled: true },
+  { id: "traceability", label: "Traceability", icon: ShieldCheck },
+  { id: "sources", label: "Source Documents", icon: FileStack, parent: "traceability" },
+  { id: "packages", label: "Packages", icon: PackageOpen, parent: "traceability" },
+  { id: "knowledge-base", label: "Knowledge Base", icon: BookOpen, parent: "traceability" },
+  { id: "test-data", label: "Test data", icon: Database, parent: "traceability" },
+  { id: "token-usage", label: "LLM Token Usage", icon: Gauge, parent: "traceability" },
 ];
 
 function canAccessNavItem(user, item) {
@@ -53,18 +50,21 @@ function canAccessNavItem(user, item) {
 }
 
 function Navigation({ items, activeNav, onNavigate, onLogout, user, initials, expanded, mobile = false }) {
-  const primaryItems = items.filter((item) => !item.section);
-  const toolItems = items.filter((item) => item.section === "Workspace tools");
-  const renderItem = ({ id, label, icon: Icon, badge, badgeLabel, disabled, running }) => (
-    <button key={id} type="button" className={`sidebar-nav-item ${activeNav === id ? "selected" : ""}`} aria-label={label} aria-current={activeNav === id ? "page" : undefined} aria-disabled={disabled || undefined} title={expanded ? undefined : label} onClick={() => !disabled && onNavigate(id)}>
+  const traceabilityChildren = items.filter((item) => item.parent === "traceability");
+  const primaryItems = items.filter((item) => !item.parent);
+  const childIsActive = traceabilityChildren.some((item) => item.id === activeNav);
+  const [traceabilityOpen, setTraceabilityOpen] = useState(() => localStorage.getItem("testiq_traceability_menu_open") === "true" || childIsActive);
+  useEffect(() => { if (childIsActive) setTraceabilityOpen(true); }, [childIsActive]);
+  useEffect(() => { localStorage.setItem("testiq_traceability_menu_open", String(traceabilityOpen)); }, [traceabilityOpen]);
+  const renderItem = ({ id, label, icon: Icon, badge, badgeLabel, disabled, running }, nested = false) => (
+    <button key={id} type="button" className={`sidebar-nav-item ${nested ? "sidebar-nav-child" : ""} ${activeNav === id ? "selected" : ""}`} aria-label={label} aria-current={activeNav === id ? "page" : undefined} aria-disabled={disabled || undefined} title={expanded ? undefined : label} onClick={() => !disabled && onNavigate(id)}>
       <Icon size={18} aria-hidden="true" /><span className="sidebar-nav-label">{label}</span>{running && <LoaderCircle className="spin nav-runner" size={16} aria-label={`${label} is running`} />}{badge && <span className="nav-badge" aria-label={badgeLabel}>{badge}</span>}
     </button>
   );
   return <>
     <div className="brand-lockup"><div className="brand-mark"><FlaskConical size={19} /></div><div className="brand-copy"><div className="brand-name">Dava.Test<span>IQ</span></div><div className="brand-caption">Source workspace</div></div></div>
-    <div className="sidebar-section-label">Workspace</div><nav className="sidebar-nav" aria-label="Workspace navigation">{primaryItems.map(renderItem)}</nav>
-    {toolItems.length > 0 && <><div className="sidebar-divider" /><div className="sidebar-section-label">Workspace tools</div><nav className="sidebar-nav" aria-label="Workspace tools">{toolItems.map(renderItem)}</nav></>}
-    <div className="sidebar-spacer" /><div className="sidebar-help"><CircleHelp size={18} aria-hidden="true" /><div className="sidebar-help-copy"><strong>Need a hand?</strong><span>Read the source guide</span></div></div>
+    <div className="sidebar-section-label">Workspace</div><nav className="sidebar-nav" aria-label="Workspace navigation">{primaryItems.map((item) => item.id !== "traceability" ? renderItem(item) : <div className={`sidebar-nav-group ${traceabilityOpen ? "is-open" : ""}`} key={item.id}><div className="sidebar-nav-parent">{renderItem(item)}<button type="button" className="sidebar-subnav-toggle" aria-label={`${traceabilityOpen ? "Hide" : "Show"} Traceability tools`} aria-expanded={traceabilityOpen} onClick={() => setTraceabilityOpen((open) => !open)}><ChevronDown size={15} /></button></div>{traceabilityOpen && <div className="sidebar-subnav" aria-label="Traceability tools">{traceabilityChildren.map((child) => renderItem(child, true))}</div>}</div>)}</nav>
+    <div className="sidebar-spacer" />
     <button type="button" className="sidebar-user" aria-label={`Log out ${user?.name || user?.email || "user"}`} onClick={onLogout}><span className="avatar small">{initials}</span><span className="sidebar-user-copy"><strong>{user?.name}</strong><span>{user?.email}</span></span><LogOut size={16} aria-hidden="true" /></button>
     {mobile && <span className="sr-only">Navigation menu</span>}
   </>;
@@ -87,25 +87,6 @@ function storedGenerationAnalysis() {
   return analysis;
 }
 
-function activityTime(value) {
-  if (!value) return "";
-  return new Date(value).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-}
-
-function ActivityIcon({ status }) {
-  if (status === "running") return <LoaderCircle className="spin" size={17} />;
-  if (status === "completed") return <CheckCircle2 size={17} />;
-  return <CircleAlert size={17} />;
-}
-
-function ActivityPage({ activities, onNavigate }) {
-  const running = activities.filter((item) => item.status === "running").length;
-  return <div className="activity-page"><div className="page-heading"><div><div className="eyebrow">WORKSPACE OPERATIONS</div><h1>Activity</h1><p>Follow uploads, Knowledge Base processing, and generation work across the complete workflow.</p></div>{activities.some((item) => item.status !== "running") && <button type="button" className="secondary-button" onClick={clearFinishedActivities}>Clear finished</button>}</div>
-    <section className="activity-summary"><div><strong>{running}</strong><span>Running</span></div><div><strong>{activities.filter((item) => item.status === "completed").length}</strong><span>Completed</span></div><div><strong>{activities.filter((item) => item.status === "failed").length}</strong><span>Needs attention</span></div></section>
-    {!activities.length ? <section className="requirements-empty"><div className="empty-state-icon"><Activity size={24} /></div><h2>No recorded activity</h2><p>Operations will appear here when you upload documents or start generation.</p></section> : <section className="activity-list">{activities.map((item) => <article className={`activity-row ${item.status}`} key={item.id}><span className="activity-row-icon"><ActivityIcon status={item.status} /></span><div className="activity-row-main"><div><strong>{item.label}</strong><span className={`activity-status ${item.status}`}>{item.status === "running" ? "Running" : item.status === "completed" ? "Completed" : "Failed"}</span></div><p>{item.detail || "Processing"}</p>{item.status === "running" && <div className={`activity-progress ${item.progress == null ? "indeterminate" : ""}`}><span style={item.progress == null ? undefined : { width: `${item.progress}%` }} /></div>}<small>Started {activityTime(item.startedAt)}{item.updatedAt ? ` · Updated ${activityTime(item.updatedAt)}` : ""}</small></div><div className="activity-row-actions"><button type="button" className="text-button" onClick={() => onNavigate(item.section || "activity")}>Open</button>{item.status !== "running" && <button type="button" className="icon-button" aria-label={`Dismiss ${item.label}`} onClick={() => dismissActivity(item.id)}><X size={15} /></button>}</div></article>)}</section>}
-  </div>;
-}
-
 export default function App() {
   const [user, setUser] = useState(() => { const saved = localStorage.getItem("testiq_current_user"); const authenticated = localStorage.getItem("testiq_auth_token") || localStorage.getItem("testiq_local_session") === "true"; return saved && authenticated ? JSON.parse(saved) : null; });
   const [authView, setAuthView] = useState("login"); const [activeNav, setActiveNav] = useState(() => { const saved = localStorage.getItem(ACTIVE_NAV_KEY); return VALID_NAV_ITEMS.has(saved) ? saved : "projects"; }); const [generationAnalysis, setGenerationAnalysisState] = useState(storedGenerationAnalysis);
@@ -122,7 +103,6 @@ export default function App() {
   const runningActivityCount = activities.filter((item) => item.status === "running").length;
   const navigationItems = NAV_ITEMS.map((item) => {
     const running = activities.some((activity) => activity.status === "running" && activity.section === item.id);
-    if (item.id === "activity" && runningActivityCount) return { ...item, running, badge: runningActivityCount, badgeLabel: `${runningActivityCount} running activities` };
     return running ? { ...item, running: true } : item;
   });
   const availableNavItems = navigationItems.filter((item) => canAccessNavItem(user, item));
@@ -166,6 +146,6 @@ export default function App() {
       <button type="button" className="mobile-sidebar-close" aria-label="Close navigation menu" onClick={() => setMobileMenuOpen(false)}><X size={20} /></button>
       <Navigation items={visibleNavItems} activeNav={currentNav} onNavigate={navigate} onLogout={handleLogout} user={{ ...user, name }} initials={initials} expanded mobile />
     </aside>
-    <main className="workspace-main"><header className="workspace-topbar"><div className="topbar-leading"><button type="button" className="mobile-menu-button" aria-label="Open navigation menu" aria-controls="mobile-navigation" aria-expanded={mobileMenuOpen} onClick={() => setMobileMenuOpen(true)}><Menu size={20} /></button><div className="breadcrumb"><span>Workspace</span><span className="breadcrumb-slash">/</span><strong>{activeLabel}</strong></div></div><div className="topbar-actions"><button className="icon-button" aria-label="Notifications"><Bell size={18} /><span className="notification-dot" /></button><div className="topbar-user"><span className="avatar">{initials}</span><span>{name}</span><ChevronDown size={15} /></div></div></header><div className="workspace-content" ref={workspaceContentRef}>{!authorizedNav ? <div className="empty-state-panel"><h2>No workspace sections available</h2><p>Your account does not have access to any workspace sections.</p></div> : currentNav === "dashboard" ? <DashboardPage onNavigate={navigate} /> : currentNav === "projects" ? <ProjectsPage onOpenTestCases={openTestCaseGeneration} /> : currentNav === "sources" ? <SourceDocumentsPage /> : currentNav === "packages" ? <PackagesPage onOpenBusinessRequirements={() => navigate("business-requirements")} /> : currentNav === "business-requirements" ? <BusinessRequirementsPage onContinueToKnowledgeBase={() => navigate("knowledge-base")} /> : currentNav === "traceability" ? <TraceabilityPage /> : currentNav === "token-usage" ? <TokenUsagePage /> : currentNav === "knowledge-base" ? <KnowledgeBasePage onContinueToFunctional={() => navigate("requirements")} onOpenBusinessRequirements={() => navigate("business-requirements")} /> : currentNav === "requirements" ? <RequirementsPage onContinueToGeneration={openTestCaseGeneration} onOpenBusinessRequirements={() => navigate("business-requirements")} onOpenKnowledgeBase={() => navigate("knowledge-base")} /> : currentNav === "test-cases" ? <TestCaseGenerationPage analysis={currentGenerationAnalysis} onBack={() => setActiveNav("requirements")} onContinueToTestData={() => setActiveNav("test-data")} onReviewSaved={() => { toast.success("Test case review saved."); setActiveNav("test-data"); }} onAnalysisUnavailable={clearGenerationAnalysis} /> : currentNav === "test-data" ? <TestDataGenerationPage analysis={currentGenerationAnalysis} onGoToTestCases={() => setActiveNav("test-cases")} /> : currentNav === "test-results" ? <TestResultsPage /> : currentNav === "activity" ? <ActivityPage activities={activities} onNavigate={navigate} /> : <div className="empty-state-panel"><div className="empty-state-icon"><Activity size={25} /></div><h2>Workspace</h2><p>Choose a workspace section to continue.</p><button className="primary-button" onClick={() => navigate("projects")}>Open projects</button></div>}</div></main>
+    <main className="workspace-main"><header className="workspace-topbar"><div className="topbar-leading"><button type="button" className="mobile-menu-button" aria-label="Open navigation menu" aria-controls="mobile-navigation" aria-expanded={mobileMenuOpen} onClick={() => setMobileMenuOpen(true)}><Menu size={20} /></button><div className="breadcrumb"><span>Workspace</span><span className="breadcrumb-slash">/</span><strong>{activeLabel}</strong></div></div><div className="topbar-actions"><button className="icon-button" aria-label="Notifications"><Bell size={18} /><span className="notification-dot" /></button><div className="topbar-user"><span className="avatar">{initials}</span><span>{name}</span><ChevronDown size={15} /></div></div></header><div className="workspace-content" ref={workspaceContentRef}>{!authorizedNav ? <div className="empty-state-panel"><h2>No workspace sections available</h2><p>Your account does not have access to any workspace sections.</p></div> : currentNav === "dashboard" ? <DashboardPage onNavigate={navigate} /> : currentNav === "projects" ? <ProjectsPage onOpenTestCases={openTestCaseGeneration} /> : currentNav === "sources" ? <SourceDocumentsPage /> : currentNav === "packages" ? <PackagesPage onOpenBusinessRequirements={() => navigate("business-requirements")} /> : currentNav === "business-requirements" ? <BusinessRequirementsPage onContinueToKnowledgeBase={() => navigate("knowledge-base")} /> : currentNav === "traceability" ? <TraceabilityPage /> : currentNav === "token-usage" ? <TokenUsagePage /> : currentNav === "knowledge-base" ? <KnowledgeBasePage onContinueToFunctional={() => navigate("requirements")} onOpenBusinessRequirements={() => navigate("business-requirements")} /> : currentNav === "requirements" ? <RequirementsPage onContinueToGeneration={openTestCaseGeneration} onOpenBusinessRequirements={() => navigate("business-requirements")} onOpenKnowledgeBase={() => navigate("knowledge-base")} /> : currentNav === "test-cases" ? <TestCaseGenerationPage analysis={currentGenerationAnalysis} onBack={() => navigate("projects")} onContinueToTestData={() => setActiveNav("test-data")} onReviewSaved={() => { toast.success("Test case review saved."); setActiveNav("test-data"); }} onAnalysisUnavailable={clearGenerationAnalysis} /> : currentNav === "test-data" ? <TestDataGenerationPage analysis={currentGenerationAnalysis} onGoToTestCases={() => setActiveNav("test-cases")} /> : currentNav === "test-results" ? <TestResultsPage /> : <div className="empty-state-panel"><div className="empty-state-icon"><Activity size={25} /></div><h2>Workspace</h2><p>Choose a workspace section to continue.</p><button className="primary-button" onClick={() => navigate("projects")}>Open projects</button></div>}</div></main>
   </div></>;
 }

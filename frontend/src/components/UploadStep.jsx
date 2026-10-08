@@ -19,6 +19,7 @@ import { toast as notify } from "react-toastify";
 import { createManifest, createProject, getProject, getRevision, listProjects, listSources, uploadSource } from "../api/client.js";
 import { completeActivity, failActivity, startActivity, updateActivity } from "../activity/activityStore.js";
 import { LoadingSpinner } from "./LoadingSpinner.jsx";
+import { AppSelect } from "./AppSelect.jsx";
 
 const supportingTypes = [
   ["campaign_rules", "Campaign rules"],
@@ -358,7 +359,7 @@ export function UploadStep({ onContinueToBusinessUseCases }) {
     <div className="project-bar">
       <div className="project-context"><span className="project-icon"><FolderPlus size={17} /></span><div><span className="muted-label">Current project</span><strong>{project?.project_name || "No project selected"}</strong></div></div>
       <div className="project-actions">
-        {projects.length > 0 && <select value={project?.project_id || ""} onChange={async (event) => {
+        {projects.length > 0 && <AppSelect value={project?.project_id || ""} onChange={async (event) => {
           const selected = await getProject(event.target.value);
           setProject(selected);
           setProjectName(selected.project_name);
@@ -368,7 +369,7 @@ export function UploadStep({ onContinueToBusinessUseCases }) {
           setSelectedPackageSourceIds([]);
           localStorage.removeItem("testiq_current_package");
           await refreshSources(selected.project_id);
-        }}><option value="">Choose project</option>{projects.map((item) => <option key={item.project_id} value={item.project_id}>{item.project_name}</option>)}</select>}
+        }}><option value="">Choose project</option>{projects.map((item) => <option key={item.project_id} value={item.project_id}>{item.project_name}</option>)}</AppSelect>}
         <span className="project-count">{sources.length} source{sources.length === 1 ? "" : "s"}</span>
       </div>
     </div>
@@ -383,7 +384,7 @@ export function UploadStep({ onContinueToBusinessUseCases }) {
       <section className="upload-panel">
         <div className="panel-title"><div><h2>{currentStep === 1 ? (brds.length ? "Upload an updated BRD" : "Upload your BRD") : "Add a supporting source"}</h2><p>{currentStep === 1 ? (brds.length ? "Upload an updated BRD. The previous file will remain available for traceability." : "Your business requirements document anchors this Resource Package.") : "Connect the context your team needs for accurate test data."}</p></div><span className="step-pill">Step {currentStep} of 3</span></div>
         {currentStep === 1 && <div className="field-block"><label>Project name</label><input value={projectName} disabled={Boolean(project)} onChange={(event) => setProjectName(event.target.value)} placeholder="e.g. PBM Refill Reminder" /><span className="field-hint">A project is created automatically with your first upload.</span></div>}
-        {currentStep === 2 && <div className="field-block"><label>Source type <em>Optional technical context</em></label><select ref={sourceTypeRef} value={sourceType} onChange={(event) => setSourceType(event.target.value)}>{supportingTypes.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><span className="field-hint">Add API, database schema, or other supporting sources when they are available. The BRD is the only required document.</span></div>}
+        {currentStep === 2 && <div className="field-block"><label>Source type <em>Optional technical context</em></label><AppSelect ref={sourceTypeRef} value={sourceType} onChange={(event) => setSourceType(event.target.value)}>{supportingTypes.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</AppSelect><span className="field-hint">Add API, database schema, or other supporting sources when they are available. The BRD is the only required document.</span></div>}
         {currentStep === 1 && <div className="field-block"><label>Expected sections <em>Optional</em></label><input value={requiredSections} onChange={(event) => setRequiredSections(event.target.value)} placeholder="Scope, Requirements, Acceptance Criteria" /><span className="field-hint">Missing sections become review warnings, not upload blockers.</span></div>}
         <div className={`drop-zone-modern ${dragging ? "dragging" : ""}`} onDragOver={(event) => { event.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={(event) => { event.preventDefault(); setDragging(false); chooseFile(event.dataTransfer.files?.[0]); }}>{currentStep === 1 && brds.length > 0 && !file ? <><div className="upload-icon existing"><FileText size={23} /></div><h3 className="existing-file-name" title={brds[0].active_revision?.filename || brds[0].logical_name}>{brds[0].active_revision?.filename || brds[0].logical_name}</h3><p>Current file - v{brds[0].active_revision?.revision || brds[0].revision || 1}</p><label className="choose-file">Upload replacement<input type="file" accept=".docx,.pdf,.txt,.md,.json,.yaml,.yml,.sql,.csv" onChange={(event) => chooseFile(event.target.files?.[0])} /></label></> : <><div className="upload-icon"><CloudUpload size={23} /></div><h3>Drop a file here</h3><p>or choose from your computer</p><label className="choose-file">Choose file<input type="file" accept=".docx,.pdf,.txt,.md,.json,.yaml,.yml,.sql,.csv" onChange={(event) => chooseFile(event.target.files?.[0])} /></label><span className="file-hint">DOCX, PDF, TXT, MD, JSON, YAML, SQL or CSV - up to 25 MB</span></>}</div>
         {file && <div className="selected-file"><span className="file-type"><FileText size={17} /></span><div><strong>{file.name}</strong><span>{(file.size / 1024).toFixed(1)} KB - Ready to upload</span></div><button onClick={() => setFile(null)}><X size={17} /></button></div>}
