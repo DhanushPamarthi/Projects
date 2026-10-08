@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { ClipboardList } from "lucide-react";
-import { listGeneratedTestCases } from "../api/client.js";
+import { ClipboardList, LoaderCircle } from "lucide-react";
+import { listGeneratedTestCases, listRequirementAnalyses } from "../api/client.js";
 import { TestDataStage } from "./TestDataStage.jsx";
 import { LoadingSpinner } from "./LoadingSpinner.jsx";
 import { WorkspacePageHero } from "./WorkspacePageHero.jsx";
@@ -15,19 +15,29 @@ export function TestDataGenerationPage({ analysis, onGoToTestCases }) {
   const [error, setError] = useState("");
 
   useEffect(() => {
-    if (!analysis?.analysis_id) {
+    if (!analysis?.analysis_id && !(analysis?.generation_pipeline && analysis?.package_id)) {
       setGeneration(null);
       return;
     }
     let active = true;
     setLoading(true);
     setError("");
-    listGeneratedTestCases(analysis.analysis_id)
-      .then((items) => { if (active) setGeneration(items[0] || null); })
+    const loadSavedGeneration = async () => {
+      let analysisId = analysis?.analysis_id;
+      if (!analysisId) {
+        const analyses = await listRequirementAnalyses(analysis.package_id);
+        analysisId = (analyses || []).find((item) => item.analysis_kind === "functional")?.analysis_id;
+      }
+      if (!analysisId) return null;
+      const items = await listGeneratedTestCases(analysisId);
+      return items?.[0] || null;
+    };
+    loadSavedGeneration()
+      .then((item) => { if (active) setGeneration(item); })
       .catch((err) => { if (active) setError(err.message || "Could not load generated test cases."); })
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
-  }, [analysis?.analysis_id]);
+  }, [analysis?.analysis_id, analysis?.generation_pipeline, analysis?.package_id]);
 
   const contract = getContract(generation);
   const approvedCases = (contract.test_cases || []).filter((item) => (item.review_status || item.approval?.status || "pending") === "approved").map((item) => ({ ...item, reviewStatus: item.review_status || item.approval?.status || "pending" }));

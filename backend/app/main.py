@@ -2222,6 +2222,7 @@ def seed_default_test_data_templates():
             "member_id": "MEMBER-TEST-001", "subscriber_id": "MEMBER-TEST-001", "dependent_number": None,
             "relationship_to_subscriber": None, "first_name": "Alice", "middle_name": None,
             "last_name": "Johnson", "date_of_birth": "1985-04-15", "gender": "F", "status": "ACTIVE",
+            "speciality_id": "PBM7-SPECIALTY-TEST-001",
             "preferred_language": "EN", "marital_status": None, "race_ethnicity": None,
             "effective_date": "2026-01-01", "termination_date": None, "addresses": [],
             "phones": [{"phone_type": "MOBILE", "phone_number": "+15550000001", "is_primary": True}],
@@ -2236,6 +2237,7 @@ def seed_default_test_data_templates():
             "member_id": "MEMBER-TEST-001", "prescription_id": "RX-TEST-001", "rx_number": "RX-TEST-001",
             "ndc": "00000000001", "drug_name": "Test Medication", "strength": "40 MG",
             "dosage_form": "TABLET", "route": "ORAL", "manufacturer": "Test Manufacturer",
+            "therapy_code": "PBM-REFILL", "autofill_enrolled_ind": False,
             "prescriber_id": "PRESCRIBER-001", "prescribed_date": "2026-01-15", "refills_allowed": 3,
             "refills_remaining": 2, "next_refill_date": "2026-10-15", "eligible_ind": True,
             "status": "ACTIVE", "refill_number": 0, "dispensed_date": None, "days_supply": None,
@@ -4107,12 +4109,15 @@ def _test_data_eligibility_expectation(test_case):
 
 def _test_case_requires_prescription(test_case):
     text = _test_case_text(test_case).lower()
-    return bool(re.search(r"\b(?:prescriptions?|rx|refills?|drugs?|medications?|pharmacy)\b", text))
+    # Test-case data_needs commonly use snake_case identifiers (rx_number,
+    # prescription_id, refills_remaining). Treat an underscore as a field-name
+    # boundary so those cases are classified just like natural-language terms.
+    return bool(re.search(r"\b(?:prescriptions?|rx|refills?|drugs?|medications?|pharmacy|ndc|prescriber)(?:\b|_)", text))
 
 
 def _test_case_requires_membership(test_case):
     text = _test_case_text(test_case).lower()
-    return bool(re.search(r"\b(?:members?|membership|subscribers?|dependents?|contact|communication|consent|phone|email|address)\b", text))
+    return bool(re.search(r"\b(?:members?|membership|subscribers?|dependents?|contact|communication|consent|phone|email|address)(?:\b|_)", text))
 
 
 def _constrain_template_eligibility(schema, payload, test_case):
@@ -4156,6 +4161,13 @@ def _stamp_domain_template_payload(payload, template, generation_id, test_case_i
 
     visit(stamped)
     if entity in {"membership", "member", "member_details"}:
+        primary_phones = [item.get("phone_number") for item in stamped.get("phones", [])
+                          if isinstance(item, dict) and item.get("is_primary") and item.get("phone_number")]
+        if primary_phones:
+            for preference in stamped.get("communication_preferences", []):
+                if isinstance(preference, dict) and str(preference.get("channel", "")).upper() == "SMS" and preference.get("enabled"):
+                    preference["value"] = primary_phones[0]
+    if entity in {"membership", "member", "member_details"}:
         member_id = _unique_test_value("member_id", identity_scope, test_case_id)
         stamped["member_id"] = member_id
         if "subscriber_id" in stamped:
@@ -4177,6 +4189,16 @@ def _validate_domain_template_payload(payload, template, test_case, member_id=No
     entity = str(template.get("entity_name") or "").lower()
     if entity in {"membership", "member", "member_details"} and not payload.get("member_id"):
         raise HTTPException(422, "Generated Membership template data is missing member_id.")
+    if entity in {"membership", "member", "member_details"}:
+        primary_phones = [item.get("phone_number") for item in payload.get("phones", [])
+                          if isinstance(item, dict) and item.get("is_primary")]
+        for preference in payload.get("communication_preferences", []):
+            if not isinstance(preference, dict) or str(preference.get("channel", "")).upper() != "SMS" or not preference.get("enabled"):
+                continue
+            if preference.get("value") not in primary_phones:
+                raise HTTPException(422, "Enabled SMS preference must match the membership's primary phone number.")
+            if not re.fullmatch(r"\+1555\d{7}", str(preference.get("value") or "")):
+                raise HTTPException(422, "Generated SMS contact must use a safe synthetic +1-555 test number.")
     if entity in {"prescription", "prescriptions"}:
         if not payload.get("prescription_id"):
             raise HTTPException(422, "Generated Prescription template data is missing prescription_id.")
@@ -4185,6 +4207,12 @@ def _validate_domain_template_payload(payload, template, test_case, member_id=No
         expected = _test_data_eligibility_expectation(test_case)
         if expected is not None and payload.get("eligible_ind") is not expected:
             raise HTTPException(422, "Generated prescription eligibility does not match the approved test case.")
+        allowed, remaining = payload.get("refills_allowed"), payload.get("refills_remaining")
+        if allowed is not None and remaining is not None:
+            if isinstance(allowed, bool) or isinstance(remaining, bool) or not isinstance(allowed, int) or not isinstance(remaining, int):
+                raise HTTPException(422, "Prescription refill counts must be whole numbers.")
+            if allowed < 0 or remaining < 0 or remaining > allowed:
+                raise HTTPException(422, "Prescription refills_remaining must be between zero and refills_allowed.")
 
 def _test_data_record_response(row):
     item = row_dict(row)
@@ -4279,7 +4307,7 @@ def _test_data_template_plan_schema(case_ids):
                     "properties": {
                         "template_id": {"type": "string"},
                         "template_name": {"type": "string"},
-                        "entity_name": {"type": "string"},
+                        "entity_name": {"type": "string", "enum": ["membership", "prescription"]},
                         "fields": {
                             "type": "array",
                             "minItems": 1,
@@ -4288,7 +4316,7 @@ def _test_data_template_plan_schema(case_ids):
                                 "type": "object",
                                 "properties": {
                                     "path": {"type": "string"},
-                                    "field_type": {"type": "string", "enum": ["string", "integer", "number", "boolean", "null"]},
+                                    "field_type": {"type": "string", "enum": ["string", "integer", "number", "boolean", "null", "object", "array"]},
                                     "sample_value": {"type": "string"},
                                     "required": {"type": "boolean"},
                                 },
@@ -4328,16 +4356,25 @@ def _template_value_from_sample(field_type, sample_value):
         return value.strip().lower() in {"true", "1", "yes", "y"}
     if field_type == "null":
         return None
+    if field_type in {"object", "array"}:
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return {} if field_type == "object" else []
+        if field_type == "object" and isinstance(parsed, dict):
+            return parsed
+        if field_type == "array" and isinstance(parsed, list):
+            return parsed
+        return {} if field_type == "object" else []
     return value
 
 def _payload_from_template_fields(fields):
     payload = {}
     for field in fields or []:
         raw_path = str(field.get("path") or "").strip()
-        # Keep template shape simple and JSON-object based. Arrays can still be
-        # generated as values later, but the field source itself must come from
-        # Knowledge Base paths/columns.
-        clean_path = re.sub(r"\[[^\]]*\]", "", raw_path)
+        # Array/object fields are supplied as JSON samples at their field path,
+        # keeping the generated shape grounded and easy to validate.
+        clean_path = re.sub(r"\[\]", "", raw_path)
         clean_path = re.sub(r"[^A-Za-z0-9_.]", "_", clean_path).strip("._")
         parts = [part for part in clean_path.split(".") if part]
         if not parts:
@@ -4352,7 +4389,7 @@ def _payload_from_template_fields(fields):
         current[parts[-1]] = _template_value_from_sample(field.get("field_type"), field.get("sample_value"))
     return payload
 
-def _normalize_test_data_templates(plan, case_ids):
+def _normalize_test_data_templates(plan, case_ids, required_entities=None):
     templates = []
     by_raw_id = {}
     used_ids = set()
@@ -4370,10 +4407,13 @@ def _normalize_test_data_templates(plan, case_ids):
         if not payload:
             continue
         normalized = {
-            "template_id": template_id,
+            "template_id": uid("tdtpl"),
             "template_name": str(item.get("template_name") or entity.replace("_", " ").title()).strip() or entity,
             "entity_name": entity,
+            "version": 1,
             "payload_json": json.dumps(payload, sort_keys=True),
+            "source_filename": "generated_from_schema_patterns_and_test_case",
+            "payload": payload,
         }
         used_ids.add(template_id)
         templates.append(normalized)
@@ -4383,17 +4423,34 @@ def _normalize_test_data_templates(plan, case_ids):
     if not templates:
         raise ValueError("Knowledge Base did not provide any usable test data templates")
     assignments = {}
-    default_template = templates[0]
     for case_id in case_ids:
         assigned = []
         for raw_template_id in (plan.get("assignments") or {}).get(case_id, []):
             template = by_raw_id.get(raw_template_id)
+            if template is None:
+                # The structured response schema cannot constrain assignment values
+                # to template IDs, so resolve common model variations by name/ID.
+                normalized_ref = re.sub(r"[^a-zA-Z0-9_:-]+", "_", str(raw_template_id or "")).strip("_").lower()
+                template = next((item for item in templates if normalized_ref in {
+                    item["template_id"].lower(), item["template_name"].lower(), item["entity_name"].lower(),
+                    f"kb_{item['entity_name']}".lower(),
+                }), None)
             if template and template["template_id"] not in {item["template_id"] for item in assigned}:
                 assigned.append(template)
-        assignments[case_id] = assigned or [default_template]
+        # If the model used an unresolvable reference, the approved-case entity
+        # requirements are authoritative. Use the derived schema template for each
+        # required entity, then keep the existing exact-entity validation below.
+        if required_entities and not assigned:
+            for entity in required_entities.get(case_id, []):
+                template = next((item for item in templates if item["entity_name"] == entity), None)
+                if template and template["template_id"] not in {item["template_id"] for item in assigned}:
+                    assigned.append(template)
+        if not assigned:
+            raise ValueError(f"Knowledge Base did not assign a generated template to approved test case {case_id}")
+        assignments[case_id] = assigned
     return assignments
 
-def _derive_test_data_templates_with_openai(case_ids, cases, rag_context):
+def _derive_test_data_templates_with_openai(case_ids, cases, schema_evidence, pattern_guidance, required_entities):
     if not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY is not configured for Knowledge Base template derivation")
     from openai import OpenAI
@@ -4404,15 +4461,17 @@ def _derive_test_data_templates_with_openai(case_ids, cases, rag_context):
     ]
     prompt = {
         "instructions": (
-            "Derive test data templates only from the selected package Knowledge Base evidence. "
-            "Use database columns, API request fields, message template variables, and BRD data terms found in retrieved_knowledge_evidence. "
-            "Do not use built-in or assumed application templates. Do not invent large unrelated record shapes. "
-            "Return compact templates with fields needed to create the pre-step data for the approved test cases. "
-            "Use dot-separated object paths such as member.member_id or prescription.status; do not use array paths. "
-            "Assign at least one returned template to every approved test case."
+            "Create case-specific Bronze membership and prescription data templates using only the provided database schema evidence, pattern rules, and approved test cases. "
+            "Do not use any built-in or previously saved Membership or Prescription template. Do not invent fields absent from the schema or pattern evidence. "
+            "Return only the JSON data payload fields; field paths are relative to data (for example member_id, never data.member_id). The outer id, load_id, created_time, and data wrapper are added by the ingestion flow. "
+            "For nested arrays or objects, use one field whose sample_value is a JSON string, such as field_type=array with sample_value='[{\"phone_type\":\"MOBILE\",...}]'. "
+            "Return only fields needed for the cases, preserve schema names and types, and include member_id and required relationship fields when supported. "
+            "Every approved case must be assigned exactly the entity types needed by the case."
         ),
         "approved_test_cases": selected_cases,
-        "retrieved_knowledge_evidence": _rag_context_for_prompt(rag_context, max_evidence=18, max_fragment_characters=1100, max_rules=10, max_rule_characters=320),
+        "required_entities_by_case": required_entities,
+        "database_schema_evidence": schema_evidence,
+        "pattern_rules": pattern_guidance,
     }
     response = responses_create(client,
         model=OPENAI_MODEL,
@@ -4422,7 +4481,16 @@ def _derive_test_data_templates_with_openai(case_ids, cases, rag_context):
     )
     if not response.output_text:
         raise ValueError("OpenAI returned no Knowledge Base test data templates")
-    return _normalize_test_data_templates(json.loads(response.output_text), case_ids)
+    templates_by_case = _normalize_test_data_templates(json.loads(response.output_text), case_ids, required_entities)
+    for case_id, assigned in templates_by_case.items():
+        expected_entities = set(required_entities[case_id])
+        actual_entities = {item["entity_name"] for item in assigned}
+        if actual_entities != expected_entities:
+            raise ValueError(
+                f"Generated template entities for {case_id} did not match the approved case requirements "
+                f"(expected {', '.join(sorted(expected_entities))}; received {', '.join(sorted(actual_entities))})."
+            )
+    return templates_by_case
 
 _TEST_DATA_FIELD_STOPWORDS = {
     "select", "from", "where", "table", "column", "string", "integer", "number", "boolean", "object", "array",
@@ -4729,7 +4797,15 @@ def _normalize_test_data_relationships(payload):
         _set_all_matching_keys(payload, "prescription_id", prescription_id)
     return payload
 
-def _generate_test_data_with_openai(templates):
+def _test_data_pattern_guidance():
+    pattern_path = Path(__file__).resolve().parent.parent / "resources" / "patterns" / "membership_prescription_data_patterns.md"
+    try:
+        return pattern_path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise HTTPException(500, "The Membership and Prescription data pattern file is unavailable.") from exc
+
+
+def _generate_test_data_with_openai(templates, pattern_guidance, schema_evidence):
     key = os.getenv("OPENAI_API_KEY")
     if not key:
         raise RuntimeError("OPENAI_API_KEY is not configured for test-data generation")
@@ -4744,8 +4820,10 @@ def _generate_test_data_with_openai(templates):
             _constrain_template_eligibility(payload_schema, template["payload"], case)
         schema = {"type": "object", "properties": {"records": {"type": "object", "properties": case_properties, "required": list(case_properties), "additionalProperties": False}}, "required": ["records"], "additionalProperties": False}
         prompt = {
-            "instructions": "Generate synthetic scenario data for each approved test case using only the supplied versioned BronzeBox template and the approved case including its pre-step setup. Return exactly one complete template-shaped record for every listed test case. Preserve every key and value type. Every array must keep exactly the same number of items as the corresponding template array: fill existing object entries, do not add or remove items, and keep empty template arrays empty. Make values satisfy the case, including negative, boundary, eligibility, refill, and member-to-prescription relationship requirements. If required_prescription_eligibleInd is supplied, copy it into the template's eligible_ind field exactly. Use fictional test data. Copy source_event_id and source_correlation_id from the template; TestIQ replaces those values with run-specific trace IDs before Bronze insertion. Do not add fields or explanations.",
+            "instructions": "Generate synthetic scenario data for each approved test case using only the supplied versioned BronzeBox template, database-schema evidence, pattern rules, and approved case. Return exactly one complete template-shaped record for every listed test case. Preserve every template key and value type. The template describes only the Bronze JSON data object; the database assigns the outer id, load_id, and created_time during ingestion. Do not add or remove fields or array items. Keep phone numbers and SMS preference values aligned, and keep membership and prescription member_id values linked. Make values satisfy the test case, including negative, boundary, eligibility, refill, and relationship requirements. If required_prescription_eligibleInd is supplied, copy it exactly to eligible_ind. Use fictional data and the safe test phone format shown in the pattern rules. Copy source_event_id and source_correlation_id from the template; TestIQ replaces them with run-specific trace IDs before Bronze insertion. If the schema evidence does not support a field or scenario, do not invent a replacement; preserve the supplied template shape and use a schema-supported value. Do not add explanations.",
             "template": {"entity_name": template["entity_name"], "template_name": template["template_name"], "payload_shape_and_examples": template["payload"]},
+            "pattern_rules": pattern_guidance,
+            "database_schema_evidence": schema_evidence,
             "approved_test_cases": [{**{key: case.get(key) for key in ("test_case_id", "title", "description", "scenario", "preconditions", "data_needs", "actions", "steps", "expected_results", "deterministic_inputs") if case.get(key) is not None}, **({"required_prescription_eligibleInd": _test_data_eligibility_expectation(case)} if "eligible_ind" in template["payload"] and _test_data_eligibility_expectation(case) is not None else {})} for case in case_batch],
         }
         response = responses_create(client,
@@ -4916,7 +4994,9 @@ def generate_test_data(generation_id: str, request: TestDataGenerationRequest):
         contract = json.loads(generation["contract_json"])
         assignments = request.assignments or [TestDataCaseAssignment(test_case_id=case_id, template_ids=request.template_ids) for case_id in request.test_case_ids]
         if not assignments:
-            raise HTTPException(422, "Assign at least one template to each selected test case")
+            raise HTTPException(422, "Select at least one approved test case")
+        if request.template_ids or request.template_definitions or any(item.template_ids for item in assignments):
+            raise HTTPException(422, "Templates are created from the approved cases, indexed schema, and pattern rules. Saved template IDs are not used.")
         assignment_case_ids = [item.test_case_id for item in assignments]
         if len(set(assignment_case_ids)) != len(assignment_case_ids):
             raise HTTPException(422, "Each test case assignment must be unique")
@@ -4927,6 +5007,31 @@ def generate_test_data(generation_id: str, request: TestDataGenerationRequest):
         unapproved = [case_id for case_id in assignment_case_ids if _review_status(cases[case_id]) != "approved"]
         if unapproved:
             raise HTTPException(422, {"message": "Test data can only be generated for approved test cases", "not_approved": unapproved})
+        membership_cases = {case_id: _test_case_requires_membership(cases[case_id]) for case_id in assignment_case_ids}
+        prescription_cases = {case_id: _test_case_requires_prescription(cases[case_id]) for case_id in assignment_case_ids}
+        for case_id in assignment_case_ids:
+            if prescription_cases[case_id]:
+                membership_cases[case_id] = True
+        required_entities = {
+            case_id: [entity for entity, required in (("membership", membership_cases[case_id]), ("prescription", prescription_cases[case_id])) if required]
+            for case_id in assignment_case_ids
+        }
+        # If a case has no recognizable domain terms or field names, use the
+        # supported paired-record shape. Prescription fixtures need a linked
+        # member, and both records provide a usable default for generic cases.
+        for case_id, entities in required_entities.items():
+            if not entities:
+                required_entities[case_id] = ["membership", "prescription"]
+        rag_context = _require_test_data_knowledge(generation["package_id"])
+        schema_evidence = [
+            {"source_reference": item.get("source_reference"), "text": str(item.get("fragment_text") or "")[:1800]}
+            for item in rag_context.get("technical_fragments", [])
+            if item.get("source_type") == "database_schema" and item.get("fragment_text")
+        ][:12]
+        if not schema_evidence:
+            raise HTTPException(409, "The package Knowledge Base did not return database-schema evidence. Add/index the database schema before generating test data.")
+        pattern_guidance = _test_data_pattern_guidance()
+        schema_context = [{"source_reference": item["source_reference"], "text": item["text"]} for item in schema_evidence]
         existing_rows = conn.execute(
             "SELECT r.test_case_id,r.status,r.bronze_raw_file_id,"
             "EXISTS (SELECT 1 FROM test_data_bronze_ref ref WHERE ref.record_id=r.record_id) AS sent_to_bronze "
@@ -4945,35 +5050,23 @@ def generate_test_data(generation_id: str, request: TestDataGenerationRequest):
                     "message": "Test data already sent to Bronze is immutable. Create a new test-case generation instead of regenerating it.",
                     "test_case_ids": sent_case_ids,
                 })
-        available_templates = _test_data_templates_for_request(conn, request, assignments)
-        membership_template = available_templates.get("bronze_membership_v1")
-        prescription_template = available_templates.get("bronze_prescription_v1")
-        membership_cases = {assignment.test_case_id: _test_case_requires_membership(cases[assignment.test_case_id]) for assignment in assignments}
-        prescription_cases = {assignment.test_case_id: _test_case_requires_prescription(cases[assignment.test_case_id]) for assignment in assignments}
-        ambiguous_cases = [case_id for case_id in assignment_case_ids if not membership_cases[case_id] and not prescription_cases[case_id]]
-        if ambiguous_cases:
-            raise HTTPException(422, f"Could not determine whether these cases need Membership or Prescription data: {', '.join(ambiguous_cases)}. Clarify the approved scenario and retry.")
-        if any(membership_cases.values()) and not membership_template:
-            raise HTTPException(422, "These approved cases need Membership data, but the BronzeBox Membership template is unavailable.")
-        if any(prescription_cases.values()) and not prescription_template:
-            raise HTTPException(422, "These approved cases need prescription data, but the BronzeBox Prescription template is unavailable.")
-        selected_templates_by_case = {}
-        for assignment in assignments:
-            required_templates = set()
-            if membership_cases[assignment.test_case_id]:
-                required_templates.add("bronze_membership_v1")
-            if prescription_cases[assignment.test_case_id]:
-                required_templates.add("bronze_prescription_v1")
-            requested = set(assignment.template_ids or request.template_ids)
-            if requested and requested != required_templates:
-                raise HTTPException(422, f"{assignment.test_case_id} requires these template(s): {', '.join(sorted(required_templates))}.")
-            selected_templates_by_case[assignment.test_case_id] = [available_templates[item] for item in sorted(required_templates)]
         regeneration_id = uid("regen") if request.replace_existing_drafts and existing_rows else None
         try:
             with usage_scope("test_data", project_id=generation["project_id"], package_id=generation["package_id"], generation_id=generation_id):
-                generated_payloads = _generate_test_data_with_openai(_test_data_generation_batches(assignment_case_ids, cases, selected_templates_by_case))
+                templates_by_case = _derive_test_data_templates_with_openai(
+                    assignment_case_ids,
+                    cases,
+                    schema_evidence,
+                    pattern_guidance,
+                    required_entities,
+                )
+                generated_payloads = _generate_test_data_with_openai(
+                    _test_data_generation_batches(assignment_case_ids, cases, templates_by_case),
+                    pattern_guidance,
+                    schema_evidence,
+                )
         except Exception as exc:
-            raise HTTPException(502, f"OpenAI could not generate test data for the approved cases: {safe_llm_error_message(exc)}. No local data fallback was used.") from exc
+            raise HTTPException(502, f"OpenAI could not create templates or generate test data for the approved cases: {safe_llm_error_message(exc)}. No saved-template or local-data fallback was used.") from exc
         if existing_rows:
             conn.execute("DELETE FROM test_data_record WHERE generation_id=%s AND status='draft' AND test_case_id=ANY(%s)", (generation_id, assignment_case_ids))
         created = []
@@ -4982,22 +5075,29 @@ def generate_test_data(generation_id: str, request: TestDataGenerationRequest):
             test_case = cases[case_id]
             case_payloads = []
             member_id = None
-            if membership_cases[case_id]:
-                member_payload, member_id = _stamp_domain_template_payload(
-                    generated_payloads[(case_id, membership_template["template_id"])], membership_template, generation_id, case_id, regeneration_id=regeneration_id,
-                )
-                _validate_domain_template_payload(member_payload, membership_template, test_case)
-                case_payloads.append((membership_template, member_payload))
-            if prescription_cases[case_id]:
-                prescription_payload, _ = _stamp_domain_template_payload(
-                    generated_payloads[(case_id, prescription_template["template_id"])], prescription_template, generation_id, case_id, member_id, regeneration_id,
-                )
-                _validate_domain_template_payload(prescription_payload, prescription_template, test_case, member_id)
-                case_payloads.append((prescription_template, prescription_payload))
+            case_templates = sorted(templates_by_case[case_id], key=lambda item: (item["entity_name"] != "membership", item["entity_name"]))
+            for record_template in case_templates:
+                generated_payload = generated_payloads[(case_id, record_template["template_id"])]
+                if record_template["entity_name"] == "membership":
+                    payload, member_id = _stamp_domain_template_payload(
+                        generated_payload, record_template, generation_id, case_id, regeneration_id=regeneration_id,
+                    )
+                    _validate_domain_template_payload(payload, record_template, test_case)
+                else:
+                    payload, _ = _stamp_domain_template_payload(
+                        generated_payload, record_template, generation_id, case_id, member_id, regeneration_id,
+                    )
+                    _validate_domain_template_payload(payload, record_template, test_case, member_id)
+                case_payloads.append((record_template, payload))
             pre_steps = []
-            schema_context = []
             for record_template, payload in case_payloads:
                 template_version = record_template["version"]
+                conn.execute(
+                    "INSERT INTO test_data_template (template_id,template_name,entity_name,version,payload_json,source_filename,active,created_at,updated_at) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,FALSE,%s,%s) ON CONFLICT (template_id) DO NOTHING",
+                    (record_template["template_id"], record_template["template_name"], record_template["entity_name"], template_version,
+                     record_template["payload_json"], record_template["source_filename"], timestamp, timestamp),
+                )
                 existing_record = conn.execute("SELECT record_id,status FROM test_data_record WHERE generation_id=%s AND test_case_id=%s AND template_id=%s", (generation_id, case_id, record_template["template_id"])).fetchone()
                 if existing_record:
                     record_id = existing_record["record_id"]
