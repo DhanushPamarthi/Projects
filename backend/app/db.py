@@ -51,7 +51,8 @@ CREATE TABLE IF NOT EXISTS testiq.source_package_manifest (
   package_id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES testiq.project(project_id), package_version INTEGER NOT NULL,
   package_name TEXT, scope TEXT, manifest_hash TEXT, lifecycle_status TEXT NOT NULL DEFAULT 'draft',
   rule_review_status TEXT NOT NULL DEFAULT 'pending', rule_set_hash TEXT, rules_reviewed_at TEXT,
-  run_id TEXT, created_at TEXT NOT NULL, UNIQUE(project_id, package_version)
+  run_id TEXT, automation_stage TEXT NOT NULL DEFAULT 'not_started', automation_error TEXT,
+  created_at TEXT NOT NULL, UNIQUE(project_id, package_version)
 );
 CREATE TABLE IF NOT EXISTS testiq.package_business_rule (
   rule_id TEXT PRIMARY KEY,
@@ -367,6 +368,8 @@ MIGRATIONS = [
     "ALTER TABLE source_package_manifest ADD COLUMN rule_set_hash TEXT",
     "ALTER TABLE source_package_manifest ADD COLUMN rules_reviewed_at TEXT",
     "ALTER TABLE source_package_manifest ADD COLUMN run_id TEXT",
+    "ALTER TABLE source_package_manifest ADD COLUMN automation_stage TEXT NOT NULL DEFAULT 'not_started'",
+    "ALTER TABLE source_package_manifest ADD COLUMN automation_error TEXT",
     "ALTER TABLE source_package_item ADD COLUMN extractor_version TEXT",
     "ALTER TABLE source_package_item ADD COLUMN prompt_hash TEXT",
     "ALTER TABLE source_package_item ADD COLUMN config_hash TEXT",

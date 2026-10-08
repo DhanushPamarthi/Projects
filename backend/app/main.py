@@ -20,6 +20,11 @@ app = FastAPI(title="TestIQ Source Package API", version="1.0.0")
 app.include_router(knowledge_fabric_router)
 SOURCE_TYPES = {"brd", "campaign_rules", "api_spec", "database_schema", "message_template", "ui_description"}
 logger = logging.getLogger(__name__)
+_ACTIVE_PACKAGE_AUTOMATIONS = set()
+_PACKAGE_AUTOMATION_LOCK = threading.Lock()
+_ACTIVE_PROJECT_SYNCS = set()
+_CANCELLED_PROJECT_SYNCS = set()
+_PROJECT_SYNC_LOCK = threading.Lock()
 
 def now(): return datetime.now(timezone.utc).isoformat()
 def uid(prefix): return f"{prefix}_{uuid.uuid4().hex}"
@@ -395,12 +400,127 @@ def process_extraction(revision_id, source_id, extraction_id, storage_path, file
             conn.execute("UPDATE source_revision SET status=%s,validation_messages=%s WHERE revision_id=%s", ("extraction_failed", json.dumps(messages), revision_id))
 
 
-def _build_knowledge_for_package(package_id: str) -> None:
-    """Build a package-scoped Knowledge Base without a user action."""
+def _set_package_automation(package_id: str, stage: str, error: str | None = None) -> bool:
+    with connection() as conn:
+        result = conn.execute(
+            "UPDATE source_package_manifest SET automation_stage=%s,automation_error=%s WHERE package_id=%s AND automation_stage<>'cancelled'",
+            (stage, error[:2000] if error else None, package_id),
+        )
+        return result.rowcount > 0
+
+
+def _package_automation_was_cancelled(package_id: str) -> bool:
+    with connection() as conn:
+        package = conn.execute("SELECT automation_stage FROM source_package_manifest WHERE package_id=%s", (package_id,)).fetchone()
+    return not package or package["automation_stage"] == "cancelled"
+
+
+def _run_package_automation(package_id: str) -> None:
+    """Create Business Use Cases, then build the package Knowledge Base."""
+    with _PACKAGE_AUTOMATION_LOCK:
+        if package_id in _ACTIVE_PACKAGE_AUTOMATIONS:
+            return
+        _ACTIVE_PACKAGE_AUTOMATIONS.add(package_id)
     try:
+        with connection() as conn:
+            package = conn.execute("SELECT automation_stage FROM source_package_manifest WHERE package_id=%s", (package_id,)).fetchone()
+            if not package:
+                return
+            if package["automation_stage"] == "cancelled":
+                return
+            if package["automation_stage"] == "complete":
+                return
+            has_business = conn.execute(
+                "SELECT 1 FROM requirement_analysis WHERE package_id=%s AND analysis_kind='business' LIMIT 1",
+                (package_id,),
+            ).fetchone()
+        if not _set_package_automation(package_id, "business_use_cases"):
+            return
+        if not has_business:
+            generate_business_requirements(package_id)
+        if _package_automation_was_cancelled(package_id):
+            return
+        if not _set_package_automation(package_id, "knowledge_base"):
+            return
         build_knowledge_index(package_id, BuildIndexRequest())
-    except Exception:
-        logger.exception("Automatic Knowledge Base build failed package=%s", package_id)
+        if _package_automation_was_cancelled(package_id):
+            return
+        _set_package_automation(package_id, "complete")
+    except Exception as exc:
+        failed_stage = "business_use_cases" if 'has_business' not in locals() or not has_business else "knowledge_base"
+        message = f"{failed_stage.replace('_', ' ').title()} failed: {safe_llm_error_message(exc)}"
+        _set_package_automation(package_id, "failed", message)
+        logger.exception("Automatic package processing failed package=%s stage=%s", package_id, failed_stage)
+    finally:
+        with _PACKAGE_AUTOMATION_LOCK:
+            _ACTIVE_PACKAGE_AUTOMATIONS.discard(package_id)
+
+
+def _ingest_configured_technical_artifacts(project_id: str, brd_source_id: str) -> None:
+    """Attach the checked-in CDP API specification and database schema to a BRD."""
+    artifact_dir = Path(__file__).resolve().parents[1] / "resources" / "supporting_sources"
+    artifacts = (
+        ("api_spec", "CDP API Specification.txt"),
+        ("database_schema", "CDP Database Schema.txt"),
+    )
+    for source_type, filename in artifacts:
+        artifact_path = artifact_dir / filename
+        if not artifact_path.is_file():
+            logger.error("Configured supporting source is missing path=%s", artifact_path)
+            continue
+        try:
+            content = artifact_path.read_bytes()
+            digest = hashlib.sha256(content).hexdigest()
+            timestamp = now()
+            with connection() as conn:
+                source = conn.execute(
+                    "SELECT * FROM source_document WHERE project_id=%s AND source_type=%s AND logical_name=%s",
+                    (project_id, source_type, filename),
+                ).fetchone()
+                if source and source["active_revision_id"]:
+                    active = conn.execute(
+                        "SELECT r.sha256,e.status AS extraction_status FROM source_revision r LEFT JOIN source_extraction e ON e.revision_id=r.revision_id WHERE r.revision_id=%s ORDER BY e.created_at DESC LIMIT 1",
+                        (source["active_revision_id"],),
+                    ).fetchone()
+                    if active and active["sha256"] == digest and active["extraction_status"] == "succeeded":
+                        conn.execute(
+                            "INSERT INTO source_relationship (relationship_id,brd_source_id,supporting_source_id,relationship_type,created_at) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (brd_source_id,supporting_source_id) DO NOTHING",
+                            (uid("rel"), brd_source_id, source["source_id"], "supports", timestamp),
+                        )
+                        continue
+                source_id = source["source_id"] if source else uid("src")
+                if not source:
+                    conn.execute(
+                        "INSERT INTO source_document (source_id,logical_source_id,project_id,source_type,logical_name,owner_name,active_revision_id,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                        (source_id, source_id, project_id, source_type, filename, "Configured CDP metadata", None, timestamp, timestamp),
+                    )
+                revision_number = conn.execute(
+                    "SELECT COALESCE(MAX(revision),0)+1 AS next_revision FROM source_revision WHERE source_id=%s",
+                    (source_id,),
+                ).fetchone()["next_revision"]
+                revision_id = uid("rev")
+                storage_path = UPLOAD_DIR / f"{uid('file')}_{filename}"
+                storage_path.write_bytes(content)
+                conn.execute(
+                    "INSERT INTO source_revision (revision_id,source_id,revision,filename,content_type,size_bytes,sha256,storage_path,owner_version,ingestion_version,status,validation_messages,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (revision_id, source_id, revision_number, filename, "text/plain; charset=utf-8", len(content), digest, str(storage_path), None, "configured-supporting-source-v1", "pending", "[]", timestamp),
+                )
+                conn.execute(
+                    "UPDATE source_document SET active_revision_id=%s,updated_at=%s WHERE source_id=%s",
+                    (revision_id, timestamp, source_id),
+                )
+                extraction_id = uid("ext")
+                conn.execute(
+                    "INSERT INTO source_extraction (extraction_id,revision_id,mode,status,extracted_text,error,extractor_version,model_name,prompt_version,config_version,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (extraction_id, revision_id, "pending", "pending", None, None, LOCAL_EXTRACTOR_VERSION, None, EXTRACTION_PROMPT_VERSION, EXTRACTION_CONFIG_VERSION, timestamp),
+                )
+                conn.execute(
+                    "INSERT INTO source_relationship (relationship_id,brd_source_id,supporting_source_id,relationship_type,created_at) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (brd_source_id,supporting_source_id) DO NOTHING",
+                    (uid("rel"), brd_source_id, source_id, "supports", timestamp),
+                )
+            process_extraction(revision_id, source_id, extraction_id, str(storage_path), filename, [])
+        except Exception:
+            logger.exception("Could not attach configured %s metadata to project=%s", source_type, project_id)
 
 
 def _auto_sync_project_knowledge(project_id: str) -> None:
@@ -410,6 +530,11 @@ def _auto_sync_project_knowledge(project_id: str) -> None:
     stay attached to the project until the BRD arrives; the first successful
     BRD extraction completes the package input set and starts indexing.
     """
+    with _PROJECT_SYNC_LOCK:
+        if project_id in _ACTIVE_PROJECT_SYNCS:
+            return
+        _ACTIVE_PROJECT_SYNCS.add(project_id)
+        _CANCELLED_PROJECT_SYNCS.discard(project_id)
     try:
         with connection() as conn:
             project = conn.execute("SELECT * FROM project WHERE project_id=%s", (project_id,)).fetchone()
@@ -422,6 +547,18 @@ def _auto_sync_project_knowledge(project_id: str) -> None:
             brd = brds[0]
             if not brd["active_revision_id"]:
                 return
+            brd_source_id = brd["source_id"]
+        _ingest_configured_technical_artifacts(project_id, brd_source_id)
+        with _PROJECT_SYNC_LOCK:
+            if project_id in _CANCELLED_PROJECT_SYNCS:
+                return
+        with connection() as conn:
+            project = conn.execute("SELECT * FROM project WHERE project_id=%s", (project_id,)).fetchone()
+            sources = conn.execute("SELECT * FROM source_document WHERE project_id=%s ORDER BY created_at", (project_id,)).fetchall()
+            brds = [source for source in sources if source["source_type"] == "brd"]
+            if len(brds) != 1:
+                return
+            brd = brds[0]
             ready_source_ids = []
             active_pairs = []
             for source in sources:
@@ -441,11 +578,19 @@ def _auto_sync_project_knowledge(project_id: str) -> None:
                 if {(row["source_id"], row["revision_id"], row["content_hash"]) for row in existing} == set(active_pairs):
                     return
             project_name = project["project_name"]
-        created = create_manifest(project_id, ManifestRequest(source_ids=ready_source_ids, package_name=f"{project_name} Resource Package", scope="Project"), BackgroundTasks())
+        with _PROJECT_SYNC_LOCK:
+            if project_id in _CANCELLED_PROJECT_SYNCS:
+                return
+            created = create_manifest(project_id, ManifestRequest(source_ids=ready_source_ids, package_name=f"{project_name} Resource Package", scope="Project"), BackgroundTasks())
         package_id = created["package_id"]
-        threading.Thread(target=_build_knowledge_for_package, args=(package_id,), daemon=True).start()
+        _set_package_automation(package_id, "queued")
+        threading.Thread(target=_run_package_automation, args=(package_id,), daemon=True).start()
     except Exception:
         logger.exception("Automatic project package synchronization failed project=%s", project_id)
+    finally:
+        with _PROJECT_SYNC_LOCK:
+            _ACTIVE_PROJECT_SYNCS.discard(project_id)
+            _CANCELLED_PROJECT_SYNCS.discard(project_id)
 
 class ManifestRequest(BaseModel):
     source_ids: list[str] = Field(min_length=1)
@@ -2072,6 +2217,89 @@ def list_projects():
     with connection() as conn:
         return [row_dict(x) for x in conn.execute("SELECT p.project_id,p.project_name,p.created_at,COUNT(s.source_id) AS source_count FROM project p LEFT JOIN source_document s ON s.project_id=p.project_id GROUP BY p.project_id ORDER BY p.created_at DESC").fetchall()]
 
+@app.get("/api/v1/projects/workspace-summary")
+def list_project_workspace_summaries():
+    """Fetch project cards, active BRDs, and latest package progress in a few bulk reads."""
+    with connection() as conn:
+        project_sql = (
+            "SELECT p.project_id,p.project_name,p.created_at,COUNT(s.source_id) AS source_count "
+            "FROM project p LEFT JOIN source_document s ON s.project_id=p.project_id "
+            "GROUP BY p.project_id ORDER BY p.created_at DESC"
+        )
+        brd_sql = (
+            "SELECT s.project_id,s.source_id,s.logical_name,r.filename,r.status AS revision_status, "
+            "(SELECT e.status FROM source_extraction e WHERE e.revision_id=r.revision_id ORDER BY e.created_at DESC LIMIT 1) AS extraction_status "
+            "FROM source_document s LEFT JOIN source_revision r ON r.revision_id=s.active_revision_id "
+            "WHERE s.source_type='brd'"
+        )
+        package_sql = (
+            "SELECT m.package_id,m.project_id,m.package_version,m.package_name,m.created_at,m.automation_stage,m.automation_error "
+            "FROM source_package_manifest m WHERE m.package_version=(SELECT MAX(m2.package_version) "
+            "FROM source_package_manifest m2 WHERE m2.project_id=m.project_id)"
+        )
+        index_sql = (
+            "SELECT i.package_id,i.status,i.error,i.progress_percent,i.progress_stage "
+            "FROM knowledge_index i WHERE i.knowledge_version=(SELECT MAX(i2.knowledge_version) "
+            "FROM knowledge_index i2 WHERE i2.package_id=i.package_id)"
+        )
+        business_sql = "SELECT DISTINCT package_id FROM requirement_analysis WHERE analysis_kind='business'"
+        if DATABASE_URL and hasattr(conn, "pipeline"):
+            with conn.pipeline():
+                project_cursor = conn.execute(project_sql)
+                brd_cursor = conn.execute(brd_sql)
+                package_cursor = conn.execute(package_sql)
+                index_cursor = conn.execute(index_sql)
+                business_cursor = conn.execute(business_sql)
+        else:
+            project_cursor = conn.execute(project_sql)
+            brd_cursor = conn.execute(brd_sql)
+            package_cursor = conn.execute(package_sql)
+            index_cursor = conn.execute(index_sql)
+            business_cursor = conn.execute(business_sql)
+        projects = [row_dict(row) for row in project_cursor.fetchall()]
+        brds = [row_dict(row) for row in brd_cursor.fetchall()]
+        packages = [row_dict(row) for row in package_cursor.fetchall()]
+        indexes = [row_dict(row) for row in index_cursor.fetchall()]
+        business_packages = {row["package_id"] for row in business_cursor.fetchall()}
+    brd_by_project = {item["project_id"]: item for item in brds}
+    index_by_package = {item["package_id"]: item for item in indexes}
+    package_by_project = {item["project_id"]: item for item in packages}
+    result = []
+    for project in projects:
+        brd_row = brd_by_project.get(project["project_id"])
+        brd = None
+        if brd_row:
+            brd = {
+                "source_id": brd_row["source_id"], "source_type": "brd", "logical_name": brd_row["logical_name"],
+                "status": brd_row["revision_status"], "extraction": {"status": brd_row["extraction_status"] or "pending"},
+                "active_revision": {"filename": brd_row["filename"]} if brd_row["filename"] else None,
+            }
+        package = package_by_project.get(project["project_id"])
+        latest_package = None
+        if package:
+            index = index_by_package.get(package["package_id"])
+            stage = package.get("automation_stage") or "not_started"
+            if stage == "not_started":
+                if index and index.get("status") == "ready":
+                    stage = "complete"
+                elif index and index.get("status") in {"failed", "error"}:
+                    stage = "failed"
+                elif package["package_id"] in business_packages:
+                    stage = "knowledge_base"
+            kb_status = index["status"] if index else "not_started"
+            latest_package = {
+                **package, "automation_stage": stage,
+                "automation": {"stage": stage, "error": package.get("automation_error") or (f"Knowledge Base failed: {index['error']}" if index and index.get("error") else None)},
+                "knowledge_base": {
+                    "status": kb_status,
+                    "progress_percent": index.get("progress_percent", 0) if index else 0,
+                    "progress_stage": index.get("progress_stage") if index else None,
+                },
+                "workflow": {"package_processing": stage, "knowledge_base": kb_status},
+            }
+        result.append({**project, "brd": brd, "latest_package": latest_package})
+    return result
+
 @app.get("/api/v1/projects/{project_id}")
 def get_project(project_id: str):
     with connection() as conn:
@@ -2314,7 +2542,7 @@ def create_manifest(project_id: str, request: ManifestRequest, background_tasks:
         _refresh_package_business_rule_summary(conn, package_id)
         result = {"package_id": package_id, "project_id": project_id, "package_version": version, "package_name": package_name, "scope": request.scope, "manifest_hash": manifest_hash, "lifecycle_status": "ready", "run_id": run_id, "knowledge_build_status": "queued", "items": items}
         if background_tasks is not None:
-            background_tasks.add_task(_build_knowledge_for_package, package_id)
+            background_tasks.add_task(_run_package_automation, package_id)
         return result
 
 @app.get("/api/v1/projects/{project_id}/manifests")
@@ -2344,6 +2572,11 @@ def get_project_dashboard(project_id: str, package_id: str | None = None):
             index = row_dict(indexes[0]) if indexes else None
             analyses = conn.execute("SELECT * FROM requirement_analysis WHERE package_id=%s ORDER BY analysis_version DESC,created_at DESC", (pid,)).fetchall()
             analysis = row_dict(analyses[0]) if analyses else None
+            business_analysis_row = conn.execute(
+                "SELECT status,analysis_id,updated_at FROM requirement_analysis WHERE package_id=%s AND analysis_kind='business' ORDER BY analysis_version DESC,created_at DESC LIMIT 1",
+                (pid,),
+            ).fetchone()
+            business_analysis = row_dict(business_analysis_row) if business_analysis_row else None
             requirements_total = requirements_approved = 0
             if analysis:
                 contract = _clean_requirement_contract(json.loads(analysis.get("contract_json") or "{}"))
@@ -2397,11 +2630,18 @@ def get_project_dashboard(project_id: str, package_id: str | None = None):
                 next_milestone = "Review business rules"
             else:
                 next_milestone = "Build the Knowledge Base"
+            automation_stage = package.get("automation_stage") or "not_started"
+            if automation_stage == "not_started":
+                if index and index.get("status") in {"ready", "succeeded"}:
+                    automation_stage = "complete"
+                elif business_analysis:
+                    automation_stage = "knowledge_base"
             summaries.append({
-                **package,
+                **package, "automation_stage": automation_stage,
                 "status": overall_status,
                 "counts": {"sources": package.get("source_count", 0), "business_rules": sum(rule_counts.values()), "pending_business_rules": rule_counts.get("pending", 0), "requirements": requirements_total, "approved_requirements": requirements_approved, "test_cases": cases_total, "approved_test_cases": cases_approved, "test_data_records": data_count, "saved_test_data_records": saved_data_count, "test_runs": sum(execution_counts.values())},
-                "workflow": {"knowledge_base": index.get("status", "not_started") if index else "not_started", "requirements": analysis.get("status", "not_started") if analysis else "not_started", "test_cases": generation.get("status", "not_started") if generation else "not_started", "test_data": "ready" if data_count else "not_started"},
+                "workflow": {"package_processing": automation_stage, "business_use_cases": business_analysis.get("status", "not_started") if business_analysis else "not_started", "knowledge_base": index.get("status", "not_started") if index else "not_started", "requirements": analysis.get("status", "not_started") if analysis else "not_started", "test_cases": generation.get("status", "not_started") if generation else "not_started", "test_data": "ready" if data_count else "not_started"},
+                "automation": {"stage": automation_stage, "error": package.get("automation_error"), "business_use_cases_analysis_id": business_analysis.get("analysis_id") if business_analysis else None},
                 "knowledge_base": ({"status": index.get("status"), "knowledge_version": index.get("knowledge_version"), "chunk_count": index.get("chunk_count", 0), "node_count": index.get("node_count", 0), "edge_count": index.get("edge_count", 0), "updated_at": index.get("created_at")} if index else None),
                 "blockers": blockers,
                 "next_milestone": next_milestone,
@@ -2418,6 +2658,67 @@ def get_package(package_id: str):
         m=conn.execute("SELECT * FROM source_package_manifest WHERE package_id=%s",(package_id,)).fetchone()
         if not m: raise HTTPException(404,"Package manifest not found")
         items=conn.execute("SELECT mi.*,s.logical_name,s.source_type,r.revision,r.sha256,r.owner_version FROM source_package_item mi JOIN source_document s ON s.source_id=mi.source_id JOIN source_revision r ON r.revision_id=mi.revision_id WHERE mi.package_id=%s",(package_id,)).fetchall(); return {**row_dict(m),"items":[row_dict(x) for x in items]}
+
+@app.post("/api/v1/packages/{package_id}/automation/retry", status_code=202)
+def retry_package_automation(package_id: str, background_tasks: BackgroundTasks):
+    with connection() as conn:
+        package = conn.execute("SELECT automation_stage FROM source_package_manifest WHERE package_id=%s", (package_id,)).fetchone()
+        if not package:
+            raise HTTPException(404, "Resource Package not found")
+        if package["automation_stage"] not in {"failed", "not_started", "cancelled"}:
+            raise HTTPException(409, f"Package processing cannot be retried while its stage is {package['automation_stage']}")
+        conn.execute("UPDATE source_package_manifest SET automation_stage='queued',automation_error=NULL WHERE package_id=%s", (package_id,))
+    background_tasks.add_task(_run_package_automation, package_id)
+    return {"package_id": package_id, "automation_stage": "queued"}
+
+
+@app.post("/api/v1/packages/{package_id}/automation/stop", status_code=202)
+def stop_package_automation(package_id: str):
+    with connection() as conn:
+        package = conn.execute("SELECT automation_stage FROM source_package_manifest WHERE package_id=%s", (package_id,)).fetchone()
+        if not package:
+            raise HTTPException(404, "Resource Package not found")
+        if package["automation_stage"] not in {"not_started", "queued", "business_use_cases", "knowledge_base"}:
+            raise HTTPException(409, f"Package processing cannot be stopped while its stage is {package['automation_stage']}")
+        updated = conn.execute(
+            "UPDATE source_package_manifest SET automation_stage='cancelled',automation_error=NULL WHERE package_id=%s AND automation_stage IN ('not_started','queued','business_use_cases','knowledge_base')",
+            (package_id,),
+        ).rowcount
+        if not updated:
+            raise HTTPException(409, "Package processing has already stopped or completed")
+    return {"package_id": package_id, "automation_stage": "cancelled"}
+
+
+@app.post("/api/v1/projects/{project_id}/processing/stop", status_code=202)
+def stop_project_package_creation(project_id: str):
+    with connection() as conn:
+        project = conn.execute("SELECT project_id FROM project WHERE project_id=%s", (project_id,)).fetchone()
+        if not project:
+            raise HTTPException(404, "Project not found")
+    with _PROJECT_SYNC_LOCK:
+        if project_id not in _ACTIVE_PROJECT_SYNCS:
+            raise HTTPException(409, "Package creation is no longer running")
+        _CANCELLED_PROJECT_SYNCS.add(project_id)
+        with connection() as conn:
+            conn.execute(
+                "UPDATE source_package_manifest SET automation_stage='cancelled',automation_error=NULL WHERE package_id=(SELECT package_id FROM source_package_manifest WHERE project_id=%s AND automation_stage IN ('not_started','queued','business_use_cases','knowledge_base') ORDER BY package_version DESC LIMIT 1)",
+                (project_id,),
+            )
+    return {"project_id": project_id, "status": "stop_requested"}
+
+
+@app.post("/api/v1/projects/{project_id}/processing/resume", status_code=202)
+def resume_project_package_creation(project_id: str, background_tasks: BackgroundTasks):
+    with connection() as conn:
+        project = conn.execute("SELECT project_id FROM project WHERE project_id=%s", (project_id,)).fetchone()
+        if not project:
+            raise HTTPException(404, "Project not found")
+    with _PROJECT_SYNC_LOCK:
+        if project_id in _ACTIVE_PROJECT_SYNCS:
+            raise HTTPException(409, "The stop request is still being applied")
+        _CANCELLED_PROJECT_SYNCS.discard(project_id)
+    background_tasks.add_task(_auto_sync_project_knowledge, project_id)
+    return {"project_id": project_id, "status": "resume_queued"}
 
 @app.get("/api/v1/packages/{package_id}/business-rules")
 def list_package_business_rules(package_id: str):

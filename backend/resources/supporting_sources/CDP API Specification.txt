@@ -1,0 +1,395 @@
+# PBM Ingestion API Specification
+## Service conventions
+
+- Local base URL: `http://localhost:8000`
+- API prefix: `/api/v1`
+- Content type: `application/json`, except the multipart file upload endpoint
+- Date format: ISO 8601 `YYYY-MM-DD`
+- Timestamp format: ISO 8601 with timezone
+- Identifiers: campaign identifiers are UUIDs; ingestion load identifiers are strings; outbox identifiers are integers
+- Authentication: none is implemented
+- Interactive contract: `GET /docs`
+- OpenAPI document: `GET /openapi.json`
+
+FastAPI returns validation failures as HTTP `422` with its standard `detail` array. Database or workflow conflicts use HTTP `409`. Missing resources use HTTP `404`.
+
+## Endpoint summary
+
+| Method | Path | Success | Purpose |
+|---|---|---:|---|
+| GET | `/health` | 200 | Liveness check |
+| GET | `/ready` | 200 | Verify directories and required PostgreSQL objects |
+| POST | `/api/v1/scan` | 200 | Scan queued files and load Bronze records |
+| GET | `/api/v1/files` | 200 | List ingestion loads |
+| POST | `/api/v1/files/upload` | 202 | Queue a UTF-8 JSON file |
+| POST | `/api/v1/files/json` | 202 | Queue a JSON request body |
+| GET | `/api/v1/files/{raw_file_id}` | 200 | Get ingestion status |
+| GET | `/api/v1/files/{raw_file_id}/result` | 200 | Get the load and its Silver result |
+| POST | `/api/v1/files/{raw_file_id}/promote` | 200 | Promote one Bronze load to Silver |
+| POST | `/api/v1/files/{raw_file_id}/retry` | 200 | Reset and requeue a failed load |
+| POST | `/api/v1/files/{raw_file_id}/replay` | 200 | Reset and replay a load with the active mapping version |
+| POST | `/api/v1/mappings/validate` | 200 | Return mapping validation status |
+| GET | `/api/v1/campaigns/configuration` | 200 | Return campaign types, channels, templates, and schedule settings |
+| POST | `/api/v1/campaigns` | 201 | Create a campaign |
+| GET | `/api/v1/campaigns` | 200 | List campaigns |
+| GET | `/api/v1/campaigns/{campaign_id}` | 200 | Get a campaign |
+| POST | `/api/v1/campaigns/{campaign_id}/launch` | 200 | Launch or resume campaign processing |
+| GET | `/api/v1/campaigns/{campaign_id}/status` | 200 | Get campaign, launch, and outbox counts |
+| POST | `/api/v1/campaigns/{campaign_id}/audience/preview` | 200 | Read the audience after launch |
+| GET | `/api/v1/campaigns/{campaign_id}/audience` | 200 | Read the current audience |
+| POST | `/api/v1/notification-outbox/{outbox_id}/sent` | 200 | Mark an outbox record as sent |
+
+## Health and orchestration
+
+### `GET /health`
+
+Response:
+
+```json
+{"status": "ok"}
+```
+
+### `GET /ready`
+
+Returns `200` only when the filesystem and the required Bronze, Silver, campaign, audit, transport, and stored procedure objects are available.
+
+```json
+{"status": "ready", "database_mode": "server-bronze-silver"}
+```
+
+Returns `503` with a string `detail` when a required dependency is unavailable.
+
+### `POST /api/v1/scan`
+
+No request body. The response has this shape:
+
+```json
+{
+  "discovered": 1,
+  "bronze_loaded": 1,
+  "completed": 0,
+  "quarantined": 0,
+  "skipped": 0,
+  "errors": [],
+  "load_ids": ["10001"]
+}
+```
+
+### `POST /api/v1/files/{raw_file_id}/promote`
+
+Runs the server owned Bronze to Silver coordinator for one load. Returns the updated ingestion result described below. Returns `404` when the load does not exist and `409` when its current state cannot be promoted.
+
+## Ingestion submission contract
+
+Both submission endpoints accept either a Pharmacy Order CloudEvent or a TestIQ Bronze template payload. Duplicate event IDs, duplicate content hashes, and equivalent queued payloads return `409`.
+
+### `POST /api/v1/files/upload`
+
+Request is `multipart/form-data` with one required part named `file`.
+
+- Filename must end in `.json`.
+- File content must be UTF-8 JSON.
+- Maximum size is `MAX_UPLOAD_BYTES`, defaulting to 1,048,576 bytes.
+- The filename must be a plain filename and cannot contain a path.
+
+Errors: `413` oversized file, `422` invalid filename/encoding/JSON/document, `409` duplicate record or queued filename.
+
+### `POST /api/v1/files/json`
+
+Request content type is `application/json`. The same size and document validation rules apply after the server formats the body as JSON.
+
+Successful response for both submission endpoints:
+
+```json
+{
+  "status": "QUEUED",
+  "filename": "PharmacyOrder_2026-08-05_<generated>.json",
+  "document_type": "pharmacy.orders.v1.sample-notification"
+}
+```
+
+### Pharmacy Order CloudEvent
+
+All models below reject unknown fields. `data` must contain either a non-empty `members` array or the pair `person` plus a non-empty `prescription` array.
+
+```json
+{
+  "id": "EVENT-1001",
+  "correlationId": "CORR-1001",
+  "time": "2026-08-05T11:44:02Z",
+  "type": "pharmacy.orders.v1.sample-notification",
+  "source": "ACCREDo",
+  "specversion": "1.0",
+  "data": {
+    "recipientType": "PERSON",
+    "members": [
+      {
+        "person": {
+          "resourceID": "MEMBER-1001",
+          "specialityID": "SPECIALTY-1",
+          "firstName": "Asha",
+          "lastName": "Rao"
+        },
+        "prescription": [
+          {
+            "resourceID": "RX-1001",
+            "drug": {
+              "name": "Example Drug",
+              "strength": "10 MG",
+              "therapyCode": "TH-1",
+              "manufacturer": "Example Pharma"
+            },
+            "rxStatus": "ACTIVE",
+            "eligibleInd": true,
+            "refillsRemaining": 2,
+            "nextRefillDate": "2026-10-15",
+            "autofillEnrolled": false
+          }
+        ],
+        "contactPreference": {
+          "preferredChannel": "SMS",
+          "smsConsent": true,
+          "emailConsent": false,
+          "portalConsent": false,
+          "safeTestMobile": "+15555550100",
+          "safeTestEmail": null,
+          "safeTestPortal": null
+        }
+      }
+    ]
+  },
+  "growthplatform": "CDP",
+  "product": "PBM"
+}
+```
+
+Required top-level fields: `id`, `correlationId`, timezone-aware `time`, fixed `type`, `source`, fixed `specversion`, `data`, `growthplatform`, and `product`.
+
+Prescription enumerations and defaults:
+
+| Field | Rule |
+|---|---|
+| `rxStatus` | `ACTIVE`, `ON_HOLD`, `COMPLETED`, `CANCELLED`, or `EXPIRED`; default `ACTIVE` |
+| `eligibleInd` | boolean; default `true` |
+| `refillsRemaining` | integer >= 0; default `0` |
+| `nextRefillDate` | nullable ISO date |
+| `autofillEnrolled` | boolean; default `false` |
+
+Optional `data` entities are `benefit`, `medicalClaim`, `product`, and `order`. Their stable keys (`benefitKey`, `claimKey`, `productKey`, and `orderKey`) are required when the entity is present. An order may contain `items`; every item requires `itemKey`.
+
+### TestIQ Bronze template
+
+The endpoint also accepts one record, an array of records, a `{ "records": [...] }` wrapper, or a direct membership/prescription payload whose entity can be inferred.
+
+```json
+{
+  "records": [
+    {
+      "record_id": "REC-001",
+      "entity_name": "membership",
+      "payload_json": {
+        "member_id": "MEMBER-1001",
+        "first_name": "Asha",
+        "last_name": "Rao",
+        "status": "ACTIVE"
+      }
+    },
+    {
+      "record_id": "REC-002",
+      "entity_name": "prescription",
+      "payload_json": {
+        "member_id": "MEMBER-1001",
+        "prescription_id": "RX-1001",
+        "drug_name": "Example Drug",
+        "status": "ACTIVE"
+      }
+    }
+  ]
+}
+```
+
+`entity_name` is `membership` or `prescription`. `payload_json` may itself be a JSON object or a string containing a JSON object. Every record requires `payload_json.member_id`; prescription records also require `payload_json.prescription_id`. A batch cannot repeat a membership `member_id` or prescription `prescription_id`. Extra wrapper fields are ignored for this contract.
+
+The response `document_type` is `testiq.bronze-templates.v1`.
+
+## Ingestion query and recovery
+
+### `GET /api/v1/files`
+
+Query parameters:
+
+| Name | Type | Default | Rule |
+|---|---|---:|---|
+| `status` | string | none | Exact ingestion status filter |
+| `limit` | integer | 100 | Maximum 500 |
+
+Returns an array of ingestion load objects. Each object can contain `raw_file_id`, `load_id`, `event_id`, `correlation_id`, `original_filename`, `sha256`, `source_system`, `document_type`, `document_version`, `file_size_bytes`, `status`, `attempt_count`, `last_error`, `discovered_at`, `completed_at`, `member_count`, and `prescription_count`.
+
+### `GET /api/v1/files/{raw_file_id}`
+
+Returns one ingestion load object. The path name is retained for client compatibility; its value is the server `testiq.ingestion_load.load_id` string.
+
+### `GET /api/v1/files/{raw_file_id}/result`
+
+```json
+{
+  "file": {"raw_file_id": "10001", "status": "COMPLETED"},
+  "silver": {
+    "members": [],
+    "plans": [],
+    "drugs": [],
+    "prescriptions": []
+  },
+  "counts": {
+    "members": 0,
+    "plans": 0,
+    "drugs": 0,
+    "prescriptions": 0,
+    "bronze_members": 0,
+    "bronze_prescriptions": 0
+  }
+}
+```
+
+### `POST /api/v1/files/{raw_file_id}/retry`
+
+Resets the load to `BRONZE_LOADED`, clears its error and completion timestamp, and requeues its original file.
+
+```json
+{"status": "RETRY_PENDING", "raw_file_id": "10001"}
+```
+
+### `POST /api/v1/files/{raw_file_id}/replay`
+
+Performs the same reset and requeue operation and reports the active mapping version.
+
+```json
+{"status": "REPLAY_QUEUED", "raw_file_id": "10001", "mapping_version": "1.0"}
+```
+
+### `POST /api/v1/mappings/validate`
+
+```json
+{"valid": true, "errors": [], "mapping_count": 0}
+```
+
+## Campaign contract
+
+### `GET /api/v1/campaigns/configuration`
+
+Returns supported UI choices, template codes, validation limits, and the five-minute Asia/Kolkata schedule. The configuration currently advertises `REFILL_REMINDER`, `REFILL_WINDOW`, `OVERDUE_REFILL`, `AUTOFILL_REMINDER`, and `AGE_CAMPAIGN`, with channels `SMS`, `EMAIL`, `PHONE`, `MAIL`, and `PORTAL`.
+
+### `POST /api/v1/campaigns`
+
+```json
+{
+  "campaign_name": "October refill reminder",
+  "campaign_type": "REFILL_REMINDER",
+  "days_before_refill": 7,
+  "channel": "SMS",
+  "template_code": "REFILL_SMS_EN_V1",
+  "run_date": "2026-10-08",
+  "created_by": "CAMPAIGN_PLATFORM"
+}
+```
+
+Rules implemented by the request model:
+
+- `campaign_name`: trimmed, 3 to 200 characters
+- `campaign_type`: `REFILL_REMINDER`, `REFILL_WINDOW`, `OVERDUE_REFILL`, or `AUTOFILL_REMINDER`
+- `days_before_refill`: 0 through 365; stored as `0` for AutoFill
+- `channel`: `SMS`, `EMAIL`, `PHONE`, `MAIL`, or `PORTAL`
+- `template_code`: optional; server chooses a channel/campaign default when omitted
+- `run_date`: optional; server local date when omitted
+- `created_by`: trimmed, non-blank, default `CAMPAIGN_PLATFORM`
+- unknown fields are rejected
+
+Returns the inserted `testiq.campaign` row. A duplicate business configuration returns `409`; request/business validation returns `422`.
+
+The configuration endpoint and database migrations include `AGE_CAMPAIGN`, while the current `CampaignCreate` request model does not. Until that model is aligned, an Age campaign submitted through this endpoint receives `422`.
+
+### Campaign read and launch endpoints
+
+`GET /api/v1/campaigns?limit=100` returns newest campaigns first; `limit` must be 1 through 500. `GET /api/v1/campaigns/{campaign_id}` returns one complete campaign row.
+
+`POST /api/v1/campaigns/{campaign_id}/launch` accepts campaigns in `READY` or `RUNNING`. The first launch moves the campaign to `RUNNING`, enables scheduling, creates a launch row, and calls the campaign-specific database procedure. It returns the current campaign row. Invalid state returns `409`.
+
+`GET /api/v1/campaigns/{campaign_id}/status` returns:
+
+```json
+{
+  "campaign_id": "00000000-0000-0000-0000-000000000000",
+  "campaign_code": "CMP-20261008-1234ABCD",
+  "status": "RUNNING",
+  "updated_at": "2026-10-08T10:00:00Z",
+  "campaign_launch_id": "00000000-0000-0000-0000-000000000000",
+  "launch_status": "COMPLETED",
+  "requested_at": "2026-10-08T10:00:00Z",
+  "evaluated_count": 10,
+  "included_count": 3,
+  "pending_count": 2,
+  "sent_count": 1
+}
+```
+
+### Campaign audience
+
+`GET /api/v1/campaigns/{campaign_id}/audience` and `POST /api/v1/campaigns/{campaign_id}/audience/preview` return the same audience structure. Preview additionally rejects a campaign that has not reached an allowed launched state.
+
+```json
+{
+  "campaign_id": "00000000-0000-0000-0000-000000000000",
+  "campaign_type": "REFILL_REMINDER",
+  "counts": {
+    "members_evaluated": 10,
+    "prescriptions_evaluated": 12,
+    "persons_included": 3,
+    "evaluated": 12,
+    "included": 3
+  },
+  "included": [
+    {
+      "outbox_id": 101,
+      "audience_id": "MEMBER-1001:RX-1001:2026-10-15",
+      "member_id": "MEMBER-1001",
+      "member_key": "MEMBER-1001",
+      "member_name": "Asha Rao",
+      "decision": "INCLUDED",
+      "prescription_id": "RX-1001",
+      "drug_name": "Example Drug",
+      "next_refill_date": "2026-10-15",
+      "days_until_refill": 7,
+      "refills_remaining": 2,
+      "selected_channel": "SMS",
+      "destination": "+15555550100",
+      "notification_sent": 0,
+      "notification_sent_at": null,
+      "therapy_code": "TH-1",
+      "autofill_enrolled_ind": false,
+      "age": null,
+      "reason_code": "EXACT_REFILL_DATE_MATCH",
+      "reason_detail": "Active eligible prescription is due exactly 7 days after the campaign date",
+      "evidence": {}
+    }
+  ],
+  "eligibility_source": "silverbox.member + silverbox.prescription + silverbox.member_communication_preference"
+}
+```
+
+### `POST /api/v1/notification-outbox/{outbox_id}/sent`
+
+Marks `notification_sent=1`, sets `notification_sent_at`, clears `last_error`, and returns the complete `goldbox.notification_outbox` row. Returns `404` for an unknown outbox ID.
+
+## Status and error reference
+
+| Code | Meaning in this API |
+|---:|---|
+| 200 | Read or workflow operation completed |
+| 201 | Campaign created |
+| 202 | JSON accepted and queued; Bronze loading is asynchronous |
+| 404 | Load, campaign, or outbox record not found |
+| 409 | Duplicate input, invalid workflow state, or unavailable source file for retry/replay |
+| 413 | Submission exceeds configured byte limit |
+| 422 | Request or document contract validation failed |
+| 503 | Readiness dependency check failed |
+

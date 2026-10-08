@@ -1,0 +1,314 @@
+# PBM Ingestion Database Schema
+
+Database: PostgreSQL 16  
+Application mode: server Bronze/Silver integration  
+Last reconciled with SQL and application queries: 2026-10-08
+
+## Schema sources and deployment order
+
+The current API uses the live server model, where Bronze and core Silver tables already exist. Apply the application-owned migrations in this order:
+
+1. `db/server_integration.sql`
+2. `db/bronze_to_silver_scheduler.sql`
+3. `db/campaign_daily_scheduler.sql`
+4. `db/transport_layer.sql`
+5. `db/age_campaign.sql`
+6. `db/pg_cron_end_to_end.sql`
+7. `db/testiq_to_bronze_scheduler.sql` when the TestIQ handoff is required
+
+`db/init.sql` is a separate clean-database POC schema mounted by `docker-compose.yml`. It contains UUID based `bronzebox.raw_file`, generalized Silver entities, and the original Gold campaign model. Those table shapes are retained for clean POC/test compatibility, but they are not the live `testiq.ingestion_load` and server Bronze/Silver model queried by the current API.
+
+## Layer overview
+
+| Schema | Ownership and purpose |
+|---|---|
+| `bronzebox` | Server owned append-only JSONB entity records grouped by `load_id` |
+| `silverbox` | Server owned normalized PBM entities and ETL audits; application adds AutoFill and DNC fields/tables |
+| `goldbox` | Campaign qualification, notification outbox, and prescription-refill outputs |
+| `testiq` | Ingestion control, campaign configuration, scheduling, orchestration, and audit |
+| `transport` | SMS, email, and voice delivery staging plus journey audit |
+
+## Application data flow
+
+```text
+JSON/file queue
+    -> testiq.ingestion_load
+    -> bronzebox.<entity> JSONB rows
+    -> silverbox.process_membership(load_id)
+    -> silverbox.process_prescription(load_id)
+    -> Silver member/prescription/contact entities
+    -> campaign-specific Gold procedure
+    -> goldbox.notification_outbox / goldbox.prescription_refill
+    -> transport.sms | transport.email | transport.voice
+```
+
+## Live operational tables
+
+### `testiq.ingestion_load`
+
+Primary control row for one accepted ingestion batch.
+
+| Column | Type | Null/default | Notes |
+|---|---|---|---|
+| `load_id` | text | primary key | Sequence value serialized as text |
+| `event_id` | text | not null, unique | CloudEvent ID or deterministic TestIQ template ID |
+| `correlation_id` | text | not null | Source correlation ID |
+| `original_filename` | text | not null | Queued source filename |
+| `sha256` | char(64) | nullable, unique | Content deduplication hash |
+| `source_system` | text | nullable | Event source |
+| `document_type` | text | not null | Event type or `testiq.bronze-templates.v1` |
+| `document_version` | text | nullable | Usually `1.0` |
+| `file_size_bytes` | bigint | default 0 | Source byte count |
+| `status` | text | default `BRONZE_LOADED` | See status lifecycle below |
+| `member_count` | integer | default 0 | Bronze membership rows expected |
+| `prescription_count` | integer | default 0 | Bronze prescription rows expected |
+| `attempt_count` | integer | default 0 | Promotion attempts |
+| `last_attempt_at` | timestamptz | nullable | Most recent promotion attempt |
+| `error_message` | text | nullable | Latest orchestration error |
+| `created_at` | timestamptz | default `now()` | Load creation |
+| `silver_completed_at` | timestamptz | nullable | Terminal Silver time |
+
+Status constraint: `BRONZE_LOADED`, `SILVER_PROCESSING`, `COMPLETED`, `COMPLETED_WITH_ERRORS`, or `FAILED`.
+
+Sequence: `testiq.ingestion_load_id_seq`, initialized at 10000.
+
+### Bronze entity tables
+
+The live server supplies these tables with the common ingestion shape `id`, `load_id`, `created_time`, and `data JSONB`:
+
+- `bronzebox.membership`
+- `bronzebox.prescription`
+- `bronzebox.drug`
+- `bronzebox.benefit`
+- `bronzebox.claim`
+- `bronzebox.medical_claim`
+- `bronzebox.order`
+- `bronzebox.product`
+
+The API writes membership and prescription template batches directly. Pharmacy events can also produce the optional entities. Membership is processed before prescription because the prescription transform resolves the member surrogate key.
+
+### Server Silver entities used by the application
+
+These are dependencies rather than full definitions owned by this repository. The listed columns are the contract referenced by Python and SQL.
+
+| Table | Required application-facing columns |
+|---|---|
+| `silverbox.member` | `member_sk`, `member_id`, `first_name`, `last_name`, `status`, `date_of_birth`, `preferred_language`, `load_id` |
+| `silverbox.member_plan` | `member_plan_sk`, `member_sk`, `plan_id`, `plan_name`, `group_name` |
+| `silverbox.prescription` | `prescription_sk`, `prescription_id`, `member_sk`, `member_id`, `drug_name`, `strength`, `status`, `eligible_ind`, `refills_remaining`, `next_refill_date`, `therapy_code`, `autofill_enrolled_ind`, `fill_method`, `load_id` |
+| `silverbox.member_communication_preference` | `member_communication_preference_sk`, `member_sk`, `preference_type`, `channel`, `value`, `enabled` |
+| `silverbox.member_phone` | `member_sk`, phone value columns used by transport resolution |
+| `silverbox.member_email` | `member_sk`, email value columns used by transport resolution |
+| `silverbox.membership_etl_audit` | `load_id`, `status`, read/processed/failed counts, `error_message`, timestamps |
+| `silverbox.prescription_etl_audit` | `load_id`, `status`, read/processed/failed counts, `error_message`, timestamps |
+
+`db/bronze_to_silver_scheduler.sql` adds `silverbox.prescription.fill_method TEXT NOT NULL DEFAULT 'MANUAL'` with allowed values `MANUAL` and `AUTOFILL`.
+
+### `testiq.bronze_silver_run_audit`
+
+One combined audit record for a membership then prescription orchestration run.
+
+| Column | Type | Notes |
+|---|---|---|
+| `orchestration_run_id` | uuid | Primary key, generated |
+| `load_id` | text | FK to `testiq.ingestion_load` |
+| `trigger_source` | text | Manual or scheduled source |
+| `started_at`, `completed_at` | timestamptz | Run timing |
+| `status` | text | `STARTED`, `COMPLETED`, `COMPLETED_WITH_ERRORS`, `FAILED` |
+| `membership_status` | text | Latest membership procedure status |
+| `membership_records_read` | integer | Default 0 |
+| `membership_records_processed` | integer | Default 0 |
+| `membership_records_failed` | integer | Default 0 |
+| `prescription_status` | text | Latest prescription procedure status |
+| `prescription_records_read` | integer | Default 0 |
+| `prescription_records_processed` | integer | Default 0 |
+| `prescription_records_failed` | integer | Default 0 |
+| `unhandled_entity_counts` | jsonb | Optional Bronze rows awaiting approved Silver mappings |
+| `error_message` | text | Combined error details |
+
+Index: `(load_id, started_at DESC)`.
+
+## Campaign and Gold schema
+
+### `testiq.campaign`
+
+| Column | Type | Null/default | Notes |
+|---|---|---|---|
+| `campaign_id` | uuid | primary key, generated | Campaign identity |
+| `campaign_code` | text | not null, unique | Generated display code |
+| `campaign_name` | text | not null | Operator supplied name |
+| `campaign_type` | text | not null | Refill, AutoFill, or Age family |
+| `days_before_refill` | integer | not null | 0 through 365 |
+| `channel` | text | not null | Campaign channel |
+| `template_code` | text | nullable | Template selected by API |
+| `run_date` | date | default current date | Business evaluation date |
+| `status` | text | default `READY` | `READY`, `RUNNING`, `COMPLETED`, `FAILED` |
+| `configuration_fingerprint` | char(64) | not null, unique | Duplicate business configuration guard |
+| `created_by` | text | default `CAMPAIGN_PLATFORM` | Audit principal |
+| `created_at`, `updated_at` | timestamptz | default `now()` | Audit timestamps |
+| `schedule_timezone` | text | default `Asia/Kolkata` | Recurring schedule zone |
+| `schedule_interval_minutes` | integer | default 5 | Constrained to 5 |
+| `scheduler_enabled` | boolean | default true | Scheduler eligibility |
+| `processing_procedure` | text | nullable | Dedicated generated procedure name |
+| `last_run_at`, `next_run_at` | timestamptz | nullable | Scheduler state |
+
+Index: `(next_run_at, campaign_id)` for `RUNNING` enabled campaigns.
+
+### `testiq.campaign_launch`
+
+| Column | Type | Notes |
+|---|---|---|
+| `campaign_launch_id` | uuid | Primary key, generated |
+| `campaign_id` | uuid | FK to campaign, cascade delete |
+| `status` | text | `RUNNING`, `COMPLETED`, `FAILED`, `WAITING_FOR_GOLD_SCHEMA` |
+| `requested_at`, `completed_at` | timestamptz | Launch timing |
+| `error_message` | text | Failure detail |
+| `evaluated_count`, `included_count` | integer | Default 0 |
+
+Index: `(campaign_id, requested_at DESC)`.
+
+### `testiq.campaign_daily_run`
+
+Stores one recurring business-date evaluation for one campaign.
+
+| Column | Type | Notes |
+|---|---|---|
+| `campaign_run_id` | uuid | Primary key |
+| `campaign_id` | uuid | FK to campaign |
+| `campaign_code`, `procedure_name`, `trigger_source` | text | Execution identity |
+| `schedule_timezone` | text | Default `Asia/Kolkata` |
+| `evaluation_date`, `target_refill_date` | date | Business dates |
+| `status` | text | `RUNNING`, `COMPLETED`, `COMPLETED_WITH_ERRORS`, `FAILED`, `SKIPPED` |
+| `started_at`, `completed_at` | timestamptz | Timing |
+| `members_evaluated`, `prescriptions_evaluated` | integer | Default 0 |
+| `records_qualified`, `records_inserted`, `records_excluded`, `records_failed` | integer | Default 0 |
+| `error_message` | text | Failure detail |
+
+Unique key: `(campaign_id, evaluation_date)`. A completed row may be reopened for same-day incremental Silver arrivals; Gold/outbox uniqueness prevents duplicates.
+
+### `goldbox.notification_outbox`
+
+Immutable campaign notification snapshot and API acknowledgment target.
+
+| Column | Type | Null/default | Notes |
+|---|---|---|---|
+| `outbox_id` | bigint identity | primary key | API acknowledgment ID |
+| `campaign_id` | uuid | not null | FK to `testiq.campaign` |
+| `campaign_launch_id` | uuid | nullable | FK to launch |
+| `member_sk` | bigint | not null | Silver surrogate key |
+| `member_id` | text | not null | Source member key |
+| `prescription_sk` | bigint | nullable | FK to Silver prescription |
+| `prescription_id` | text | nullable | Source prescription key |
+| `drug_name` | text | nullable | Snapshot value |
+| `next_refill_date` | date | nullable | Snapshot value |
+| `first_name`, `last_name` | text | nullable | Snapshot values |
+| `channel` | text | not null | Routed channel |
+| `destination` | text | not null | Selected endpoint |
+| `template_code` | text | nullable | Render template |
+| `payload` | jsonb | default `{}` | Campaign evidence and message data |
+| `notification_sent` | smallint | default 0 | 0 pending, 1 sent |
+| `notification_sent_at` | timestamptz | nullable | Required when sent |
+| `created_at` | timestamptz | default `now()` | Snapshot time |
+| `last_error` | text | nullable | Delivery error |
+
+Unique key: `(campaign_id, member_id, prescription_id, next_refill_date)`.
+
+Indexes cover campaign history, refill identity, and pending outbox rows.
+
+### Existing Gold refill tables extended by scheduling
+
+The server supplies `goldbox.prescription_refill`, `goldbox.prescription_refill_etl_audit`, and `goldbox.prescription_refill_record_audit`.
+
+The scheduler adds these lineage fields:
+
+- `goldbox.prescription_refill`: `campaign_id`, `campaign_run_id`, `evaluation_date`
+- `goldbox.prescription_refill_record_audit`: `campaign_run_id`, `evaluation_date`, `exclusion_reason`
+
+The partial unique index on `(campaign_id, evaluation_date, prescription_sk, next_refill_date)` makes repeated campaign evaluation idempotent.
+
+## Do-not-contact and Transport schema
+
+### `silverbox.do_not_contact`
+
+| Column | Type | Notes |
+|---|---|---|
+| `do_not_contact_id` | bigint identity | Primary key |
+| `member_sk` | bigint | FK to Silver member |
+| `channel` | text | `SMS`, `EMAIL`, `PHONE`, or `ALL` |
+| `reason` | text | Optional exclusion reason |
+| `effective_at` | timestamptz | Default now |
+| `expires_at` | timestamptz | Nullable expiry |
+| `active` | boolean | Default true |
+| `created_at`, `updated_at` | timestamptz | Audit timestamps |
+
+Unique key: `(member_sk, channel)`. Active lookup index: `(member_sk, channel, active)`.
+
+### `transport.journey_run_audit`
+
+One execution record per channel journey. It stores `journey_run_id`, `channel`, start/completion timestamps, status, selected/routed/DNC/missing-contact/duplicate/failed counts, and `error_message`.
+
+### `transport.journey_processing`
+
+Coordination row keyed by `gold_record_id`, with FKs to `goldbox.prescription_refill` and `silverbox.member`. It stores campaign, channel, processing status, attempt count, timestamps, and error data so concurrent workers cannot route the same Gold record twice.
+
+### `transport.journey_record_audit`
+
+Record-level evidence with FKs to journey run, Gold refill, and optional DNC record. It stores member/campaign/channel, masked destination, result code, detail, and created timestamp. Result codes include `ROUTED`, `DNC_EXCLUDED`, `MISSING_CONTACT`, `DUPLICATE`, and `FAILED`.
+
+### Channel delivery tables
+
+`transport.sms`, `transport.email`, and `transport.voice` each reference the Gold refill, Silver member, campaign, and journey run. They store the resolved destination, payload/message fields, delivery status, provider identifiers, attempt/error fields, and timestamps.
+
+Each channel table has:
+
+- an idempotency key tied to the Gold record;
+- a pending-delivery index;
+- an index on member and campaign;
+- a channel-specific destination and content contract.
+
+## Stored procedures and functions
+
+| Object | Purpose |
+|---|---|
+| `silverbox.process_membership(text)` | Transform one Bronze membership load |
+| `silverbox.process_prescription(text)` | Transform one Bronze prescription load |
+| `testiq.process_bronze_load_to_silver(text,text)` | Lock, coordinate, audit, and finalize one load |
+| `testiq.process_pending_bronze_to_silver(integer,text)` | Process pending loads in a bounded batch |
+| `goldbox.preview_campaign_audience(uuid)` | Compute/refetch a refill audience |
+| `goldbox.process_campaign(uuid)` | Materialize an exact-date refill campaign |
+| `goldbox.process_age_campaign(uuid,text)` | Materialize active members older than 30 with an active prescription |
+| `testiq.execute_autofill_campaign_daily(uuid,text)` | Run AutoFill qualification and materialization |
+| `testiq.ensure_campaign_procedure(uuid)` | Create/update the dedicated per-campaign procedure |
+| `testiq.invoke_campaign_procedure(uuid,text)` | Invoke the assigned campaign procedure |
+| `testiq.process_due_campaigns(integer,text)` | Run due five-minute campaign work |
+| `goldbox.mark_notification_sent(bigint)` | Acknowledge an outbox record |
+| `transport.route_channel(text)` | Route pending Gold rows for one channel |
+| `transport.journey_sms()` | Run SMS journey |
+| `transport.journey_email()` | Run email journey |
+| `transport.journey_voice()` | Run voice journey |
+| `transport.process_pending_journeys()` | Run all transport journeys |
+| `testiq.process_pending_testiq_to_bronze(integer,text)` | Move ready TestIQ records into Bronze |
+
+## Idempotency and concurrency
+
+- Ingestion is deduplicated by `event_id`, SHA-256, queued file content, and queued payload equality.
+- Bronze to Silver uses transaction advisory locks and processes only `BRONZE_LOADED` control rows.
+- Membership runs before prescription for every load.
+- Campaign creation uses a unique configuration fingerprint.
+- Campaign daily work is unique per campaign and evaluation date.
+- Notification snapshots are unique per campaign, member, prescription, and refill date.
+- Transport uses a coordination record and channel-specific unique keys.
+- Scheduled procedures use row locks/advisory locks, allowing pg_cron and backend fallback checks to overlap safely.
+
+## Scheduler contract
+
+PostgreSQL `pg_cron` is the primary scheduler. The application runs APScheduler fallbacks every five minutes when the corresponding pg_cron job is missing, stale, failed, or unreadable.
+
+The three recurring stages are:
+
+1. pending Bronze to Silver loads;
+2. due Silver to Gold campaigns;
+3. Gold to Transport channel journeys.
+
+All campaign business-date logic uses `Asia/Kolkata`; service scheduling infrastructure runs in UTC where appropriate.
+

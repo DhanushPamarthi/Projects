@@ -179,6 +179,26 @@ export async function getProjectDashboard(projectId, options = {}) {
   return request(`/api/v1/projects/${encodeURIComponent(projectId)}/dashboard`, { cache: "no-store", ...options });
 }
 
+export async function getProjectWorkspaceSummary(options = {}) {
+  return request("/api/v1/projects/workspace-summary", { cache: "no-store", ...options });
+}
+
+export async function retryPackageAutomation(packageId) {
+  return request(`/api/v1/packages/${encodeURIComponent(packageId)}/automation/retry`, { method: "POST" });
+}
+
+export async function stopPackageAutomation(packageId) {
+  return request(`/api/v1/packages/${encodeURIComponent(packageId)}/automation/stop`, { method: "POST" });
+}
+
+export async function stopProjectPackageCreation(projectId) {
+  return request(`/api/v1/projects/${encodeURIComponent(projectId)}/processing/stop`, { method: "POST" });
+}
+
+export async function resumeProjectPackageCreation(projectId) {
+  return request(`/api/v1/projects/${encodeURIComponent(projectId)}/processing/resume`, { method: "POST" });
+}
+
 export async function buildKnowledgeIndex(packageId, options = {}) {
   return request(`/api/v1/packages/${encodeURIComponent(packageId)}/knowledge-index`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(options) });
 }

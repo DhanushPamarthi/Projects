@@ -40,8 +40,11 @@ CREATE TABLE IF NOT EXISTS testiq.source_extraction (
 
 CREATE TABLE IF NOT EXISTS testiq.source_package_manifest (
   package_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, package_version INTEGER NOT NULL,
-  scope TEXT, created_at TEXT NOT NULL, UNIQUE(project_id, package_version)
+  scope TEXT, automation_stage TEXT NOT NULL DEFAULT 'not_started', automation_error TEXT,
+  created_at TEXT NOT NULL, UNIQUE(project_id, package_version)
 );
+ALTER TABLE testiq.source_package_manifest ADD COLUMN IF NOT EXISTS automation_stage TEXT NOT NULL DEFAULT 'not_started';
+ALTER TABLE testiq.source_package_manifest ADD COLUMN IF NOT EXISTS automation_error TEXT;
 
 CREATE TABLE IF NOT EXISTS testiq.source_package_item (
   package_id TEXT NOT NULL REFERENCES testiq.source_package_manifest(package_id),
