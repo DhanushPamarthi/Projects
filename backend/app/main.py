@@ -2469,10 +2469,11 @@ def list_project_workspace_summaries():
             "GROUP BY p.project_id ORDER BY p.created_at DESC"
         )
         brd_sql = (
-            "SELECT s.project_id,s.source_id,s.logical_name,r.filename,r.status AS revision_status, "
+            "SELECT s.project_id,s.source_id,s.logical_name,s.created_at,r.revision_id,r.revision,r.filename,r.owner_version,r.status AS revision_status, "
+            "(SELECT COUNT(*) FROM source_revision rv WHERE rv.source_id=s.source_id) AS revision_count, "
             "(SELECT e.status FROM source_extraction e WHERE e.revision_id=r.revision_id ORDER BY e.created_at DESC LIMIT 1) AS extraction_status "
             "FROM source_document s LEFT JOIN source_revision r ON r.revision_id=s.active_revision_id "
-            "WHERE s.source_type='brd'"
+            "WHERE s.source_type='brd' ORDER BY s.created_at,s.source_id"
         )
         package_sql = (
             "SELECT m.package_id,m.project_id,m.package_version,m.package_name,m.created_at,m.automation_stage,m.automation_error "
@@ -2503,19 +2504,25 @@ def list_project_workspace_summaries():
         packages = [row_dict(row) for row in package_cursor.fetchall()]
         indexes = [row_dict(row) for row in index_cursor.fetchall()]
         business_packages = {row["package_id"] for row in business_cursor.fetchall()}
-    brd_by_project = {item["project_id"]: item for item in brds}
+    brds_by_project: dict[str, list[dict]] = {}
+    for item in brds:
+        brds_by_project.setdefault(item["project_id"], []).append(item)
     index_by_package = {item["package_id"]: item for item in indexes}
     package_by_project = {item["project_id"]: item for item in packages}
     result = []
     for project in projects:
-        brd_row = brd_by_project.get(project["project_id"])
-        brd = None
-        if brd_row:
-            brd = {
+        project_brds = []
+        for brd_row in brds_by_project.get(project["project_id"], []):
+            project_brds.append({
                 "source_id": brd_row["source_id"], "source_type": "brd", "logical_name": brd_row["logical_name"],
                 "status": brd_row["revision_status"], "extraction": {"status": brd_row["extraction_status"] or "pending"},
-                "active_revision": {"filename": brd_row["filename"]} if brd_row["filename"] else None,
-            }
+                "revision_count": brd_row["revision_count"] or 0,
+                "active_revision": ({
+                    "revision_id": brd_row["revision_id"], "revision": brd_row["revision"], "filename": brd_row["filename"],
+                    "owner_version": brd_row["owner_version"], "status": brd_row["revision_status"],
+                } if brd_row["revision_id"] else None),
+            })
+        brd = project_brds[0] if project_brds else None
         package = package_by_project.get(project["project_id"])
         latest_package = None
         if package:
@@ -2539,7 +2546,7 @@ def list_project_workspace_summaries():
                 },
                 "workflow": {"package_processing": stage, "knowledge_base": kb_status},
             }
-        result.append({**project, "brd": brd, "latest_package": latest_package})
+        result.append({**project, "brd": brd, "brds": project_brds, "latest_package": latest_package})
     return result
 
 @app.get("/api/v1/projects/{project_id}")
@@ -2551,7 +2558,7 @@ def get_project(project_id: str):
         return row_dict(project)
 
 @app.post("/api/v1/projects/{project_id}/sources")
-async def upload_source(project_id: str, file: UploadFile = File(...), source_type: str = Form(...), owner: str | None = Form(None), owner_version: str | None = Form(None), brd_source_id: str | None = Form(None), required_sections: str | None = Form(None), background_tasks: BackgroundTasks = None):
+async def upload_source(project_id: str, file: UploadFile = File(...), source_type: str = Form(...), owner: str | None = Form(None), owner_version: str | None = Form(None), brd_source_id: str | None = Form(None), version_of_source_id: str | None = Form(None), required_sections: str | None = Form(None), background_tasks: BackgroundTasks = None):
     if source_type not in SOURCE_TYPES: raise HTTPException(422, "Unsupported source type")
     if source_type != "brd" and not brd_source_id:
         raise HTTPException(422, "Select the BRD associated with this supporting document")
@@ -2560,6 +2567,10 @@ async def upload_source(project_id: str, file: UploadFile = File(...), source_ty
     with connection() as conn:
         if not conn.execute("SELECT project_id FROM project WHERE project_id=%s", (project_id,)).fetchone():
             raise HTTPException(404, "Project not found")
+        if version_of_source_id:
+            version_source = conn.execute("SELECT * FROM source_document WHERE source_id=%s AND project_id=%s", (version_of_source_id, project_id)).fetchone()
+            if not version_source: raise HTTPException(422, "The BRD selected for version upload was not found in this project")
+            if version_source["source_type"] != source_type: raise HTTPException(422, "A new version must use the same document type as its source")
         if source_type != "brd" and brd_source_id:
             brd = conn.execute("SELECT * FROM source_document WHERE source_id=%s AND project_id=%s", (brd_source_id, project_id)).fetchone()
             if not brd: raise HTTPException(422, "Associated BRD was not found in this project")
@@ -2573,7 +2584,7 @@ async def upload_source(project_id: str, file: UploadFile = File(...), source_ty
     except ValueError as exc:
         source_id, revision_id = uid("src"), uid("rev"); path = UPLOAD_DIR / f"{revision_id}_{Path(file.filename or 'source').name}"; path.write_bytes(content)
         with connection() as conn:
-            existing = conn.execute("SELECT * FROM source_document WHERE project_id=%s AND source_type=%s AND logical_name=%s", (project_id, source_type, file.filename or "source")).fetchone()
+            existing = conn.execute("SELECT * FROM source_document WHERE source_id=%s AND project_id=%s", (version_of_source_id, project_id)).fetchone() if version_of_source_id else conn.execute("SELECT * FROM source_document WHERE project_id=%s AND source_type=%s AND logical_name=%s", (project_id, source_type, file.filename or "source")).fetchone()
             if existing:
                 source_id = existing["source_id"]
                 revision = (conn.execute("SELECT COALESCE(MAX(revision),0)+1 AS next_revision FROM source_revision WHERE source_id=%s", (source_id,)).fetchone()["next_revision"])
@@ -2584,7 +2595,7 @@ async def upload_source(project_id: str, file: UploadFile = File(...), source_ty
         return JSONResponse(status_code=415 if "Unsupported document format" in str(exc) else 422, content={"status": "rejected", "revision_id": revision_id, "source_id": source_id, "validation_messages": [str(exc)], "original_preserved": True})
     digest = hashlib.sha256(content).hexdigest(); filename = file.filename or "source"
     with connection() as conn:
-        existing = conn.execute("SELECT s.*,r.* FROM source_document s JOIN source_revision r ON r.source_id=s.source_id WHERE s.project_id=%s AND s.source_type=%s AND s.logical_name=%s ORDER BY r.revision DESC", (project_id, source_type, filename)).fetchall()
+        existing = conn.execute("SELECT s.*,r.* FROM source_document s JOIN source_revision r ON r.source_id=s.source_id WHERE s.source_id=%s AND s.project_id=%s ORDER BY r.revision DESC", (version_of_source_id, project_id)).fetchall() if version_of_source_id else conn.execute("SELECT s.*,r.* FROM source_document s JOIN source_revision r ON r.source_id=s.source_id WHERE s.project_id=%s AND s.source_type=%s AND s.logical_name=%s ORDER BY r.revision DESC", (project_id, source_type, filename)).fetchall()
         # Content identity is project-scoped and independent of the physical
         # filename. A renamed upload should remain traceable to its canonical
         # logical source instead of creating a second package source.
@@ -2678,7 +2689,7 @@ class ActiveRevisionRequest(BaseModel):
     revision_id: str = Field(min_length=1)
 
 @app.post("/api/v1/sources/{source_id}/active-revision")
-def select_active_revision(source_id: str, request: ActiveRevisionRequest):
+def select_active_revision(source_id: str, request: ActiveRevisionRequest, background_tasks: BackgroundTasks):
     with connection() as conn:
         source = conn.execute("SELECT * FROM source_document WHERE source_id=%s", (source_id,)).fetchone()
         revision = conn.execute("SELECT r.*,e.status AS extraction_status FROM source_revision r LEFT JOIN source_extraction e ON e.revision_id=r.revision_id WHERE r.source_id=%s AND r.revision_id=%s ORDER BY e.created_at DESC LIMIT 1", (source_id, request.revision_id)).fetchone()
@@ -2687,7 +2698,9 @@ def select_active_revision(source_id: str, request: ActiveRevisionRequest):
         if revision["status"] in {"rejected", "extraction_failed", "pending", "processing"} or revision["extraction_status"] != "succeeded":
             raise HTTPException(422, "Only a successfully extracted revision can be made active")
         conn.execute("UPDATE source_document SET active_revision_id=%s,updated_at=%s WHERE source_id=%s", (request.revision_id, now(), source_id))
-        return {"source_id": source_id, "active_revision_id": request.revision_id}
+        project_id = source["project_id"]
+    background_tasks.add_task(_auto_sync_project_knowledge, project_id)
+    return {"source_id": source_id, "active_revision_id": request.revision_id}
 
 @app.get("/api/v1/revisions/{revision_id}/compare/{other_revision_id}")
 def compare_revisions(revision_id: str, other_revision_id: str):

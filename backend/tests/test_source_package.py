@@ -59,6 +59,76 @@ def test_distinct_brds_remain_separate_and_can_share_one_package(monkeypatch):
     assert package.status_code == 201, package.text
     assert {item["source_id"] for item in package.json()["items"]} == {first.json()["source_id"], second.json()["source_id"]}
 
+
+def test_explicit_brd_version_upload_keeps_lineage_and_workspace_lists_all_brds(monkeypatch):
+    client = _client(monkeypatch)
+    first = client.post("/api/v1/projects/p1/sources", files={"file": ("requirements-v1.md", io.BytesIO(b"# Scope\nInitial requirements."), "text/markdown")}, data={"source_type": "brd", "owner_version": "1.0"})
+    second = client.post("/api/v1/projects/p1/sources", files={"file": ("delivery.md", io.BytesIO(b"# Scope\nDelivery requirements."), "text/markdown")}, data={"source_type": "brd", "owner_version": "1.0"})
+    assert first.status_code == second.status_code == 202
+
+    updated = client.post(
+        "/api/v1/projects/p1/sources",
+        files={"file": ("requirements-renamed-v2.md", io.BytesIO(b"# Scope\nUpdated requirements."), "text/markdown")},
+        data={"source_type": "brd", "owner_version": "2.0", "version_of_source_id": first.json()["source_id"]},
+    )
+    assert updated.status_code == 202, updated.text
+    assert updated.json()["source_id"] == first.json()["source_id"]
+    assert updated.json()["revision"] == 2
+
+    sources = client.get("/api/v1/projects/p1/sources").json()
+    assert len([source for source in sources if source["source_type"] == "brd"]) == 2
+    revisions = client.get(f"/api/v1/sources/{first.json()['source_id']}/revisions").json()["revisions"]
+    assert [revision["revision"] for revision in revisions] == [2, 1]
+
+    summary = next(item for item in client.get("/api/v1/projects/workspace-summary").json() if item["project_id"] == "p1")
+    assert len(summary["brds"]) == 2
+    versioned = next(brd for brd in summary["brds"] if brd["source_id"] == first.json()["source_id"])
+    assert versioned["revision_count"] == 2
+    assert versioned["active_revision"]["filename"] == "requirements-renamed-v2.md"
+
+
+def test_brd_version_upload_keeps_package_lineage_and_preserves_previous_snapshot(monkeypatch):
+    client = _client(monkeypatch)
+    import app.main
+    monkeypatch.setattr(app.main, "_run_package_automation", lambda package_id: None)
+    first = client.post(
+        "/api/v1/projects/p1/sources",
+        files={"file": ("requirements-v1.md", io.BytesIO(b"# Scope\nInitial requirements."), "text/markdown")},
+        data={"source_type": "brd", "owner_version": "1.0"},
+    )
+    assert first.status_code == 202, first.text
+
+    packages_after_v1 = client.get("/api/v1/projects/p1/manifests").json()
+    assert len(packages_after_v1) == 1
+    package_v1 = client.get(f"/api/v1/manifests/{packages_after_v1[0]['package_id']}").json()
+    brd_v1 = next(item for item in package_v1["items"] if item["source_type"] == "brd")
+    assert brd_v1["revision_id"] == first.json()["revision_id"]
+
+    second = client.post(
+        "/api/v1/projects/p1/sources",
+        files={"file": ("requirements-renamed-v2.md", io.BytesIO(b"# Scope\nUpdated requirements."), "text/markdown")},
+        data={
+            "source_type": "brd",
+            "owner_version": "2.0",
+            "version_of_source_id": first.json()["source_id"],
+        },
+    )
+    assert second.status_code == 202, second.text
+
+    packages_after_v2 = client.get("/api/v1/projects/p1/manifests").json()
+    assert [package["package_version"] for package in packages_after_v2] == [2, 1]
+    package_v2 = client.get(f"/api/v1/manifests/{packages_after_v2[0]['package_id']}").json()
+    preserved_package_v1 = client.get(f"/api/v1/manifests/{packages_after_v2[1]['package_id']}").json()
+    brd_v2 = next(item for item in package_v2["items"] if item["source_type"] == "brd")
+    preserved_brd_v1 = next(item for item in preserved_package_v1["items"] if item["source_type"] == "brd")
+
+    assert package_v2["package_name"] == preserved_package_v1["package_name"] == "p1 Resource Package"
+    assert brd_v2["source_id"] == preserved_brd_v1["source_id"] == first.json()["source_id"]
+    assert brd_v2["revision_id"] == second.json()["revision_id"]
+    assert preserved_brd_v1["revision_id"] == first.json()["revision_id"]
+    assert brd_v2["revision"] == 2
+    assert preserved_brd_v1["revision"] == 1
+
 def test_upload_validation(monkeypatch):
     client = _client(monkeypatch)
     empty = client.post("/api/v1/projects/p1/sources", files={"file": ("empty.md", io.BytesIO(b""), "text/markdown")}, data={"source_type": "brd"})

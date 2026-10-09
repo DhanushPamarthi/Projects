@@ -140,11 +140,12 @@ export async function listProjects(options = {}) {
   return request("/api/v1/projects", { cacheTtl: 30_000, ...options });
 }
 
-export async function uploadSource(projectId, file, sourceType = "brd", brdSourceId = "", requiredSections = "") {
+export async function uploadSource(projectId, file, sourceType = "brd", brdSourceId = "", requiredSections = "", versionOfSourceId = "") {
   const formData = new FormData();
   formData.append("file", file);
   formData.append("source_type", sourceType);
   if (brdSourceId) formData.append("brd_source_id", brdSourceId);
+  if (versionOfSourceId) formData.append("version_of_source_id", versionOfSourceId);
   if (requiredSections) formData.append("required_sections", requiredSections);
   return request(`/api/v1/projects/${encodeURIComponent(projectId)}/sources`, {
     method: "POST",
