@@ -32,7 +32,7 @@ if (localStorage.getItem(WORKSPACE_STATE_VERSION_KEY) !== WORKSPACE_STATE_VERSIO
 const VALID_NAV_ITEMS = new Set(["projects", "sources", "packages", "business-requirements", "requirements", "test-cases", "test-data", "test-results", "traceability", "knowledge-base", "dashboard", "token-usage"]);
 const NAV_ITEMS = [
   { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
-  { id: "projects", label: "Upload Document", icon: UploadCloud },
+  { id: "projects", label: "Manage Projects & Upload BRD", icon: UploadCloud },
   { id: "test-cases", label: "Test cases", icon: ClipboardCheck },
   { id: "test-data", label: "Test data", icon: Database },
   { id: "test-results", label: "Test Results", icon: FileCheck2 },
@@ -51,11 +51,16 @@ function canAccessNavItem(user, item) {
 
 function Navigation({ items, activeNav, onNavigate, onLogout, user, initials, expanded, mobile = false }) {
   const traceabilityChildren = items.filter((item) => item.parent === "traceability");
+  const workspaceToolChildren = items.filter((item) => item.parent === "workspace-tools");
   const primaryItems = items.filter((item) => !item.parent);
   const childIsActive = traceabilityChildren.some((item) => item.id === activeNav);
+  const workspaceToolIsActive = workspaceToolChildren.some((item) => item.id === activeNav);
   const [traceabilityOpen, setTraceabilityOpen] = useState(() => localStorage.getItem("testiq_traceability_menu_open") === "true" || childIsActive);
+  const [workspaceToolsOpen, setWorkspaceToolsOpen] = useState(() => localStorage.getItem("testiq_workspace_tools_menu_open") === "true" || workspaceToolIsActive);
   useEffect(() => { if (childIsActive) setTraceabilityOpen(true); }, [childIsActive]);
+  useEffect(() => { if (workspaceToolIsActive) setWorkspaceToolsOpen(true); }, [workspaceToolIsActive]);
   useEffect(() => { localStorage.setItem("testiq_traceability_menu_open", String(traceabilityOpen)); }, [traceabilityOpen]);
+  useEffect(() => { localStorage.setItem("testiq_workspace_tools_menu_open", String(workspaceToolsOpen)); }, [workspaceToolsOpen]);
   const renderItem = ({ id, label, icon: Icon, badge, badgeLabel, disabled, running }, nested = false) => (
     <button key={id} type="button" className={`sidebar-nav-item ${nested ? "sidebar-nav-child" : ""} ${activeNav === id ? "selected" : ""}`} aria-label={label} aria-current={activeNav === id ? "page" : undefined} aria-disabled={disabled || undefined} title={expanded ? undefined : label} onClick={() => !disabled && onNavigate(id)}>
       <Icon size={18} aria-hidden="true" /><span className="sidebar-nav-label">{label}</span>{running && <LoaderCircle className="spin nav-runner" size={16} aria-label={`${label} is running`} />}{badge && <span className="nav-badge" aria-label={badgeLabel}>{badge}</span>}
@@ -63,7 +68,7 @@ function Navigation({ items, activeNav, onNavigate, onLogout, user, initials, ex
   );
   return <>
     <div className="brand-lockup"><div className="brand-mark"><FlaskConical size={19} /></div><div className="brand-copy"><div className="brand-name">Dava.Test<span>IQ</span></div><div className="brand-caption">Source workspace</div></div></div>
-    <div className="sidebar-section-label">Workspace</div><nav className="sidebar-nav" aria-label="Workspace navigation">{primaryItems.map((item) => item.id !== "traceability" ? renderItem(item) : <div className={`sidebar-nav-group ${traceabilityOpen ? "is-open" : ""}`} key={item.id}><div className="sidebar-nav-parent">{renderItem(item)}<button type="button" className="sidebar-subnav-toggle" aria-label={`${traceabilityOpen ? "Hide" : "Show"} Traceability tools`} aria-expanded={traceabilityOpen} onClick={() => setTraceabilityOpen((open) => !open)}><ChevronDown size={15} /></button></div>{traceabilityOpen && <div className="sidebar-subnav" aria-label="Traceability tools">{traceabilityChildren.map((child) => renderItem(child, true))}</div>}</div>)}</nav>
+    <div className="sidebar-section-label">Workspace</div><nav className="sidebar-nav" aria-label="Workspace navigation">{primaryItems.map((item) => item.id === "workspace-tools" && workspaceToolChildren.length ? <div className={`sidebar-nav-group ${workspaceToolsOpen ? "is-open" : ""}`} key={item.id}><div className="sidebar-nav-parent">{renderItem(item)}<button type="button" className="sidebar-subnav-toggle" aria-label={`${workspaceToolsOpen ? "Hide" : "Show"} Workspace Tools`} aria-expanded={workspaceToolsOpen} onClick={() => setWorkspaceToolsOpen((open) => !open)}><ChevronDown size={15} /></button></div>{workspaceToolsOpen && <div className="sidebar-subnav" aria-label="Workspace Tools">{workspaceToolChildren.map((child) => renderItem(child, true))}</div>}</div> : item.id === "traceability" && traceabilityChildren.length ? <div className={`sidebar-nav-group ${traceabilityOpen ? "is-open" : ""}`} key={item.id}><div className="sidebar-nav-parent">{renderItem(item)}<button type="button" className="sidebar-subnav-toggle" aria-label={`${traceabilityOpen ? "Hide" : "Show"} Traceability tools`} aria-expanded={traceabilityOpen} onClick={() => setTraceabilityOpen((open) => !open)}><ChevronDown size={15} /></button></div>{traceabilityOpen && <div className="sidebar-subnav" aria-label="Traceability tools">{traceabilityChildren.map((child) => renderItem(child, true))}</div>}</div> : renderItem(item))}</nav>
     <div className="sidebar-spacer" />
     <button type="button" className="sidebar-user" aria-label={`Log out ${user?.name || user?.email || "user"}`} onClick={onLogout}><span className="avatar small">{initials}</span><span className="sidebar-user-copy"><strong>{user?.name}</strong><span>{user?.email}</span></span><LogOut size={16} aria-hidden="true" /></button>
     {mobile && <span className="sr-only">Navigation menu</span>}

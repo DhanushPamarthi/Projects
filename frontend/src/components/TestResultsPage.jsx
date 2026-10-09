@@ -65,6 +65,7 @@ export function TestResultsPage() {
   const [packages, setPackages] = useState([]);
   const [packageId, setPackageId] = useState(() => readStoredJson("testiq_current_package")?.package_id || "");
   const [runs, setRuns] = useState([]);
+  const [selectedRunIds, setSelectedRunIds] = useState([]);
   const [loading, setLoading] = useState(true);
   const [executingRunId, setExecutingRunId] = useState("");
   const [runPage, setRunPage] = useState(1); const [resultPage, setResultPage] = useState(1); const [evidencePage, setEvidencePage] = useState(1);
@@ -124,6 +125,7 @@ export function TestResultsPage() {
         })).sort((left, right) => String(right.created_at || "").localeCompare(String(left.created_at || "")));
         if (!cancelled) {
           setRuns(nextRuns);
+          setSelectedRunIds((current) => current.filter((runId) => nextRuns.some((run) => run.run_id === runId)));
         }
       } catch (err) {
         if (!cancelled) setError(err.message || "Unable to load test results.");
@@ -136,11 +138,22 @@ export function TestResultsPage() {
   }, [packageId]);
   useEffect(() => { setRunPage(1); setResultPage(1); setEvidencePage(1); }, [packageId]);
 
+  const reportRuns = selectedRunIds.length ? runs.filter((run) => selectedRunIds.includes(run.run_id)) : runs;
+
+  function toggleRunSelection(runId) {
+    setSelectedRunIds((current) => current.includes(runId) ? current.filter((item) => item !== runId) : [...current, runId]);
+  }
+
+  function toggleAllRuns(checked) {
+    setSelectedRunIds(checked ? runs.map((run) => run.run_id) : []);
+  }
+
   async function selectProject(projectId) {
     setProject(null);
     setPackages([]);
     setPackageId("");
     setRuns([]);
+    setSelectedRunIds([]);
     if (!projectId) { setLoading(false); localStorage.removeItem("testiq_current_project"); return; }
     setLoading(true);
     setError("");
@@ -163,6 +176,7 @@ export function TestResultsPage() {
 
   function selectPackage(id) {
     setPackageId(id);
+    setSelectedRunIds([]);
     const selectedPackage = packages.find((item) => item.package_id === id);
     if (selectedPackage) localStorage.setItem("testiq_current_package", JSON.stringify(selectedPackage));
   }
@@ -181,16 +195,16 @@ export function TestResultsPage() {
   }
 
   const summary = useMemo(() => {
-    const passed = runs.filter((run) => testResultStatus(run) === "Pass").length;
-    const failed = runs.filter((run) => testResultStatus(run) === "Fail").length;
-    const waiting = runs.filter((run) => testResultStatus(run) === "Waiting for CDP").length;
+    const passed = reportRuns.filter((run) => testResultStatus(run) === "Pass").length;
+    const failed = reportRuns.filter((run) => testResultStatus(run) === "Fail").length;
+    const waiting = reportRuns.filter((run) => testResultStatus(run) === "Waiting for CDP").length;
     const executed = passed + failed;
-    const total = runs.length;
+    const total = reportRuns.length;
     return { passed, failed, executed, waiting, total, progress: total ? Math.round((executed / total) * 100) : 0 };
-  }, [runs]);
+  }, [reportRuns]);
 
-  const runsWithResults = runs.filter((run) => run.execution_results?.length);
-  const executionResultRows = useMemo(() => runs.flatMap((run) => {
+  const runsWithResults = reportRuns.filter((run) => run.execution_results?.length);
+  const executionResultRows = useMemo(() => reportRuns.flatMap((run) => {
     const cases = run.generation?.contract?.test_cases || run.generation?.test_cases || [];
     const titles = new Map(cases.map((item) => [item.test_case_id, item.title || item.scenario || "Untitled test case"]));
     return (run.execution_results || []).map((result) => ({
@@ -198,7 +212,7 @@ export function TestResultsPage() {
       title: titles.get(result.test_case_id) || result.title || "Untitled test case",
       executedAt: result.completed_at || result.executed_at || run.completed_at || run.updated_at || run.created_at,
     }));
-  }), [runs]);
+  }), [reportRuns]);
   const pageSize = 5;
   const visibleRuns = runs.slice((runPage - 1) * pageSize, runPage * pageSize);
   const visibleResultRows = executionResultRows.slice((resultPage - 1) * pageSize, resultPage * pageSize);
@@ -234,7 +248,7 @@ export function TestResultsPage() {
         : <>
           <div className="requirements-summary-grid"><div><span>Total baselines</span><strong>{runs.length}</strong></div><div><span>Executed</span><strong>{summary.executed}</strong></div><div><span>Passed</span><strong>{summary.passed}</strong></div><div><span>Failed</span><strong>{summary.failed}</strong></div><div><span>Waiting for CDP</span><strong>{summary.waiting}</strong></div></div>
           {executionResultsTable}
-          <section className="requirements-panel"><div className="panel-title-row"><div><h2>Execution runs</h2><p className="panel-helper">Validate layer evidence for each run.</p></div><span>{runs.length} run{runs.length === 1 ? "" : "s"}</span></div><div className="business-requirements-table-wrap"><table className="business-requirements-table test-results-table"><thead><tr><th>Run ID</th><th>Project Name</th><th>Selected cases</th><th>Data records</th><th>Status</th><th>Created On</th><th>Action</th></tr></thead><tbody>{visibleRuns.map((run) => { const status = testResultStatus(run); const state = runStatus(run); const blocked = state === "cancelled" || executingRunId === run.run_id; const hasResults = Boolean(run.execution_results?.length); const action = status === "Waiting for CDP" ? "Check layer results" : hasResults ? "Recheck layer results" : "Check layer results"; const selectedRecords = run.frozen_contract?.selected_test_data_record_ids || run.configuration_snapshot?.selected_test_data_record_ids || []; return <tr key={run.run_id}><td>{runDateLabel(run)}</td><td>{project?.project_name || "-"}</td><td>{run.selected_test_case_ids?.length || 0}</td><td>{selectedRecords.length || run.frozen_contract?.test_data_records?.length || 0}</td><td><span className={`execution-run-status ${statusClass(status)}`}>{status}</span></td><td>{formatDate(run.created_at)}</td><td><button type="button" className="secondary-button compact-button" disabled={blocked} onClick={() => executeRun(run)}>{executingRunId === run.run_id ? <><LoaderCircle className="spin" size={14} /> Checking...</> : <><PlayCircle size={14} /> {action}</>}</button></td></tr>; })}</tbody></table></div><Pagination page={runPage} pageSize={pageSize} totalItems={runs.length} onPageChange={setRunPage} label="execution runs" /></section>
+          <section className="requirements-panel"><div className="panel-title-row"><div><h2>Execution runs</h2><p className="panel-helper">Select one or more runs to focus the report below. Clear the selection to show all runs.</p></div><span>{selectedRunIds.length ? `${selectedRunIds.length} selected` : `${runs.length} run${runs.length === 1 ? "" : "s"}`}</span></div><div className="business-requirements-table-wrap"><table className="business-requirements-table test-results-table"><thead><tr><th className="test-results-select-column"><input type="checkbox" aria-label="Select all execution runs" checked={runs.length > 0 && selectedRunIds.length === runs.length} onChange={(event) => toggleAllRuns(event.target.checked)} /></th><th>Run ID</th><th>Project Name</th><th>Selected cases</th><th>Data records</th><th>Status</th><th>Created On</th><th>Action</th></tr></thead><tbody>{visibleRuns.map((run) => { const status = testResultStatus(run); const state = runStatus(run); const blocked = state === "cancelled" || executingRunId === run.run_id; const hasResults = Boolean(run.execution_results?.length); const action = status === "Waiting for CDP" ? "Check layer results" : hasResults ? "Recheck layer results" : "Check layer results"; const selectedRecords = run.frozen_contract?.selected_test_data_record_ids || run.configuration_snapshot?.selected_test_data_record_ids || []; return <tr key={run.run_id}><td className="test-results-select-cell"><input type="checkbox" aria-label={`Select ${runDateLabel(run)}`} checked={selectedRunIds.includes(run.run_id)} onChange={() => toggleRunSelection(run.run_id)} /></td><td>{runDateLabel(run)}</td><td>{project?.project_name || "-"}</td><td>{run.selected_test_case_ids?.length || 0}</td><td>{selectedRecords.length || run.frozen_contract?.test_data_records?.length || 0}</td><td><span className={`execution-run-status ${statusClass(status)}`}>{status}</span></td><td>{formatDate(run.created_at)}</td><td><button type="button" className="secondary-button compact-button" disabled={blocked} onClick={() => executeRun(run)}>{executingRunId === run.run_id ? <><LoaderCircle className="spin" size={14} /> Checking...</> : <><PlayCircle size={14} /> {action}</>}</button></td></tr>; })}</tbody></table></div><Pagination page={runPage} pageSize={pageSize} totalItems={runs.length} onPageChange={setRunPage} label="execution runs" /></section>
           {runsWithResults.length > 0 && <section className="requirements-panel"><div className="panel-title-row"><div><h2>Execution evidence</h2><p className="panel-helper">Bronze-to-Transport validation evidence.</p></div><span>{runsWithResults.length} run{runsWithResults.length === 1 ? "" : "s"} with results</span></div><div className="execution-result-list">{visibleEvidenceRuns.map((run) => <article key={run.run_id} className="execution-result-run"><div className="execution-result-run-head"><div><strong>{runDateLabel(run)}</strong><span>{run.execution_summary?.passed || 0} passed / {run.execution_summary?.failed || 0} failed / {run.execution_summary?.pending || 0} waiting</span></div><span className={`execution-run-status ${statusClass(testResultStatus(run))}`}>{testResultStatus(run)}</span></div><div className="execution-result-cases">{run.execution_results.map((result) => { const failedAssertions = (result.assertions || []).filter((item) => item.status === "failed"); const pendingAssertions = (result.assertions || []).filter((item) => item.status === "pending"); const actual = result.actual || {}; const layers = [{ label: "Bronze", count: actual.bronze_rows?.length || 0 }, { label: "Silver", count: (actual.silver?.members?.length || 0) + (actual.silver?.prescriptions?.length || 0) }, { label: "Gold", count: (actual.gold || []).length }, { label: "Transport", count: actual.transport?.length || 0 }]; return <details key={result.result_id} className={`execution-result-case ${result.status}`}><summary>{resultIcon(result.status)} <strong>{result.test_case_id}</strong><span>{result.status}</span>{failedAssertions.length ? <em>{failedAssertions.length} failed assertion{failedAssertions.length === 1 ? "" : "s"}</em> : pendingAssertions.length ? <em>{pendingAssertions.length} waiting for CDP</em> : <em>{(result.assertions || []).length} assertions passed</em>}</summary><div className="execution-layer-summary">{layers.map((layer) => <span key={layer.label}><strong>{layer.label}</strong>{layer.count} row{layer.count === 1 ? "" : "s"}</span>)}</div><div className="execution-assertion-list">{(result.assertions || []).map((assertion, index) => <div key={`${result.result_id}-${index}`} className={`execution-assertion ${assertion.status}`}><span>{assertion.status === "passed" ? <CheckCircle2 size={14} /> : assertion.status === "failed" ? <XCircle size={14} /> : <LoaderCircle size={14} />}</span><div><strong>{assertion.name}</strong><small>{assertion.message}</small>{assertion.status === "failed" && <code>Expected: {JSON.stringify(assertion.expected)} | Actual: {JSON.stringify(assertion.actual)}</code>}</div></div>)}</div><div className="execution-bronze-refs"><strong>Bronze refs</strong><span>{(result.bronze_refs || []).map((ref) => `${ref.bronze_table}:${ref.bronze_id}`).join(", ") || "No Bronze refs"}</span></div></details>; })}</div></article>)}</div><Pagination page={evidencePage} pageSize={pageSize} totalItems={runsWithResults.length} onPageChange={setEvidencePage} label="evidence runs" /></section>}
         </>}
   </div>;

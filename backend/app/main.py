@@ -657,6 +657,7 @@ class ExternalTestCaseImport(BaseModel):
 class TestCaseReviewItem(BaseModel):
     test_case_id: str = Field(min_length=1, max_length=100)
     review_status: str = Field(pattern="^(pending|approved|rejected)$")
+    comments: str | None = Field(default=None, max_length=4000)
     title: str | None = Field(default=None, max_length=400)
     steps: list[str] | None = None
     expected_results: list[str] | None = None
@@ -4013,12 +4014,15 @@ def review_test_case_generation(generation_id: str, request: TestCaseReviewReque
         unknown = [item.test_case_id for item in request.items if item.test_case_id not in by_id]
         missing = [case_id for case_id in by_id if case_id not in {item.test_case_id for item in request.items}]
         if unknown or missing: raise HTTPException(422, {"unknown_items": unknown, "missing_items": missing})
+        missing_rejection_comments = [item.test_case_id for item in request.items if item.review_status == "rejected" and not (item.comments or request.comments or "").strip()]
+        if missing_rejection_comments:
+            raise HTTPException(422, {"message": "A review comment is required for every rejected test case", "test_case_ids": missing_rejection_comments})
         timestamp = now()
         for item in request.items:
             case = by_id[item.test_case_id]
             case["review_status"] = item.review_status
             case["approved"] = item.review_status == "approved"
-            case["approval"] = {"status": item.review_status, "reviewer": request.reviewer, "comments": request.comments or "", "reviewed_at": timestamp}
+            case["approval"] = {"status": item.review_status, "reviewer": request.reviewer, "comments": item.comments if item.comments is not None else (request.comments or ""), "reviewed_at": timestamp}
             if item.title is not None: case["title"] = item.title.strip()
             if item.steps is not None: case["steps"] = [value.strip() for value in item.steps if value.strip()]
             if item.expected_results is not None: case["expected_results"] = [value.strip() for value in item.expected_results if value.strip()]
