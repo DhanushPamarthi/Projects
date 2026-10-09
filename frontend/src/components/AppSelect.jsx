@@ -8,7 +8,7 @@ function optionText(node) {
   return node?.props?.children ? optionText(node.props.children) : "";
 }
 
-export const AppSelect = forwardRef(function AppSelect({ children, value = "", onChange, disabled = false, className = "", id, name, "aria-label": ariaLabel }, forwardedRef) {
+export const AppSelect = forwardRef(function AppSelect({ children, value = "", onChange, disabled = false, className = "", id, name, menuWidth, "aria-label": ariaLabel }, forwardedRef) {
   const rootRef = useRef(null);
   const internalButtonRef = useRef(null);
   const [open, setOpen] = useState(false);
@@ -34,7 +34,9 @@ export const AppSelect = forwardRef(function AppSelect({ children, value = "", o
     if (!rect) return;
     const menuHeight = Math.min(options.length, 4) * 40 + 10;
     const opensUp = window.innerHeight - rect.bottom < menuHeight + 12 && rect.top > menuHeight + 12;
-    setMenuStyle({ left: rect.left, top: opensUp ? rect.top - menuHeight - 6 : rect.bottom + 6, width: rect.width });
+    const width = Math.min(menuWidth || rect.width, window.innerWidth - 16);
+    const left = Math.max(8, Math.min(rect.left, window.innerWidth - width - 8));
+    setMenuStyle({ left, top: opensUp ? rect.top - menuHeight - 6 : rect.bottom + 6, width });
   }
 
   function showMenu() {

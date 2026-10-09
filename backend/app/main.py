@@ -5793,8 +5793,14 @@ def _expected_test_data_ids(payload):
                 members.append(item["person"]["resourceID"])
             prescriptions.extend(rx.get("resourceID") for rx in item.get("prescription", []) if rx.get("resourceID"))
     else:
-        membership = payload.get("membership") or payload.get("member") or payload
         prescription = payload.get("prescription")
+        if not isinstance(prescription, dict) and payload.get("prescription_id"):
+            # Standalone Prescription template records store prescription_id at
+            # the payload root rather than under a "prescription" key.
+            prescription = payload
+        membership = payload.get("membership") or payload.get("member")
+        if not isinstance(membership, dict) and not payload.get("prescription_id"):
+            membership = payload
         if isinstance(membership, dict) and membership.get("member_id"):
             members.append(membership["member_id"])
         if isinstance(prescription, dict) and prescription.get("prescription_id"):
@@ -6149,7 +6155,7 @@ def _execute_case_against_bronze(conn, run_id: str, generation_id: str, test_cas
         "INSERT INTO test_execution_result (result_id,run_id,generation_id,test_case_id,status,expected_json,actual_json,assertions_json,bronze_refs_json,started_at,completed_at,error) "
         "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
         "ON CONFLICT (run_id, test_case_id) DO UPDATE SET status=EXCLUDED.status,expected_json=EXCLUDED.expected_json,actual_json=EXCLUDED.actual_json,assertions_json=EXCLUDED.assertions_json,bronze_refs_json=EXCLUDED.bronze_refs_json,started_at=EXCLUDED.started_at,completed_at=EXCLUDED.completed_at,error=EXCLUDED.error",
-        (result_id, run_id, generation_id, test_case_id, status, json.dumps({"records": expected_records}, sort_keys=True), json.dumps({"bronze_rows": actual_records, "silver": silver_actual, "gold": gold_actual, "transport": transport_actual}, sort_keys=True), json.dumps(assertions, sort_keys=True), json.dumps(all_refs, sort_keys=True), started_at, completed_at, error),
+        (result_id, run_id, generation_id, test_case_id, status, json.dumps({"records": expected_records}, sort_keys=True, default=str), json.dumps({"bronze_rows": actual_records, "silver": silver_actual, "gold": gold_actual, "transport": transport_actual}, sort_keys=True, default=str), json.dumps(assertions, sort_keys=True, default=str), json.dumps(all_refs, sort_keys=True, default=str), started_at, completed_at, error),
     )
     return status
 

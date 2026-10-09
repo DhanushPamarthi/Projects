@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { AlertCircle, ArrowLeft, Check, CheckCircle2, ChevronLeft, ChevronRight, ClipboardList, LoaderCircle, Pencil, ShieldCheck, Sparkles, X } from "lucide-react";
 import { generateFunctionalRequirements, generateTestCasesFromAnalysis, getRequirementAnalysis, getTestCaseGeneration, importExternalTestCases, listGeneratedTestCases, listProjectTestCaseHistory, listProjectTestCaseLibrary, listRequirementAnalyses, listTestData, previewTestCaseReuse, reviewTestCaseGeneration } from "../api/client.js";
 import { useActivities } from "../activity/activityStore.js";
+import { AppSelect } from "./AppSelect.jsx";
 
 function lines(value) {
   return String(value || "")
@@ -423,28 +424,34 @@ export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData,
     if (!currentAnalysis) return null;
     return <section className="requirements-panel test-case-reuse-panel">
       <div className="panel-title-row"><div><h2>Existing test cases and reuse</h2><p className="panel-helper">Matches are checked against this Resource Package. Exact, citation-safe cases can be reused; similar cases guide a new evidence-grounded case. Generation covers every FR, with additional cases only for distinct supported scenarios.</p></div><span>{generationRequirements.length} FRs</span></div>
-      <div className="test-case-reuse-list">{(reusePreview?.requirements || []).map((row) => <div className="test-case-reuse-row" key={row.requirement_id}>
-        <strong>{row.requirement_id} · {row.title || "Functional Requirement"}</strong>
-        <label>Decision <select value={reuseSelections[row.requirement_id] || ""} onChange={(event) => setReuseSelections((current) => ({ ...current, [row.requirement_id]: event.target.value }))}>
-          <option value="">Create a new case</option>
-          {row.matches.map((match) => <option key={match.candidate_id} value={match.candidate_id}>{match.action === "reuse" ? "Reuse verified case" : "Adapt similar case"} · {match.title} · {Math.round(match.score * 100)}% text similarity</option>)}
-        </select></label>
-        {row.matches.length > 0 ? <small>{row.matches.length} related existing case(s); no match is used without your selection.</small> : <small>No relevant existing case found. A new case is needed.</small>}
-      </div>)}</div>
-      <details><summary>Browse existing project test cases ({library.length})</summary>
+      <div className="test-case-reuse-list">{(reusePreview?.requirements || []).map((row) => {
+        const selectedMatch = row.matches.find((match) => match.candidate_id === reuseSelections[row.requirement_id]);
+        return <div className="test-case-reuse-row" key={row.requirement_id}>
+          <strong>{row.requirement_id} · {row.title || "Functional Requirement"}</strong>
+          <label><span className="sr-only">Reuse decision for {row.requirement_id}</span><AppSelect menuWidth={440} aria-label={`Reuse decision for ${row.requirement_id}`} value={reuseSelections[row.requirement_id] || ""} onChange={(event) => setReuseSelections((current) => ({ ...current, [row.requirement_id]: event.target.value }))}>
+            <option value="">Create a new case</option>
+            {row.matches.map((match) => <option key={match.candidate_id} value={match.candidate_id}>{match.action === "reuse" ? "Reuse" : "Adapt"} · {match.title} ({Math.round(match.score * 100)}%)</option>)}
+          </AppSelect></label>
+          {selectedMatch ? <div className="test-case-reuse-preview"><div className="test-case-reuse-preview-heading"><strong>{selectedMatch.action === "reuse" ? "Selected case" : "Case to adapt"}: {selectedMatch.title}</strong><span>{Math.round(selectedMatch.score * 100)}% match</span></div><div className="test-case-reuse-preview-content"><section><b>Steps</b><ol>{(selectedMatch.steps || []).map((step, index) => <li key={`${selectedMatch.candidate_id}-step-${index}`}>{step}</li>)}</ol></section><section><b>Expected results</b><ul>{(selectedMatch.expected_results || []).map((result, index) => <li key={`${selectedMatch.candidate_id}-result-${index}`}>{result}</li>)}</ul></section></div></div>
+            : <small>{row.matches.length > 0 ? `${row.matches.length} related existing case(s); select one to preview it. No match is used without your selection.` : "No relevant existing case found. A new case is needed."}</small>}
+        </div>;
+      })}</div>
+      <div className="test-case-library-tools">
+      <details className="test-case-tool"><summary><span>Browse existing project test cases</span><small>{library.length} available</small></summary>
         <div className="test-case-library-list">{library.map((item) => <div className="test-case-library-row" key={item.candidate_id}>
           <div><strong>{item.case.title || item.candidate_id}</strong><small>{item.origin === "external" ? item.source_name : `Resource Package ${item.package_id}`} · {item.case.requirement_id || "External"}</small></div>
           <button type="button" className="secondary-button compact-button" onClick={() => setLibraryEdit({ ...item, title: item.case.title || "", steps: (item.case.steps || []).join("\n"), expected_results: (item.case.expected_results || []).join("\n") })}>Edit</button>
         </div>)}</div>
       </details>
-      <details><summary>Test generation history ({runHistory.length} saved runs)</summary>
+      <details className="test-case-tool"><summary><span>Test generation history</span><small>{runHistory.length} saved runs</small></summary>
         <div className="test-case-library-list">{runHistory.map((run) => <div className="test-case-library-row" key={run.generation_id}>
           <div><strong>Resource Package v{run.package_version} · {run.test_case_count} case(s)</strong><small>{run.created_at} · {run.status} · {run.generation_id}</small></div>
           <button type="button" className="secondary-button compact-button" onClick={async () => { try { setViewedHistoryRun(await getTestCaseGeneration(run.generation_id)); } catch (err) { setError(err.message); } }}>View cases</button>
         </div>)}</div>
         {viewedHistoryRun && <div className="test-case-library-list"><strong>Cases in {viewedHistoryRun.generation_id}</strong>{(viewedHistoryRun.contract?.test_cases || []).map((item) => <div className="test-case-library-row" key={item.test_case_id}><div><strong>{item.test_case_id} · {item.title}</strong><small>{item.requirement_id} · {item.review_status || "pending"}</small></div><button type="button" className="secondary-button compact-button" onClick={() => setLibraryEdit({ origin: "history", generation_id: viewedHistoryRun.generation_id, case: item, title: item.title || "", steps: (item.steps || []).join("\n"), expected_results: (item.expected_results || []).join("\n") })}>Edit</button></div>)}</div>}
       </details>
-      <label className="test-case-import-label">Import external test cases (JSON with cases containing requirement_text, title, steps, expected_results)<input type="file" accept="application/json,.json" onChange={uploadExternalCases} /></label>
+      <label className="test-case-import-label"><strong>Import external cases</strong><span>Choose a JSON file with requirement_text, title, steps, and expected_results.</span><input type="file" accept="application/json,.json" onChange={uploadExternalCases} /></label>
+      </div>
       {libraryEdit && <div className="modal-backdrop"><div className="confirm-modal case-edit-modal" role="dialog" aria-modal="true" aria-labelledby="library-edit-heading">
         <h2 id="library-edit-heading">Edit existing test case</h2><label>Title<input value={libraryEdit.title} onChange={(event) => setLibraryEdit((current) => ({ ...current, title: event.target.value }))} /></label>
         <label>Steps<textarea value={libraryEdit.steps} onChange={(event) => setLibraryEdit((current) => ({ ...current, steps: event.target.value }))} /></label>

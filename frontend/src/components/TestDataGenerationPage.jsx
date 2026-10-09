@@ -9,7 +9,7 @@ function getContract(generation) {
   return generation?.contract || generation || {};
 }
 
-export function TestDataGenerationPage({ analysis, onGoToTestCases }) {
+export function TestDataGenerationPage({ analysis, onGoToTestCases, onContinueToResults }) {
   const [generation, setGeneration] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -46,6 +46,6 @@ export function TestDataGenerationPage({ analysis, onGoToTestCases }) {
   return <div className="requirements-page test-generation-page professional-workspace-page">
     <WorkspacePageHero productLabel="TestIQ · Test Data" eyebrow="TEST DATA" title="Test Data Intelligence" context={analysis?.project_name} cues={["Approved scope", "Controlled generation", "Bronze readiness"]} />
     {error && <div className="error-message">{error}</div>}
-    {loading ? <LoadingSpinner variant="section" label="Loading approved test cases" detail="Preparing test-data generation context." /> : !analysis ? <section className="generation-empty"><ClipboardList size={22} /><h3>No test-case analysis selected</h3><p>Generate and approve test cases first.</p><button type="button" className="primary-button" onClick={onGoToTestCases}>Open test cases</button></section> : !generationId ? <section className="generation-empty"><ClipboardList size={22} /><h3>Generate test cases first</h3><p>Approved test cases are required.</p><button type="button" className="primary-button" onClick={onGoToTestCases}>Open test cases</button></section> : approvedCases.length === 0 ? <section className="generation-empty"><ClipboardList size={22} /><h3>No approved test cases</h3><p>Approve at least one test case.</p><button type="button" className="primary-button" onClick={onGoToTestCases}>Review test cases</button></section> : <TestDataStage projectId={analysis.project_id || contract.project_id} generationId={generationId} approvedCases={approvedCases} reviewer="Product Owner" onGoToTestCases={onGoToTestCases} />}
+    {loading ? <LoadingSpinner variant="section" label="Loading approved test cases" detail="Preparing test-data generation context." /> : !analysis ? <section className="generation-empty"><ClipboardList size={22} /><h3>No test-case analysis selected</h3><p>Generate and approve test cases first.</p><button type="button" className="primary-button" onClick={onGoToTestCases}>Open test cases</button></section> : !generationId ? <section className="generation-empty"><ClipboardList size={22} /><h3>Generate test cases first</h3><p>Approved test cases are required.</p><button type="button" className="primary-button" onClick={onGoToTestCases}>Open test cases</button></section> : approvedCases.length === 0 ? <section className="generation-empty"><ClipboardList size={22} /><h3>No approved test cases</h3><p>Approve at least one test case.</p><button type="button" className="primary-button" onClick={onGoToTestCases}>Review test cases</button></section> : <TestDataStage projectId={analysis.project_id || contract.project_id} generationId={generationId} approvedCases={approvedCases} reviewer="Product Owner" onGoToTestCases={onGoToTestCases} onContinueToResults={onContinueToResults} />}
   </div>;
 }
