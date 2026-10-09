@@ -76,7 +76,7 @@ export function TestDataStage({ projectId, generationId, approvedCases, reviewer
       setRecords(mergedRecords);
       setSelectedDataCaseIds([]);
       const generated = `${replaceExistingDrafts ? "Regenerated" : "Generated"} data for ${new Set(result.records.map((item) => item.test_case_id)).size} case(s) using ${result.records.length} template record(s)`;
-      setMessage(`${generated} for approved cases using case-specific templates built from the database schema and data patterns with ${result.generation_model || "the configured LLM"}. Review the JSON, select cases, then save them for CDP.`);
+      setMessage(`${generated} for approved cases using case-specific templates built from the database schema and data patterns with ${result.generation_model || "the configured LLM"}. Review the JSON, select cases, then send them to the Bronze layer.`);
     } catch (err) { setError(err.message); }
     finally { setBusy(false); }
   }
@@ -91,6 +91,16 @@ export function TestDataStage({ projectId, generationId, approvedCases, reviewer
       setSelectedDataCaseIds([]);
       setMessage(result.message || `${result.sent_count || result.saved_count} test data record(s) sent to the Bronze layer successfully.`);
     } catch (err) { setError(err.message); }
+    finally { setBusy(false); }
+  }
+  async function saveDataEdit(record) {
+    setBusy(true); setError(""); setMessage("");
+    try {
+      const updated = await reviewTestData(generationId, [{ record_id: record.record_id, payload: JSON.parse(record.payload_text || "{}") }]);
+      const saved = updated[0];
+      setRecords((items) => items.map((item) => item.record_id === record.record_id ? { ...saved, payload_text: JSON.stringify(saved.payload, null, 2) } : item));
+      setMessage("Test data JSON saved. The prior draft is retained in edit history.");
+    } catch (err) { setError(err.message || "Could not save test data edit."); }
     finally { setBusy(false); }
   }
   function toggle(list, setList, id) { setList((items) => items.includes(id) ? items.filter((item) => item !== id) : [...items, id]); }
@@ -147,6 +157,7 @@ export function TestDataStage({ projectId, generationId, approvedCases, reviewer
             <div className="test-data-group-content">
               {caseRecords.map((record) => <div className="test-data-record-payload" key={record.record_id}>
                 <label className="test-data-json-label">{record.status === "draft" ? `Review ${recordTemplateLabel(record)} JSON` : `${recordTemplateLabel(record)} JSON`}<textarea className="test-data-json-editor" value={record.payload_text} disabled={record.status !== "draft"} onChange={(event) => setRecords((items) => items.map((item) => item.record_id === record.record_id ? { ...item, payload_text: event.target.value } : item))} spellCheck="false" /></label>
+                {record.status === "draft" && <button type="button" className="secondary-button compact-button" disabled={busy} onClick={() => saveDataEdit(record)}>Save JSON edit</button>}
               </div>)}
             </div>
             </details>

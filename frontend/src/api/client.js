@@ -161,6 +161,16 @@ export async function getRevision(revisionId) {
   return request(`/api/v1/revisions/${encodeURIComponent(revisionId)}`);
 }
 
+export async function listSourceRevisions(sourceId) {
+  return request(`/api/v1/sources/${encodeURIComponent(sourceId)}/revisions`, { cache: "no-store" });
+}
+
+export async function selectActiveRevision(sourceId, revisionId) {
+  return request(`/api/v1/sources/${encodeURIComponent(sourceId)}/active-revision`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ revision_id: revisionId }),
+  });
+}
+
 export async function createManifest(sourceIds, packageName, scope, projectId) {
   return request(`/api/v1/projects/${encodeURIComponent(projectId)}/manifests`, {
     method: "POST",
@@ -265,8 +275,34 @@ export async function reviewRequirementAnalysis(analysisId, review) {
   });
 }
 
-export async function generateTestCasesFromAnalysis(analysisId) {
-  return request(`/api/v1/requirement-analyses/${encodeURIComponent(analysisId)}/test-cases`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) });
+export async function generateTestCasesFromAnalysis(analysisId, options = {}) {
+  return request(`/api/v1/requirement-analyses/${encodeURIComponent(analysisId)}/test-cases`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(options) });
+}
+
+export async function previewTestCaseReuse(analysisId) {
+  return request(`/api/v1/requirement-analyses/${encodeURIComponent(analysisId)}/test-case-reuse`, { cache: "no-store" });
+}
+
+export async function importExternalTestCases(projectId, payload) {
+  return request(`/api/v1/projects/${encodeURIComponent(projectId)}/external-test-cases`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+  });
+}
+
+export async function listProjectTestCaseLibrary(projectId, packageId) {
+  return request(`/api/v1/projects/${encodeURIComponent(projectId)}/test-case-library?package_id=${encodeURIComponent(packageId)}`, { cache: "no-store" });
+}
+
+export async function getProjectTestCaseHistorySummary(projectId) {
+  return request(`/api/v1/projects/${encodeURIComponent(projectId)}/test-case-history-summary`, { cache: "no-store" });
+}
+
+export async function listProjectTestCaseHistory(projectId) {
+  return request(`/api/v1/projects/${encodeURIComponent(projectId)}/test-case-history`, { cache: "no-store" });
+}
+
+export async function getTestCaseGeneration(generationId) {
+  return request(`/api/v1/test-case-generations/${encodeURIComponent(generationId)}`, { cache: "no-store" });
 }
 
 export async function listGeneratedTestCases(analysisId) {

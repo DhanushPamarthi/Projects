@@ -92,9 +92,13 @@ export function TraceabilityPage() {
       setError("");
       try {
         const analyses = await listRequirementAnalyses(packageId);
-        const latestAnalysis = analyses[0] || null;
-        const generationGroups = await Promise.all(analyses.map((item) => listGeneratedTestCases(item.analysis_id).catch(() => [])));
-        const generations = generationGroups.flat().sort((left, right) => latestTimestamp(right).localeCompare(latestTimestamp(left)));
+        const functionalAnalyses = analyses.filter((item) => item.analysis_kind === "functional");
+        const latestAnalysis = functionalAnalyses[0] || null;
+        // A test run from an older FR version must never appear as coverage
+        // for the latest Functional Requirements.
+        const generations = latestAnalysis
+          ? (await listGeneratedTestCases(latestAnalysis.analysis_id)).sort((left, right) => latestTimestamp(right).localeCompare(latestTimestamp(left)))
+          : [];
         const latestGeneration = generations[0] || null;
         const review = latestGeneration?.generation_id
           ? await getTestCaseCoverageReview(latestGeneration.generation_id).catch(() => null)
@@ -207,6 +211,14 @@ export function TraceabilityPage() {
     return <span className="traceability-gap">{text}</span>;
   }
 
+  const functionalRows = (analysis?.contract?.requirements || []).map((requirement) => ({
+    id: requirement.requirement_id,
+    title: requirement.title || requirement.statement || "Functional Requirement",
+    statement: requirement.statement || "",
+    businessRules: requirement.business_rules || [],
+    acceptanceCriteria: requirement.acceptance_criteria || [],
+    testCases: (testGeneration?.contract?.test_cases || []).filter((item) => item.requirement_id === requirement.requirement_id),
+  }));
   const pageSize = 8;
   const visibleCoverageRows = coverage.rows.slice((page - 1) * pageSize, page * pageSize);
 
@@ -216,13 +228,17 @@ export function TraceabilityPage() {
     {error && <div className="error-message">{error}</div>}
     {loading ? <LoadingSpinner variant="page" label="Loading traceability" detail="Linking source evidence to requirements and generated artifacts." />
       : !analysis ? <section className="requirements-empty"><div className="empty-state-icon"><FileSearch size={25} /></div><h2>No analysis available yet</h2><p>Run Functional Requirements for a source package to view traceability links.</p></section>
-        : tree.length ? <>
+        : <>
+          <section className="traceability-coverage-card"><div className="traceability-coverage-header"><div><div className="eyebrow">FUNCTIONAL REQUIREMENTS</div><h2>All Functional Requirements</h2><p>Each FR is shown once, independently of its business-rule mappings.</p></div><strong>{functionalRows.length} FRs</strong></div>
+            <div className="traceability-coverage-table-wrap"><table className="traceability-coverage-table"><thead><tr><th>FR</th><th>Requirement</th><th>Business rules</th><th>Acceptance criteria</th><th>Mapped test cases</th></tr></thead><tbody>{functionalRows.map((row) => <tr key={row.id}><td><strong>{row.id}</strong></td><td>{row.title}<small>{row.statement}</small></td><td>{row.businessRules.map((item) => item.rule_id).filter(Boolean).join(", ") || "—"}</td><td>{row.acceptanceCriteria.map((item) => item.acceptance_id).filter(Boolean).join(", ") || "—"}</td><td>{row.testCases.map((item) => item.test_case_id).join(", ") || emptyBadge("Needs a test case")}</td></tr>)}</tbody></table></div>
+          </section>
+          {tree.length > 0 && <>
           <section className="traceability-coverage-card">
             <div className="traceability-coverage-header"><div><div className="eyebrow">COVERAGE REVIEW</div><h2>Business requirement coverage</h2><p>Requirements mapped to generated test evidence.</p></div><div className={`traceability-coverage-score ${coverage.percent === 100 ? "complete" : ""}`}><strong>{coverage.percent}%</strong><span>covered</span></div></div>
             <div className="traceability-coverage-summary"><span><strong>{coverage.covered}</strong> of {coverage.total} requirements covered</span><span>{coverage.rows.filter((row) => row.testCaseId).length} linked test cases</span></div>
             <div className="traceability-coverage-table-wrap"><table className="traceability-coverage-table"><thead><tr><th>Status</th><th>Business requirement</th><th>Description</th><th>Test case ID</th><th>Test case description</th></tr></thead><tbody>{coverage.rows.length ? visibleCoverageRows.map((row) => <tr key={`${row.ruleId}-${row.testCaseId || "missing"}`}><td><span className={`traceability-coverage-status ${row.status === "covered" ? "covered" : "missing"}`}>{row.status === "covered" ? "Covered" : "Missing"}</span></td><td><strong>{row.ruleId}</strong><small>{row.requirementId}</small></td><td>{row.description || "No business requirement description"}</td><td>{row.testCaseId || emptyBadge("No test case linked")}</td><td>{row.testCase ? (row.testCase.title || row.testCase.scenario || "No description") : emptyBadge("Coverage required")}</td></tr>) : <tr><td colSpan="5">{emptyBadge("Coverage review is not available for this generation")}</td></tr>}</tbody></table></div><Pagination page={page} pageSize={pageSize} totalItems={coverage.rows.length} onPageChange={setPage} label="traceability records" />
           </section>
-        </>
-          : <section className="requirements-empty"><div className="empty-state-icon"><FileSearch size={25} /></div><h2>No traceability mappings found</h2><p>This analysis does not contain business requirement mappings to trace.</p></section>}
+        </>}
+        </>}
   </div>;
 }

@@ -9,7 +9,7 @@ import uuid
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
-import networkx as nx
+from importlib.metadata import version as package_version
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -576,6 +576,7 @@ def _select_diverse_hits(candidates, top_k, minimum_score, max_chunks_per_source
 def _graph_expansion(conn, index_id, seed_chunk_ids, graph_depth):
     if graph_depth <= 0 or not seed_chunk_ids:
         return set(), []
+    import networkx as nx
     nodes = {}
     for row in conn.execute("SELECT node_id,label,evidence_chunk_ids_json FROM knowledge_node WHERE index_id=%s", (index_id,)).fetchall():
         item = _dict(row)
@@ -881,7 +882,7 @@ def build_knowledge_index(package_id: str, request: BuildIndexRequest):
             "embedding_model": request.embedding_model, "embedding_dimensions": OPENAI_EMBEDDING_DIMENSIONS,
             "vector_backend": "pgvector-hnsw" if db_module.PGVECTOR_AVAILABLE else "python-cosine",
             "graph_model": request.graph_model,
-            "graph_engine": f"networkx-{nx.__version__}",
+            "graph_engine": f"networkx-{package_version('networkx')}",
             "chunker_version": CHUNKER_VERSION, "graph_prompt_version": GRAPH_PROMPT_VERSION,
             "graph_prompt_hash": _hash(GRAPH_INSTRUCTIONS), "fragment_set_hash": fragment_set_hash,
             "approved_rule_set": {"hash": package["rule_set_hash"], "count": approved_rule_count, "mode": "automatic"},

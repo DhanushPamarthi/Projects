@@ -136,6 +136,15 @@ CREATE TABLE IF NOT EXISTS testiq.test_case_generation (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS testiq.external_test_case (
+  external_id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES testiq.project(project_id),
+  source_name TEXT NOT NULL,
+  requirement_text TEXT NOT NULL,
+  case_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS testiq_external_test_case_project_idx ON testiq.external_test_case(project_id,created_at);
 CREATE TABLE IF NOT EXISTS testiq.discovery_context (
   context_id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES testiq.project(project_id),
@@ -198,6 +207,14 @@ CREATE TABLE IF NOT EXISTS testiq.test_data_record (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE(generation_id, test_case_id, template_id)
+);
+CREATE TABLE IF NOT EXISTS testiq.test_data_edit_audit (
+  audit_id TEXT PRIMARY KEY,
+  record_id TEXT NOT NULL,
+  generation_id TEXT NOT NULL,
+  before_json TEXT NOT NULL,
+  after_json TEXT NOT NULL,
+  edited_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS testiq.test_data_template (
   template_id TEXT PRIMARY KEY,
@@ -318,6 +335,9 @@ CREATE INDEX IF NOT EXISTS testiq_llm_token_usage_scope_idx ON testiq.llm_token_
 SQLITE_SCHEMA = SCHEMA.replace("CREATE SCHEMA IF NOT EXISTS testiq;\n", "").replace("testiq.", "")
 
 MIGRATIONS = [
+    "CREATE TABLE IF NOT EXISTS test_data_edit_audit (audit_id TEXT PRIMARY KEY, record_id TEXT NOT NULL, generation_id TEXT NOT NULL, before_json TEXT NOT NULL, after_json TEXT NOT NULL, edited_at TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS external_test_case (external_id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES project(project_id), source_name TEXT NOT NULL, requirement_text TEXT NOT NULL, case_json TEXT NOT NULL, created_at TEXT NOT NULL)",
+    "CREATE INDEX IF NOT EXISTS testiq_external_test_case_project_idx ON external_test_case(project_id,created_at)",
     "ALTER TABLE test_data_record ADD COLUMN schema_context_json TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE test_data_record ADD COLUMN template_name TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE test_data_record ADD COLUMN template_version INTEGER NOT NULL DEFAULT 1",

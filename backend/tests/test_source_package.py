@@ -48,6 +48,17 @@ def test_upload_revision_duplicate_manifest(monkeypatch):
     assert fetched.status_code == 200
     assert fetched.json()["items"][0]["sha256"] == changed.json()["sha256"]
 
+
+def test_distinct_brds_remain_separate_and_can_share_one_package(monkeypatch):
+    client = _client(monkeypatch)
+    first = client.post("/api/v1/projects/p1/sources", files={"file": ("eligibility.md", io.BytesIO(b"# Eligibility\nEligible members receive a reminder."), "text/markdown")}, data={"source_type": "brd"})
+    second = client.post("/api/v1/projects/p1/sources", files={"file": ("delivery.md", io.BytesIO(b"# Delivery\nSend the reminder by SMS."), "text/markdown")}, data={"source_type": "brd"})
+    assert first.status_code == second.status_code == 202
+    assert first.json()["source_id"] != second.json()["source_id"]
+    package = client.post("/api/v1/projects/p1/manifests", json={"source_ids": [first.json()["source_id"], second.json()["source_id"]], "scope": "MVP"})
+    assert package.status_code == 201, package.text
+    assert {item["source_id"] for item in package.json()["items"]} == {first.json()["source_id"], second.json()["source_id"]}
+
 def test_upload_validation(monkeypatch):
     client = _client(monkeypatch)
     empty = client.post("/api/v1/projects/p1/sources", files={"file": ("empty.md", io.BytesIO(b""), "text/markdown")}, data={"source_type": "brd"})
@@ -85,7 +96,8 @@ def test_supporting_source_manifest_is_traceable(monkeypatch):
     assert api.status_code == 202, api.text
     listed = client.get("/api/v1/projects/p1/sources").json()
     brd_row = next(item for item in listed if item["source_id"] == brd_id)
-    assert brd_row["supporting_sources"][0]["source_type"] == "api_spec"
+    assert any(source["source_id"] == api.json()["source_id"] and source["source_type"] == "api_spec"
+               for source in brd_row["supporting_sources"])
     manifest = client.post("/api/v1/projects/p1/manifests", json={"source_ids": [brd_id, api.json()["source_id"]], "scope": "release-1"})
     assert manifest.status_code == 201
     assert all(item["ingestion_status"] == "succeeded" for item in manifest.json()["items"])
@@ -327,8 +339,9 @@ def test_all_supporting_source_types_require_and_retain_brd_association(monkeypa
     assert missing_association.status_code == 422
     listed = client.get("/api/v1/projects/p1/sources").json()
     brd_row = next(source for source in listed if source["source_id"] == brd_id)
-    assert {source["source_type"] for source in brd_row["supporting_sources"]} == set(supporting_types)
-    assert all(source["active_revision"]["owner_version"] for source in listed if source["source_type"] in supporting_types)
+    assert set(supporting_types) <= {source["source_type"] for source in brd_row["supporting_sources"]}
+    assert all(source["active_revision"]["owner_version"] for source in listed
+               if source["logical_name"] in {f"{source_type}.md" for source_type in supporting_types})
 
 def test_unreadable_source_and_missing_sections_are_visible(monkeypatch):
     client = _client(monkeypatch)

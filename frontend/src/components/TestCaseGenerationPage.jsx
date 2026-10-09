@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { AlertCircle, ArrowLeft, Check, CheckCircle2, ChevronLeft, ChevronRight, ClipboardList, LoaderCircle, Pencil, ShieldCheck, Sparkles, X } from "lucide-react";
-import { generateFunctionalRequirements, generateTestCasesFromAnalysis, getRequirementAnalysis, listGeneratedTestCases, listRequirementAnalyses, listTestData, reviewTestCaseGeneration } from "../api/client.js";
+import { generateFunctionalRequirements, generateTestCasesFromAnalysis, getRequirementAnalysis, getTestCaseGeneration, importExternalTestCases, listGeneratedTestCases, listProjectTestCaseHistory, listProjectTestCaseLibrary, listRequirementAnalyses, listTestData, previewTestCaseReuse, reviewTestCaseGeneration } from "../api/client.js";
 import { useActivities } from "../activity/activityStore.js";
 
 function lines(value) {
@@ -109,6 +109,12 @@ export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData,
   const [generatedDataByCase, setGeneratedDataByCase] = useState({});
   const [workflowProgress, setWorkflowProgress] = useState(null);
   const [casePage, setCasePage] = useState(1);
+  const [reusePreview, setReusePreview] = useState(null);
+  const [reuseSelections, setReuseSelections] = useState({});
+  const [library, setLibrary] = useState([]);
+  const [runHistory, setRunHistory] = useState([]);
+  const [viewedHistoryRun, setViewedHistoryRun] = useState(null);
+  const [libraryEdit, setLibraryEdit] = useState(null);
   const activeGenerationActivity = activities.find((item) => item.status === "running" && (item.label === "Generating Functional Requirements" || item.label === "Generating test cases"));
   const generationActivityKey = activities.filter((item) => item.label === "Generating Functional Requirements" || item.label === "Generating test cases").map((item) => `${item.id}:${item.status}:${item.updatedAt}`).join("|");
 
@@ -122,6 +128,8 @@ export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData,
   const approvedRequirements = requirements.filter((item) => approvedIds.has(item.requirement_id) || item.review_status === "approved");
   const generationRequirements = approvedRequirements.length ? approvedRequirements : requirements;
   const contract = caseContract(generation);
+  const coverageSummary = contract.coverage_review?.summary || {};
+  const reuseDecisions = contract.reuse_decisions || [];
   const generationId = generation?.generation_id || contract.generation_id;
   const testCases = contract.test_cases || [];
   const generationMode = contract.generation_mode;
@@ -133,8 +141,21 @@ export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData,
     ? (knowledgeUsed ? `Knowledge Base used${ragMetadata?.index_id ? ` � ${ragMetadata.index_id}` : ""}` : "Knowledge Base not used for this run")
     : "A ready, approved Knowledge Base and configured OpenAI model are required.";
   const approvedCount = testCases.filter((item) => (statuses[item.test_case_id] || item.review_status || item.approval?.status || "pending") === "approved").length;
-  const allApproved = testCases.length > 0 && approvedCount === testCases.length;
+  const hasUnsavedDecisions = testCases.some((item) => (statuses[item.test_case_id] || "pending") !== (item.review_status || item.approval?.status || "pending"));
+  const allApproved = testCases.length > 0 && approvedCount === testCases.length && !hasUnsavedDecisions;
   const selectedAll = testCases.length > 0 && selected.length === testCases.length;
+
+  useEffect(() => {
+    if (!currentAnalysis?.analysis_id) return undefined;
+    let active = true;
+    Promise.all([
+      previewTestCaseReuse(currentAnalysis.analysis_id),
+      listProjectTestCaseLibrary(currentAnalysis.project_id, currentAnalysis.package_id),
+      listProjectTestCaseHistory(currentAnalysis.project_id),
+    ]).then(([preview, cases, history]) => { if (active) { setReusePreview(preview); setLibrary(cases); setRunHistory(history); } })
+      .catch((err) => { if (active) setError(err.message || "Could not check existing test cases."); });
+    return () => { active = false; };
+  }, [currentAnalysis?.analysis_id, currentAnalysis?.project_id, currentAnalysis?.package_id]);
 
   useEffect(() => {
     if (!generationId) { setGeneratedDataByCase({}); return undefined; }
@@ -232,7 +253,7 @@ export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData,
       progressTimer = advanceProgressUntilComplete(setWorkflowProgress);
     }
     try {
-      const next = await generateTestCasesFromAnalysis(currentAnalysis.analysis_id);
+      const next = await generateTestCasesFromAnalysis(currentAnalysis.analysis_id, { reuse: reuseSelections });
       applyGeneration(next);
       setSelected([]);
       if (analysis?.generation_pipeline) setWorkflowProgress({ percent: 100, label: "Test Cases generated" });
@@ -256,18 +277,65 @@ export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData,
       setWorkflowProgress({ percent: 50, label: "Functional Requirements complete" });
       setVerifiedAnalysis(nextAnalysis);
       onAnalysisPrepared?.({ ...nextAnalysis, generation_pipeline: true, project_id: analysis.project_id, project_name: analysis.project_name });
-      setWorkflowProgress({ percent: 58, label: "Generating Test Cases" });
-      progressTimer = advanceProgressUntilComplete(setWorkflowProgress);
-      const nextGeneration = await generateTestCasesFromAnalysis(nextAnalysis.analysis_id);
-      applyGeneration(nextGeneration);
-      setSelected([]);
-      setWorkflowProgress({ percent: 100, label: "Test Cases generated" });
+      setWorkflowProgress({ percent: 100, label: "Functional Requirements ready" });
+      setSuccess("Functional Requirements are ready. Review similar historical cases below, then generate test cases.");
     } catch (err) {
       setError(err.message || "Could not complete Test Case generation.");
     } finally {
       if (progressTimer) window.clearInterval(progressTimer);
       setLoading(false);
     }
+  }
+
+  async function refreshReuse() {
+    if (!currentAnalysis?.analysis_id) return;
+    const [preview, cases, history] = await Promise.all([
+      previewTestCaseReuse(currentAnalysis.analysis_id),
+      listProjectTestCaseLibrary(currentAnalysis.project_id, currentAnalysis.package_id),
+      listProjectTestCaseHistory(currentAnalysis.project_id),
+    ]);
+    setReusePreview(preview);
+    setLibrary(cases);
+    setRunHistory(history);
+  }
+
+  async function uploadExternalCases(event) {
+    const file = event.target.files?.[0];
+    if (!file || !currentAnalysis?.project_id) return;
+    try {
+      const parsed = JSON.parse(await file.text());
+      const cases = Array.isArray(parsed) ? parsed : parsed.cases;
+      if (!Array.isArray(cases)) throw new Error("JSON must contain a cases array.");
+      const result = await importExternalTestCases(currentAnalysis.project_id, { source_name: file.name, cases });
+      await refreshReuse();
+      setSuccess(`${result.imported_count} external test cases imported into this project's history.`);
+    } catch (err) { setError(err.message || "Could not import external cases."); }
+    event.target.value = "";
+  }
+
+  async function saveLibraryEdit() {
+    if (!libraryEdit) return;
+    try {
+      const changes = { title: libraryEdit.title.trim(), steps: lines(libraryEdit.steps), expected_results: lines(libraryEdit.expected_results) };
+      if (!changes.title || !changes.steps.length || !changes.expected_results.length) throw new Error("Title, steps, and expected results are required.");
+      if (libraryEdit.origin === "external") {
+        await importExternalTestCases(currentAnalysis.project_id, { source_name: `${libraryEdit.source_name || "External import"} (edited)`, cases: [{ requirement_text: libraryEdit.requirement_text, ...changes }] });
+      } else {
+        const run = await getTestCaseGeneration(libraryEdit.generation_id);
+        await reviewTestCaseGeneration(libraryEdit.generation_id, { reviewer: reviewer.trim() || "Product Owner", comments: "Edited from project test-case library", items: run.contract.test_cases.map((item) => ({
+          test_case_id: item.test_case_id, review_status: item.review_status || item.approval?.status || "pending",
+          title: item.test_case_id === libraryEdit.case.test_case_id ? changes.title : item.title,
+          steps: item.test_case_id === libraryEdit.case.test_case_id ? changes.steps : item.steps,
+          expected_results: item.test_case_id === libraryEdit.case.test_case_id ? changes.expected_results : item.expected_results,
+        })) });
+      }
+      setLibraryEdit(null);
+      await refreshReuse();
+      if (viewedHistoryRun?.generation_id === libraryEdit.generation_id) {
+        setViewedHistoryRun(await getTestCaseGeneration(libraryEdit.generation_id));
+      }
+      setSuccess("Test case edit saved; earlier versions remain in review history.");
+    } catch (err) { setError(err.message); }
   }
 
   function moveSelected(status) {
@@ -289,19 +357,25 @@ export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData,
     setEditingExpected((item.expected_results || []).join("\n"));
   }
 
-  function saveEdit(id) {
-    setGeneration((current) => {
-      const next = structuredClone(current);
-      const nextContract = next.contract || next;
-      const item = (nextContract.test_cases || []).find((entry) => entry.test_case_id === id);
-      if (item) {
-        item.title = editingTitle.trim();
-        item.steps = lines(editingSteps);
-        item.expected_results = lines(editingExpected);
-      }
-      return next;
-    });
-    setEditingId("");
+  async function saveEdit(id) {
+    const title = editingTitle.trim();
+    const steps = lines(editingSteps);
+    const expectedResults = lines(editingExpected);
+    if (!title || !steps.length || !expectedResults.length) { setError("Title, steps, and expected results are required."); return; }
+    setSaving(true); setError("");
+    try {
+      const next = await reviewTestCaseGeneration(generationId, { reviewer: reviewer.trim() || "Product Owner", comments: "Test case edited", items: testCases.map((item) => ({
+        test_case_id: item.test_case_id,
+        review_status: statuses[item.test_case_id] || item.review_status || item.approval?.status || "pending",
+        title: item.test_case_id === id ? title : item.title,
+        steps: item.test_case_id === id ? steps : item.steps,
+        expected_results: item.test_case_id === id ? expectedResults : item.expected_results,
+      })) });
+      applyGeneration(next);
+      setEditingId("");
+      setSuccess("Test case edit saved in review history.");
+    } catch (err) { setError(err.message); }
+    finally { setSaving(false); }
   }
 
   async function saveReview() {
@@ -343,6 +417,41 @@ export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData,
 
   function pageHeader() {
     return <section className="test-design-header"><div className="test-design-header-copy"><div className="test-design-header-meta"><span><Sparkles size={12} /> TestIQ Test Design</span><div className="eyebrow">QUALITY ASSURANCE WORKSPACE</div></div><h1>Test Design Intelligence</h1><div className="test-design-cues"><span>AI-assisted generation</span><span>Human approval</span><span>Traceable coverage</span></div></div><div className="test-design-header-actions">{analysis?.project_name && <span className="test-design-project">{analysis.project_name}</span>}<button type="button" className="test-design-back" onClick={onBack}><ArrowLeft size={15} /> Upload Document</button></div></section>;
+  }
+
+  function reuseSection() {
+    if (!currentAnalysis) return null;
+    return <section className="requirements-panel test-case-reuse-panel">
+      <div className="panel-title-row"><div><h2>Existing test cases and reuse</h2><p className="panel-helper">Matches are checked against this Resource Package. Exact, citation-safe cases can be reused; similar cases guide a new evidence-grounded case. Generation covers every FR, with additional cases only for distinct supported scenarios.</p></div><span>{generationRequirements.length} FRs</span></div>
+      <div className="test-case-reuse-list">{(reusePreview?.requirements || []).map((row) => <div className="test-case-reuse-row" key={row.requirement_id}>
+        <strong>{row.requirement_id} · {row.title || "Functional Requirement"}</strong>
+        <label>Decision <select value={reuseSelections[row.requirement_id] || ""} onChange={(event) => setReuseSelections((current) => ({ ...current, [row.requirement_id]: event.target.value }))}>
+          <option value="">Create a new case</option>
+          {row.matches.map((match) => <option key={match.candidate_id} value={match.candidate_id}>{match.action === "reuse" ? "Reuse verified case" : "Adapt similar case"} · {match.title} · {Math.round(match.score * 100)}% text similarity</option>)}
+        </select></label>
+        {row.matches.length > 0 ? <small>{row.matches.length} related existing case(s); no match is used without your selection.</small> : <small>No relevant existing case found. A new case is needed.</small>}
+      </div>)}</div>
+      <details><summary>Browse existing project test cases ({library.length})</summary>
+        <div className="test-case-library-list">{library.map((item) => <div className="test-case-library-row" key={item.candidate_id}>
+          <div><strong>{item.case.title || item.candidate_id}</strong><small>{item.origin === "external" ? item.source_name : `Resource Package ${item.package_id}`} · {item.case.requirement_id || "External"}</small></div>
+          <button type="button" className="secondary-button compact-button" onClick={() => setLibraryEdit({ ...item, title: item.case.title || "", steps: (item.case.steps || []).join("\n"), expected_results: (item.case.expected_results || []).join("\n") })}>Edit</button>
+        </div>)}</div>
+      </details>
+      <details><summary>Test generation history ({runHistory.length} saved runs)</summary>
+        <div className="test-case-library-list">{runHistory.map((run) => <div className="test-case-library-row" key={run.generation_id}>
+          <div><strong>Resource Package v{run.package_version} · {run.test_case_count} case(s)</strong><small>{run.created_at} · {run.status} · {run.generation_id}</small></div>
+          <button type="button" className="secondary-button compact-button" onClick={async () => { try { setViewedHistoryRun(await getTestCaseGeneration(run.generation_id)); } catch (err) { setError(err.message); } }}>View cases</button>
+        </div>)}</div>
+        {viewedHistoryRun && <div className="test-case-library-list"><strong>Cases in {viewedHistoryRun.generation_id}</strong>{(viewedHistoryRun.contract?.test_cases || []).map((item) => <div className="test-case-library-row" key={item.test_case_id}><div><strong>{item.test_case_id} · {item.title}</strong><small>{item.requirement_id} · {item.review_status || "pending"}</small></div><button type="button" className="secondary-button compact-button" onClick={() => setLibraryEdit({ origin: "history", generation_id: viewedHistoryRun.generation_id, case: item, title: item.title || "", steps: (item.steps || []).join("\n"), expected_results: (item.expected_results || []).join("\n") })}>Edit</button></div>)}</div>}
+      </details>
+      <label className="test-case-import-label">Import external test cases (JSON with cases containing requirement_text, title, steps, expected_results)<input type="file" accept="application/json,.json" onChange={uploadExternalCases} /></label>
+      {libraryEdit && <div className="modal-backdrop"><div className="confirm-modal case-edit-modal" role="dialog" aria-modal="true" aria-labelledby="library-edit-heading">
+        <h2 id="library-edit-heading">Edit existing test case</h2><label>Title<input value={libraryEdit.title} onChange={(event) => setLibraryEdit((current) => ({ ...current, title: event.target.value }))} /></label>
+        <label>Steps<textarea value={libraryEdit.steps} onChange={(event) => setLibraryEdit((current) => ({ ...current, steps: event.target.value }))} /></label>
+        <label>Expected results<textarea value={libraryEdit.expected_results} onChange={(event) => setLibraryEdit((current) => ({ ...current, expected_results: event.target.value }))} /></label>
+        <div className="confirm-actions"><button type="button" className="secondary-button" onClick={() => setLibraryEdit(null)}>Cancel</button><button type="button" className="primary-button" onClick={saveLibraryEdit}>Save edit</button></div>
+      </div></div>}
+    </section>;
   }
 
   function listBlock(title, items, empty = "Not specified") {
@@ -429,9 +538,11 @@ export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData,
     {pageHeader()}
     {error && <div className="error-message"><AlertCircle size={17} /> {error}</div>}
     {success && <div className="toast-message"><CheckCircle2 size={17} /> {success}</div>}
+    {reuseSection()}
+    {generation && <section className="requirements-panel test-case-coverage-summary" aria-label="Test case coverage and evidence"><h2>Coverage and grounding</h2><div className="test-case-coverage-metrics"><span>FRs: {coverageSummary.requirements_covered || 0}/{coverageSummary.requirements_total || 0}</span><span>Acceptance criteria: {coverageSummary.acceptance_criteria_covered || 0}/{coverageSummary.acceptance_criteria_total || 0}</span><span>Business rules: {coverageSummary.business_rules_covered || 0}/{coverageSummary.business_rules_total || 0}</span><span>{knowledgeUsed ? "Knowledge Base evidence used" : "Knowledge Base evidence unavailable"}</span></div><p>{reuseDecisions.filter((item) => item.action === "reuse").length} verified reused · {reuseDecisions.filter((item) => item.action === "adapt_with_llm").length} adapted from similar cases · {testCases.length - reuseDecisions.filter((item) => item.action === "reuse").length} newly generated</p>{(contract.global_gaps || []).length > 0 && <details><summary>Open coverage gaps ({contract.global_gaps.length})</summary><ul>{contract.global_gaps.map((gap, index) => <li key={index}>{gap}</li>)}</ul></details>}</section>}
     <section className="generation-next-card"><div><div className="eyebrow">GENERATION</div><h2>{generation ? "Test cases ready for review" : activeGenerationActivity ? "Generation in progress" : "Generate test cases"}</h2><p>{generation ? `${testCases.length} cases generated from the approved project context.` : activeGenerationActivity ? "Generation continues in the background. You can safely open another page." : "Create positive and negative cases from approved requirements."}</p></div><div className="generation-controls project-generation-controls">{analysis?.generation_pipeline && loading && workflowProgress && <div className="test-case-inline-progress" aria-label="Test Case generation progress"><div className={`project-progress-track ${workflowProgress.percent === 100 ? "completed" : ""} running`} role="progressbar" aria-label="Test Case generation" aria-valuemin="0" aria-valuemax="100" aria-valuenow={workflowProgress.percent}><span style={{ width: `${workflowProgress.percent}%` }} /></div><div className={`project-progress-meta ${workflowProgress.percent === 100 ? "completed" : ""}`}><strong>{workflowProgress.percent}%</strong><span>{workflowProgress.label}</span></div></div>}{generation ? <span className="test-case-generation-ready"><CheckCircle2 size={16} /> Generated · {testCases.length} cases</span> : !(analysis?.generation_pipeline && loading) && !activeGenerationActivity && <button type="button" className="primary-button" disabled={!generationRequirements.length || loading} onClick={generate}><ShieldCheck size={16} /> Generate test cases</button>}</div></section>
     {generation && <section className="requirements-panel generated-cases-panel"><div className="panel-title-row"><div><h2>Test-case review</h2><p className="panel-helper">Approve, reject, or edit generated cases.</p></div><span>{approvedCount}/{testCases.length} approved</span></div><div className="selection-actions"><label className="select-all"><input type="checkbox" checked={selectedAll} onChange={(event) => toggleAll(event.target.checked)} /> Select all {testCases.length}</label><div className="review-move-actions"><button type="button" className="review-icon-action approved-action" disabled={!selected.length} title="Approve selected test cases" onClick={() => moveSelected("approved")}><Check size={14} /> Approve</button><button type="button" className="review-icon-action rejected-action" disabled={!selected.length} title="Reject selected test cases" onClick={() => moveSelected("rejected")}><X size={14} /> Reject</button></div></div><div className="test-case-execution-table-wrap"><table className="test-case-execution-table"><thead><tr><th className="test-case-grid-select-heading"></th><th>TC#</th><th>Test Title</th><th>Test Steps</th><th>Test data</th><th>Expected</th><th>Status</th><th className="test-case-grid-actions"></th></tr></thead><tbody>{visibleCaseItems.map(testCaseTableRow)}</tbody></table></div>{casePageCount > 1 && <nav className="test-case-pagination" aria-label="Test case pages"><span>Showing {(casePage - 1) * casesPerPage + 1}–{Math.min(casePage * casesPerPage, caseItems.length)} of {caseItems.length}</span><div><button type="button" aria-label="Previous test-case page" disabled={casePage === 1} onClick={() => setCasePage((current) => current - 1)}><ChevronLeft size={16} /></button>{casePaginationPages.map((pageNumber) => <button type="button" className={casePage === pageNumber ? "active" : ""} aria-current={casePage === pageNumber ? "page" : undefined} key={pageNumber} onClick={() => setCasePage(pageNumber)}>{pageNumber}</button>)}<button type="button" aria-label="Next test-case page" disabled={casePage === casePageCount} onClick={() => setCasePage((current) => current + 1)}><ChevronRight size={16} /></button></div></nav>}</section>}
     {editingId && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setEditingId(""); }}><div className="confirm-modal case-edit-modal" role="dialog" aria-modal="true" aria-labelledby="case-edit-heading"><button type="button" className="modal-close" aria-label="Close edit test case" onClick={() => setEditingId("")}><X size={18} /></button><div className="eyebrow">EDIT TEST CASE · {editingId}</div><h2 id="case-edit-heading">Update test case details</h2><label className="case-edit-field">Test title<input className="test-case-grid-input" value={editingTitle} onChange={(event) => setEditingTitle(event.target.value)} /></label><label className="case-edit-field">Test steps<textarea className="test-case-grid-input test-case-grid-textarea" value={editingSteps} onChange={(event) => setEditingSteps(event.target.value)} /></label><label className="case-edit-field">Expected results<textarea className="test-case-grid-input test-case-grid-textarea" value={editingExpected} onChange={(event) => setEditingExpected(event.target.value)} /></label><div className="confirm-actions"><button type="button" className="secondary-button" onClick={() => setEditingId("")}>Cancel</button><button type="button" className="primary-button" onClick={() => saveEdit(editingId)}>Save changes</button></div></div></div>}
-    {generation && <section className="requirements-review-card"><div className="test-review-heading"><div><div className="eyebrow">HUMAN REVIEW</div><h2>{allApproved ? "Review complete" : "Finalize review"}</h2></div>{approvedCaseItems.length > 0 && <button type="button" className="secondary-button compact-button" onClick={onContinueToTestData}>Continue to test data</button>}</div><div className="review-fields"><label>Reviewer<input value={reviewer} onChange={(event) => setReviewer(event.target.value)} /></label><label>Review comments<textarea value={comments} onChange={(event) => setComments(event.target.value)} placeholder="Optional review notes" /></label><button className="primary-button" onClick={saveReview} disabled={saving || !testCases.length}>{saving ? <><LoaderCircle className="spin" size={16} /> Saving...</> : <><ShieldCheck size={16} /> Save review</>}</button></div></section>}
+    {generation && <section className="requirements-review-card"><div className="test-review-heading"><div><div className="eyebrow">HUMAN REVIEW</div><h2>{allApproved ? "Review complete" : "Finalize review"}</h2></div>{approvedCaseItems.length > 0 && <button type="button" className="secondary-button compact-button" disabled={hasUnsavedDecisions} title={hasUnsavedDecisions ? "Save review decisions first" : undefined} onClick={onContinueToTestData}>Continue to test data</button>}</div><div className="review-fields"><label>Reviewer<input value={reviewer} onChange={(event) => setReviewer(event.target.value)} /></label><label>Review comments<textarea value={comments} onChange={(event) => setComments(event.target.value)} placeholder="Optional review notes" /></label><button className="primary-button" onClick={saveReview} disabled={saving || !testCases.length}>{saving ? <><LoaderCircle className="spin" size={16} /> Saving...</> : <><ShieldCheck size={16} /> Save review</>}</button></div></section>}
   </div>;
 }

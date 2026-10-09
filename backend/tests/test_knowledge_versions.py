@@ -6,7 +6,6 @@ import uuid
 from pathlib import Path
 
 import pytest
-from fastapi import HTTPException
 
 
 def _modules(monkeypatch):
@@ -61,13 +60,15 @@ class _FakeOpenAI:
         return types.SimpleNamespace(output_text=json.dumps({"entities": [], "relationships": []}))
 
 
-def test_build_requires_completed_business_rule_review(monkeypatch):
+def test_build_uses_only_approved_rules_without_a_manual_review_gate(monkeypatch):
     db, knowledge = _modules(monkeypatch)
+    monkeypatch.setattr(knowledge, "_create_client", lambda: _FakeOpenAI())
     _seed_package(db, "pkg-1", 1, "rev-1", "frag-1", review_status="pending")
-    with pytest.raises(HTTPException) as failure:
-        knowledge.build_knowledge_index("pkg-1", knowledge.BuildIndexRequest())
-    assert failure.value.status_code == 409
-    assert "Business Use Case" in str(failure.value.detail)
+    index = knowledge.build_knowledge_index("pkg-1", knowledge.BuildIndexRequest())
+    assert index["status"] == "ready"
+    with db.connection() as conn:
+        configuration = json.loads(conn.execute("SELECT configuration_json FROM knowledge_index WHERE index_id=%s", (index["index_id"],)).fetchone()["configuration_json"])
+    assert configuration["approved_rule_set"]["count"] == 0
 
 
 def test_project_knowledge_versions_reuse_unchanged_embeddings_and_graph(monkeypatch):
@@ -99,3 +100,20 @@ def test_project_knowledge_versions_reuse_unchanged_embeddings_and_graph(monkeyp
     with db.connection() as conn:
         assert conn.execute("SELECT COUNT(*) AS count FROM knowledge_index WHERE project_id='p1' AND status='ready'").fetchone()["count"] == 3
         assert conn.execute("SELECT COUNT(*) AS count FROM knowledge_node WHERE index_id=%s", (second["index_id"],)).fetchone()["count"] > 0
+
+
+def test_retrieval_is_scoped_persisted_and_respects_top_k(monkeypatch):
+    db, knowledge = _modules(monkeypatch)
+    fake = _FakeOpenAI()
+    monkeypatch.setattr(knowledge, "_create_client", lambda: fake)
+    _seed_package(db, "pkg-1", 1, "rev-1", "frag-1")
+    index = knowledge.build_knowledge_index("pkg-1", knowledge.BuildIndexRequest())
+    first = knowledge.retrieve_knowledge(index["index_id"], knowledge.RetrievalRequest(
+        query="eligible campaign reminder", top_k=1, candidate_k=5, use_reranker=True))
+    assert first["package_id"] == "pkg-1"
+    assert len(first["hits"]) == 1
+    assert first["configuration"]["top_k"] == 1
+    assert first["configuration"]["vector_backend"].startswith("python-cosine")
+    assert first["reranker"]["status"] in {"completed", "fallback"}
+    with db.connection() as conn:
+        assert conn.execute("SELECT COUNT(*) AS count FROM knowledge_chunk WHERE index_id=%s", (index["index_id"],)).fetchone()["count"] > 0

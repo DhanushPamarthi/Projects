@@ -1287,8 +1287,19 @@ button {
 }
 
 .package-source-selection { display: grid; gap: 10px; margin: 18px 0; }
-.package-source-option { display: block; min-width: 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; }
+.package-source-option { display: flex; align-items: center; gap: 12px; min-width: 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; cursor: pointer; }
+.package-source-option > input { flex: 0 0 auto; width: 18px; height: 18px; }
 .package-source-option .source-row { min-width: 0; margin: 0; padding: 0; border: 0; }
+.test-case-reuse-panel { display: grid; gap: 16px; }
+.test-case-reuse-list, .test-case-library-list { display: grid; gap: 10px; max-height: 380px; overflow: auto; }
+.test-case-reuse-row, .test-case-library-row { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 10px; }
+.test-case-reuse-row label { display: flex; align-items: center; gap: 8px; }
+.test-case-reuse-row select { max-width: 340px; padding: 8px; border: 1px solid var(--line); border-radius: 8px; }
+.test-case-reuse-row small, .test-case-library-row small { display: block; color: var(--muted); }
+.test-case-import-label { display: grid; gap: 8px; }
+.test-case-coverage-summary { display: grid; gap: 12px; }
+.test-case-coverage-metrics { display: flex; flex-wrap: wrap; gap: 10px; }
+.test-case-coverage-metrics span { padding: 8px 12px; border: 1px solid var(--line); border-radius: 9px; }
 .package-rule-list { display: grid; gap: 12px; margin: 18px 0; }
 .package-rule-card { display: grid; gap: 10px; padding: 16px; border: 1px solid var(--line); border-radius: 12px; }
 .package-rule-heading { display: flex; justify-content: space-between; gap: 16px; align-items: center; }
