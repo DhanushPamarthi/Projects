@@ -116,6 +116,10 @@ export async function registerUser(email, password, name = "") {
   return data.user;
 }
 
+export function getCurrentUser() {
+  return request("/auth/me", { cache: "no-store" });
+}
+
 export async function logoutUser() {
   try { await request("/auth/logout", { method: "POST" }); } finally { localStorage.removeItem("testiq_auth_token"); }
 }
@@ -302,6 +306,15 @@ export async function listProjectTestCaseHistory(projectId) {
   return request(`/api/v1/projects/${encodeURIComponent(projectId)}/test-case-history`, { cache: "no-store" });
 }
 
+export async function listProjectFunctionalRequirementHistory(projectId) {
+  return request(`/api/v1/projects/${encodeURIComponent(projectId)}/functional-requirement-history`, { cache: "no-store" });
+}
+
+export async function listProjectTestCases(projectId, packageVersion = null) {
+  const versionQuery = packageVersion == null ? "" : `?package_version=${encodeURIComponent(packageVersion)}`;
+  return request(`/api/v1/projects/${encodeURIComponent(projectId)}/test-cases${versionQuery}`, { cache: "no-store" });
+}
+
 export async function getTestCaseGeneration(generationId) {
   return request(`/api/v1/test-case-generations/${encodeURIComponent(generationId)}`, { cache: "no-store" });
 }
@@ -378,7 +391,7 @@ export async function saveTestDataToBronze(generationId, testCaseIds, reviewer =
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ test_case_ids: testCaseIds, reviewer }),
-    activity: { label: "Sending test data to Bronze", section: "test-data", detail: "The selected test data is being validated and loaded through the database stored procedure." },
+    activity: { label: "Sending test data to the target data platform", section: "test-data", detail: "The selected test data is being validated and loaded through the database stored procedure." },
   });
 }
 

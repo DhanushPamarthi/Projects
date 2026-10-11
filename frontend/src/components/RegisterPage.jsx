@@ -154,6 +154,11 @@ export function RegisterPage({ onBack }) {
       return;
     }
 
+    if (password.length < 12) {
+      setError("Use a password with at least 12 characters.");
+      return;
+    }
+
     if (!agreeTerms) {
       setError("Please agree to the Terms of Service and Privacy Policy");
       return;
@@ -162,14 +167,10 @@ export function RegisterPage({ onBack }) {
     setIsLoading(true);
     registerUser(email, password)
       .then(() => { localStorage.removeItem("testiq_auth_token"); localStorage.removeItem("testiq_current_user"); completeRegistration(); })
-      .catch(() => {
-        const users = JSON.parse(localStorage.getItem("testiq_users") || "{}");
-        if (users[email]) { setError("An account with this email already exists"); setIsLoading(false); return; }
-        const user = { email, password };
-        users[email] = user; localStorage.setItem("testiq_users", JSON.stringify(users)); localStorage.removeItem("testiq_current_user"); localStorage.removeItem("testiq_local_session"); completeRegistration(); setIsLoading(false);
+      .catch((registrationError) => {
+        setError(registrationError?.message || "Account registration failed. Check the backend and try again.");
+        setIsLoading(false);
       });
-    return;
-
   }
 
   return (

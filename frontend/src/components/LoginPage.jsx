@@ -146,29 +146,14 @@ export function LoginPage({ onLogin, onRegister }) {
     try {
       const user = await loginUser(email, password);
       localStorage.setItem("testiq_current_user", JSON.stringify(user));
-      localStorage.setItem("testiq_local_session", "true");
       toast.success("Login successful. Welcome back to TestIQ.");
       onLogin(user);
-      return;
-    } catch {
-      // Keep the local POC account fallback for offline development.
-    }
-    setTimeout(() => {
-      const users = JSON.parse(localStorage.getItem("testiq_users") || "{}");
-      const user = users[email];
-
-      if (!user || user.password !== password) {
-        setError("Invalid email or password");
-        setIsLoading(false);
-        return;
-      }
-
-      localStorage.setItem("testiq_current_user", JSON.stringify(user));
-      localStorage.setItem("testiq_local_session", "true");
-      toast.success("Login successful. Welcome back to TestIQ.");
-      onLogin(user);
+    } catch (loginError) {
+      setError(loginError?.status === 401
+        ? "Invalid email or password."
+        : loginError?.message || "Sign-in failed. Check the backend and try again.");
       setIsLoading(false);
-    }, 500);
+    }
   }
 
   return (

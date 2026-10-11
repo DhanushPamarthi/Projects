@@ -62,6 +62,9 @@ OPENAI_MODEL=gpt-4o-mini
 OPENAI_TIMEOUT_SECONDS=90
 OPENAI_PROMPT_CACHING_MODE=disabled
 TESTIQ_PGVECTOR_MODE=auto
+TESTIQ_AUTH_REQUIRED=true
+TESTIQ_AUTH_ALLOW_REGISTRATION=true
+TESTIQ_AUTH_SESSION_TTL_HOURS=12
 TESTIQ_POSTGRES_LOCK_TIMEOUT_MS=5000
 TESTIQ_POSTGRES_STATEMENT_TIMEOUT_MS=90000
 MAX_UPLOAD_BYTES=26214400
@@ -71,6 +74,33 @@ MAX_UPLOAD_BYTES=26214400
 `DATABASE_URL` overrides the individual `TESTIQ_POSTGRES_*` values. If neither `DATABASE_URL` nor `TESTIQ_POSTGRES_HOST` is set, the service uses local SQLite at `TESTIQ_DB_PATH`. The application creates the `testiq` schema tables at startup. Original uploads are stored under `TESTIQ_DATA_DIR/uploads`.
 
 `TESTIQ_PGVECTOR_MODE` supports `auto`, `disabled`, and `required`. `auto` uses pgvector when the server provides it and otherwise uses the PostgreSQL-backed Python cosine fallback. `disabled` explicitly selects that fallback; embeddings remain persisted in PostgreSQL, keyword retrieval preselects a broad vector candidate pool, and cosine scoring, graph expansion, reciprocal-rank fusion, and semantic reranking remain active. `required` stops startup when pgvector cannot be enabled.
+
+### pgvector setup and verification
+
+The PostgreSQL server or managed database provider must first make the pgvector extension files available. Having database `CREATE` permission alone is not enough when the extension is absent from the server's installed/allow-listed extensions. Ask the PostgreSQL administrator or provider to enable pgvector for the PostgreSQL major version and database service in use. Then, as a database owner/administrator, enable it in the TestIQ database:
+
+```sql
+SELECT name, default_version, installed_version
+FROM pg_available_extensions WHERE name = 'vector';
+
+CREATE EXTENSION IF NOT EXISTS vector;
+
+SELECT extversion FROM pg_extension WHERE extname = 'vector';
+```
+
+Restart the API with `TESTIQ_PGVECTOR_MODE=auto` (or `required` if startup must fail rather than fall back). Confirm startup reports pgvector as the active backend and inspect the index:
+
+```sql
+SELECT indexname FROM pg_indexes
+WHERE schemaname = 'testiq' AND tablename = 'knowledge_chunk'
+  AND indexdef ILIKE '%USING hnsw%';
+```
+
+The app creates its vector column and cosine HNSW index when pgvector is available. Existing Knowledge Base versions may contain JSON embeddings without populated vector columns; rebuild the selected Knowledge Base version (or create a new version) after activation so it gets vector values. Until then, retrieval can fall back to Python cosine scoring. On the configured demo database, the `vector` extension was not listed in `pg_available_extensions`, so a PostgreSQL administrator/provider action is required before pgvector can be activated.
+
+### Authentication
+
+`/auth/register`, `/auth/login`, `/auth/me`, and `/auth/logout` provide backend-backed accounts and expiring bearer sessions. Passwords use PBKDF2-SHA256 hashes; session tokens are stored as SHA-256 hashes. `TESTIQ_AUTH_REQUIRED=true` protects `/api/v1/*`; health, docs, and auth endpoints stay public. Keep initial registration enabled only for setup/demo onboarding, then set `TESTIQ_AUTH_ALLOW_REGISTRATION=false` and restart. Current authorization is workspace-wide: users authenticate, but projects and records are not yet isolated by owner or tenant. The browser stores the bearer token in local storage, so production hardening should move sessions to secure, HttpOnly cookies and add tenant/project access policies before exposing the service to untrusted users.
 
 ### OpenAI prompt-caching cost control
 

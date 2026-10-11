@@ -1,0 +1,39 @@
+[
+  {
+    "id": "campaign_eligibility",
+    "question": "What determines campaign eligibility and exclusion?",
+    "expected_evidence": ["active membership", "eligible prescriptions", "ineligible members"],
+    "expected_source_types": ["brd"]
+  },
+  {
+    "id": "sms_failure_fallback",
+    "question": "What happens when the primary communication fails?",
+    "expected_evidence": ["SMS communication fails", "phone call"],
+    "expected_source_types": ["brd"]
+  },
+  {
+    "id": "fallback_action",
+    "question": "What fallback action is specified?",
+    "expected_evidence": ["trigger a phone call", "fallback"],
+    "expected_source_types": ["brd"]
+  },
+  {
+    "id": "observable_outcome",
+    "question": "Which communication outcomes must be tracked?",
+    "expected_evidence": ["record outcomes", "success or failures"],
+    "expected_source_types": ["brd"]
+  },
+  {
+    "id": "order_cancellation_refund",
+    "question": "What happens when a customer cancels an unshipped order?",
+    "expected_evidence": ["cancel an unshipped order", "refund within five business days"],
+    "expected_source_types": ["brd"]
+  },
+  {
+    "id": "unsupported_email_retry",
+    "question": "What is the required email retry interval?",
+    "expected_evidence": [],
+    "expected_source_types": [],
+    "expect_no_evidence": true
+  }
+]

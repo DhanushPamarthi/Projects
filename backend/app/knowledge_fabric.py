@@ -12,12 +12,13 @@ from datetime import datetime, timezone
 from importlib.metadata import version as package_version
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from . import db as db_module
 from .config import OPENAI_EMBEDDING_DIMENSIONS, OPENAI_TIMEOUT_SECONDS, PGVECTOR_DIMENSIONS
 from .db import connection
 from .openai_requests import embeddings_create, responses_create
+from .rag_evaluation import grade_retrieval
 from .token_usage import usage_scope, usage_step
 
 
@@ -28,9 +29,9 @@ router = APIRouter()
 # or previously failed request, allowing safe retry in the common one-worker
 # development/product deployment.
 _ACTIVE_KNOWLEDGE_BUILDS = set()
-CHUNKER_VERSION = "fragment-window-1200-v1"
+CHUNKER_VERSION = "fragment-window-1200-overlap-160-v2"
 GRAPH_PROMPT_VERSION = "knowledge-graph-evidence-v3"
-RETRIEVAL_VERSION = "hybrid-bm25-vector-graph-rrf-rerank-v2"
+RETRIEVAL_VERSION = "hybrid-bm25-vector-graph-rrf-rerank-v3"
 RAG_BUILD_VERSION = "rag-persistent-incremental-v4"
 GRAPH_INSTRUCTIONS = (
     "Extract only explicit, useful campaign and technical entities and relationships from these cited chunks. "
@@ -41,8 +42,10 @@ GRAPH_INSTRUCTIONS = (
 DEFAULT_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large")
 DEFAULT_GRAPH_MODEL = os.getenv("OPENAI_GRAPH_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
 DEFAULT_RERANKER_MODEL = os.getenv("OPENAI_RERANKER_MODEL", DEFAULT_GRAPH_MODEL)
+DEFAULT_MIN_RERANKER_SCORE = min(1.0, max(0.0, float(os.getenv("RAG_MIN_RERANKER_SCORE", "0.15"))))
 RRF_K = 60
 MAX_CHARS_PER_CHUNK = 1200
+CHUNK_OVERLAP_CHARS = 160
 EMBEDDING_BATCH_SIZE = 64
 GRAPH_BATCH_SIZE = 6
 GRAPH_MAX_OUTPUT_TOKENS = 5000
@@ -51,10 +54,11 @@ MAX_INDEX_CHARACTERS = max(0, int(os.getenv("RAG_MAX_INDEX_CHARACTERS", "0")))
 MAX_CONTEXT_CHARACTERS = 30_000
 SOURCE_TYPES = {"brd", "campaign_rules", "api_spec", "database_schema", "message_template", "ui_description"}
 DEFAULT_EVALUATION_QUESTIONS = [
-    {"question": "What determines campaign eligibility and exclusion?", "expected_terms": ["eligible", "eligibility", "ineligible", "exclusion"]},
-    {"question": "What happens when the primary communication fails?", "expected_terms": ["fail", "fallback", "phone", "alternate"]},
-    {"question": "What retry or fallback behavior is specified?", "expected_terms": ["retry", "fallback", "fail", "alternate"]},
-    {"question": "What outputs and observable outcomes are expected?", "expected_terms": ["outcome", "output", "result", "status", "record"]},
+    {"question": "What determines campaign eligibility and exclusion?", "expected_evidence": ["active membership", "eligible prescriptions", "ineligible members"], "expected_source_types": ["brd"]},
+    {"question": "What happens when the primary communication fails?", "expected_evidence": ["SMS communication fails", "phone call"], "expected_source_types": ["brd"]},
+    {"question": "What retry or fallback behavior is specified?", "expected_evidence": ["SMS", "phone call"], "expected_source_types": ["brd"]},
+    {"question": "What outputs and observable outcomes are expected?", "expected_evidence": ["record the outcomes", "success or failures"], "expected_source_types": ["brd"]},
+    {"question": "What is the required email retry interval?", "expected_evidence": [], "expected_source_types": [], "expect_no_evidence": True},
 ]
 
 
@@ -108,7 +112,13 @@ def _chunks(fragment):
         body = text[start:end].strip()
         if body:
             result.append((body, start + leading_space, end + leading_space))
-        start = max(end, start + 1)
+        if end >= len(text):
+            break
+        next_start = max(start + 1, end - CHUNK_OVERLAP_CHARS)
+        aligned_start = text.find(" ", next_start, min(end, next_start + 80))
+        if aligned_start >= next_start:
+            next_start = aligned_start + 1
+        start = next_start
         while start < len(text) and text[start].isspace():
             start += 1
     return result
@@ -138,6 +148,7 @@ class RetrievalRequest(BaseModel):
     source_types: list[str] = Field(default_factory=list, max_length=6)
     max_context_characters: int = Field(default=12_000, ge=1000, le=MAX_CONTEXT_CHARACTERS)
     minimum_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    minimum_reranker_score: float = Field(default=DEFAULT_MIN_RERANKER_SCORE, ge=0.0, le=1.0)
     max_chunks_per_source: int = Field(default=6, ge=1, le=20)
     use_reranker: bool = True
     requested_by: str = Field(default="TestIQ user", min_length=1, max_length=200)
@@ -148,6 +159,22 @@ class RetrievalRequest(BaseModel):
 class EvaluationQuestion(BaseModel):
     question: str = Field(min_length=2, max_length=1000)
     expected_terms: list[str] = Field(default_factory=list, max_length=20)
+    expected_evidence: list[str] = Field(default_factory=list, max_length=20)
+    expected_source_types: list[str] = Field(default_factory=list, max_length=6)
+    expect_no_evidence: bool = False
+
+    @classmethod
+    def _validate_source_types(cls, value):
+        unknown = set(value or []) - SOURCE_TYPES
+        if unknown:
+            raise ValueError(f"Unsupported expected source types: {', '.join(sorted(unknown))}")
+        return value
+
+    # Pydantic v2 validates these request fields before any retrieval is run.
+    @field_validator("expected_source_types")
+    @classmethod
+    def validate_expected_source_types(cls, value):
+        return cls._validate_source_types(value)
 
 
 class EvaluationRequest(BaseModel):
@@ -479,7 +506,7 @@ def _context_pack(hits, max_characters):
 
 
 def _search_tokens(value):
-    return re.findall(r"[a-z0-9][a-z0-9_./-]*", str(value or "").lower())
+    return [token.rstrip("._/-") for token in re.findall(r"[a-z0-9][a-z0-9_./-]*", str(value or "").lower())]
 
 
 def _bm25_scores(query, documents, k1=1.5, b=0.75):
@@ -537,12 +564,15 @@ def _rerank_candidates(client, model, query, candidates):
         max_output_tokens=min(7000, 500 + len(candidates) * 90))
     payload = json.loads(response.output_text or "{}")
     allowed = {item["chunk_id"] for item in candidates}
-    ranked, seen = [], set()
-    for item in payload.get("ranked", []):
+    response_items = payload.get("ranked")
+    if not isinstance(response_items, list):
+        raise ValueError("Reranker did not return a ranked list")
+    returned_ids = [item.get("chunk_id") for item in response_items if isinstance(item, dict)]
+    if len(returned_ids) != len(candidates) or len(set(returned_ids)) != len(returned_ids) or set(returned_ids) != allowed:
+        raise ValueError("Reranker must return every supplied candidate exactly once")
+    ranked = []
+    for item in response_items:
         chunk_id = item.get("chunk_id")
-        if chunk_id not in allowed or chunk_id in seen:
-            continue
-        seen.add(chunk_id)
         ranked.append((chunk_id, max(0.0, min(1.0, float(item.get("relevance_score", 0.0)))), str(item.get("reason") or "")))
     if not ranked:
         raise ValueError("Reranker returned no valid candidate identifiers")
@@ -694,12 +724,12 @@ def _retrieve_with_client(index, request, client, query_vector=None):
         graph_ranked_ids = []
         for path in graph_paths:
             for chunk_id in path["evidence_chunk_ids"]:
-                if chunk_id in scored and chunk_id not in graph_ranked_ids:
+                if chunk_id in scored and chunk_id not in seeds and chunk_id not in graph_ranked_ids:
                     graph_ranked_ids.append(chunk_id)
         for chunk_id in graph_evidence:
             if chunk_id in scored:
                 scored[chunk_id]["graph_expanded"] = chunk_id not in seeds
-                if chunk_id not in graph_ranked_ids:
+                if chunk_id not in seeds and chunk_id not in graph_ranked_ids:
                     graph_ranked_ids.append(chunk_id)
         fusion_scores, channel_ranks = _rrf({"vector": vector_candidates, "keyword": lexical_candidates, "graph": graph_ranked_ids})
         candidate_ids = sorted(fusion_scores, key=lambda chunk_id: (-fusion_scores[chunk_id], chunk_id))[:request.candidate_k]
@@ -708,7 +738,7 @@ def _retrieve_with_client(index, request, client, query_vector=None):
             item["fusion_score"] = fusion_scores[item["chunk_id"]]
             item["channel_ranks"] = channel_ranks[item["chunk_id"]]
         reranker = {"enabled": request.use_reranker, "model": DEFAULT_RERANKER_MODEL if request.use_reranker else None,
-            "status": "disabled" if not request.use_reranker else "completed", "version": "openai-semantic-reranker-v1"}
+            "status": "disabled" if not request.use_reranker else "completed", "version": "openai-semantic-reranker-v2"}
         warnings = []
         reranked = []
         if request.use_reranker:
@@ -725,6 +755,13 @@ def _retrieve_with_client(index, request, client, query_vector=None):
             item["reranker_reason"] = reason
             item["final_score"] = (0.8 * reranker_score + 0.2 * item["fusion_score"]) if reranker_score is not None else item["fusion_score"]
         candidates.sort(key=lambda item: (-item["final_score"], -item["fusion_score"], item["chunk_id"]))
+        candidate_count = len(candidates)
+        reranker_filtered_count = 0
+        if reranker["status"] == "completed":
+            before_filter = len(candidates)
+            candidates = [item for item in candidates if item["reranker_score"] is not None
+                          and item["reranker_score"] >= request.minimum_reranker_score]
+            reranker_filtered_count = before_filter - len(candidates)
         hits = _select_diverse_hits(candidates, request.top_k, request.minimum_score, request.max_chunks_per_source)
     for rank, hit in enumerate(hits, 1):
         hit["rank"] = rank
@@ -736,7 +773,9 @@ def _retrieve_with_client(index, request, client, query_vector=None):
         hit["final_score"] = round(hit["final_score"], 6)
         hit["retrieval_score"] = hit["final_score"]
     context = _context_pack(hits, request.max_context_characters)
-    return hits, graph_paths, context, reranker, warnings, len(candidates), vector_backend
+    reranker["minimum_relevance_score"] = request.minimum_reranker_score if request.use_reranker else None
+    reranker["filtered_candidate_count"] = reranker_filtered_count
+    return hits, graph_paths, context, reranker, warnings, candidate_count, vector_backend
 
 
 def retrieve_knowledge(index_id, request, client=None, query_vector=None):
@@ -759,6 +798,7 @@ def retrieve_knowledge(index_id, request, client=None, query_vector=None):
         "vector_backend": vector_backend, "candidate_k": request.candidate_k, "candidate_count": candidate_count, "top_k": request.top_k,
         "graph_depth": request.graph_depth, "source_types": sorted(request.source_types), "rrf_k": RRF_K,
         "minimum_score": request.minimum_score, "max_chunks_per_source": request.max_chunks_per_source,
+        "minimum_reranker_score": request.minimum_reranker_score,
         "reranker": reranker, "max_context_characters": request.max_context_characters,
         "require_approved": request.require_approved}
     stored_result = {"chunk_ids": [hit["chunk_id"] for hit in hits],
@@ -1287,14 +1327,17 @@ def evaluate_knowledge_index(index_id: str, request: EvaluationRequest):
             max_context_characters=10_000, requested_by=request.requested_by, purpose="retrieval_evaluation",
             require_approved=True), client=client)
         lowered = retrieval["context"].lower()
-        expected_hits = {term: term.lower() in lowered for term in question.expected_terms}
-        concept_found = not expected_hits or any(expected_hits.values())
-        passed = bool(retrieval["hits"]) and concept_found
-        results.append({"question": question.question, "passed": passed, "retrieval_id": retrieval["retrieval_id"],
+        legacy_term_hits = {term: term.lower() in lowered for term in question.expected_terms}
+        grading_question = question.model_copy(update={
+            "expected_evidence": question.expected_evidence or question.expected_terms,
+        })
+        grounding = grade_retrieval(grading_question, retrieval)
+        passed = grounding["passed"]
+        results.append({"question": question.question, **grounding, "passed": passed, "retrieval_id": retrieval["retrieval_id"],
             "citation_count": len(retrieval["hits"]), "source_types": sorted({hit["source_type"] for hit in retrieval["hits"]}),
             "graph_path_count": len(retrieval["graph_paths"]),
             "top_retrieval_score": retrieval["hits"][0]["retrieval_score"] if retrieval["hits"] else None,
-            "expected_term_hits": expected_hits})
+            "legacy_expected_term_hits": legacy_term_hits})
     with connection() as conn:
         index = conn.execute("SELECT package_id FROM knowledge_index WHERE index_id=%s", (index_id,)).fetchone()
         if not index:
@@ -1304,7 +1347,9 @@ def evaluate_knowledge_index(index_id: str, request: EvaluationRequest):
         conn.execute("INSERT INTO knowledge_evaluation_run (evaluation_id,index_id,package_id,requested_by,questions_json,result_json,passed,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
             (evaluation_id, index_id, index["package_id"], request.requested_by.strip(),
              json.dumps([question.model_dump() for question in questions]), json.dumps(results), int(passed), timestamp))
-    return {"evaluation_id": evaluation_id, "index_id": index_id, "passed": passed, "results": results, "created_at": timestamp}
+    return {"evaluation_id": evaluation_id, "index_id": index_id, "passed": passed,
+        "score_semantics": "Evidence coverage and citation integrity; retrieval scores are ranking signals, not confidence probabilities.",
+        "results": results, "created_at": timestamp}
 
 
 @router.get("/api/v1/knowledge-indexes/{index_id}/evaluations")

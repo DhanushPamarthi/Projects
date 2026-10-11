@@ -57,6 +57,9 @@ PGVECTOR_HNSW_EF_SEARCH = int(os.getenv("PGVECTOR_HNSW_EF_SEARCH", "100"))
 PGVECTOR_MODE = os.getenv("TESTIQ_PGVECTOR_MODE", "auto").strip().lower()
 if PGVECTOR_MODE not in {"auto", "disabled", "required"}:
     raise ValueError("TESTIQ_PGVECTOR_MODE must be auto, disabled, or required")
+AUTH_REQUIRED = os.getenv("TESTIQ_AUTH_REQUIRED", "true").strip().lower() in {"1", "true", "yes", "on"}
+AUTH_ALLOW_REGISTRATION = os.getenv("TESTIQ_AUTH_ALLOW_REGISTRATION", "true").strip().lower() in {"1", "true", "yes", "on"}
+AUTH_SESSION_TTL_HOURS = max(1, int(os.getenv("TESTIQ_AUTH_SESSION_TTL_HOURS", "12")))
 POSTGRES_LOCK_TIMEOUT_MS = int(os.getenv("TESTIQ_POSTGRES_LOCK_TIMEOUT_MS", "5000"))
 POSTGRES_STATEMENT_TIMEOUT_MS = int(os.getenv("TESTIQ_POSTGRES_STATEMENT_TIMEOUT_MS", "90000"))
 POSTGRES_POOL_MIN_SIZE = int(os.getenv("TESTIQ_POSTGRES_POOL_MIN_SIZE", "1"))

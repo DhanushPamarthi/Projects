@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Activity, Bell, BookOpen, ChevronDown, ChevronLeft, ChevronRight, ClipboardCheck, Database, FileCheck2, FileStack, FlaskConical, Gauge, LayoutDashboard, LoaderCircle, LogOut, Menu, PackageOpen, ShieldCheck, UploadCloud, X } from "lucide-react";
+import { Activity, Bell, BookOpen, ChevronDown, ChevronLeft, ChevronRight, ClipboardCheck, Database, FileCheck2, FileSearch, FileStack, FlaskConical, Gauge, LayoutDashboard, LoaderCircle, LogOut, Menu, PackageOpen, ShieldCheck, UploadCloud, X } from "lucide-react";
 import { LoginPage } from "./components/LoginPage.jsx";
 import { RegisterPage } from "./components/RegisterPage.jsx";
 import { ProjectsPage } from "./components/ProjectsPage.jsx";
@@ -14,7 +14,7 @@ import { TestResultsPage } from "./components/TestResultsPage.jsx";
 import { KnowledgeBasePage } from "./components/KnowledgeBasePage.jsx";
 import { TokenUsagePage } from "./components/TokenUsagePage.jsx";
 import { DashboardPage } from "./components/DashboardPage.jsx";
-import { logoutUser } from "./api/client.js";
+import { getCurrentUser, logoutUser } from "./api/client.js";
 import { ToastContainer } from "react-toastify";
 import { toast } from "react-toastify";
 import { reconcileStaleActivities, recoverInterruptedTabActivities, useActivities } from "./activity/activityStore.js";
@@ -25,6 +25,9 @@ const ACTIVE_NAV_KEY = "testiq_active_nav";
 const GENERATION_ANALYSIS_KEY = "testiq_generation_analysis";
 const WORKSPACE_STATE_VERSION_KEY = "testiq_workspace_state_version";
 const WORKSPACE_STATE_VERSION = "automatic-kb-clean-slate-v1";
+// Remove credentials from the old local-only POC login implementation.
+localStorage.removeItem("testiq_users");
+localStorage.removeItem("testiq_local_session");
 if (localStorage.getItem(WORKSPACE_STATE_VERSION_KEY) !== WORKSPACE_STATE_VERSION) {
   Object.keys(localStorage).filter((key) => key === "testiq_current_project" || key === "testiq_current_package" || key === GENERATION_ANALYSIS_KEY || key === "testiq_workspace_activities_v1" || key.startsWith("testiq_business_rule_selection:") || key.startsWith("testiq_functional_review_draft:")).forEach((key) => localStorage.removeItem(key));
   localStorage.setItem(WORKSPACE_STATE_VERSION_KEY, WORKSPACE_STATE_VERSION);
@@ -39,7 +42,9 @@ const NAV_ITEMS = [
   { id: "traceability", label: "Traceability", icon: ShieldCheck },
   { id: "sources", label: "Source Documents", icon: FileStack, parent: "traceability" },
   { id: "packages", label: "Packages", icon: PackageOpen, parent: "traceability" },
+  { id: "business-requirements", label: "Business use cases", icon: ShieldCheck, parent: "traceability" },
   { id: "knowledge-base", label: "Knowledge Base", icon: BookOpen, parent: "traceability" },
+  { id: "requirements", label: "Functional Requirements", icon: FileSearch, parent: "traceability" },
   { id: "token-usage", label: "LLM Token Usage", icon: Gauge, parent: "traceability" },
 ];
 
@@ -93,12 +98,37 @@ function storedGenerationAnalysis() {
 }
 
 export default function App() {
-  const [user, setUser] = useState(() => { const saved = localStorage.getItem("testiq_current_user"); const authenticated = localStorage.getItem("testiq_auth_token") || localStorage.getItem("testiq_local_session") === "true"; return saved && authenticated ? JSON.parse(saved) : null; });
+  const [user, setUser] = useState(() => { const saved = localStorage.getItem("testiq_current_user"); return saved && localStorage.getItem("testiq_auth_token") ? JSON.parse(saved) : null; });
+  const [authReady, setAuthReady] = useState(() => !localStorage.getItem("testiq_auth_token"));
   const [authView, setAuthView] = useState("login"); const [activeNav, setActiveNav] = useState(() => { const saved = localStorage.getItem(ACTIVE_NAV_KEY); return VALID_NAV_ITEMS.has(saved) ? saved : "projects"; }); const [generationAnalysis, setGenerationAnalysisState] = useState(storedGenerationAnalysis);
   const [sidebarExpanded, setSidebarExpanded] = useState(() => localStorage.getItem("testiq_sidebar_expanded") === "true");
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const workspaceContentRef = useRef(null);
   const activities = useActivities();
+  useEffect(() => {
+    const token = localStorage.getItem("testiq_auth_token");
+    if (!token) {
+      localStorage.removeItem("testiq_current_user");
+      setUser(null);
+      setAuthReady(true);
+      return undefined;
+    }
+    let active = true;
+    getCurrentUser()
+      .then((currentUser) => {
+        if (!active) return;
+        localStorage.setItem("testiq_current_user", JSON.stringify(currentUser));
+        setUser(currentUser);
+      })
+      .catch(() => {
+        if (!active) return;
+        localStorage.removeItem("testiq_auth_token");
+        localStorage.removeItem("testiq_current_user");
+        setUser(null);
+      })
+      .finally(() => { if (active) setAuthReady(true); });
+    return () => { active = false; };
+  }, []);
   useEffect(() => {
     recoverInterruptedTabActivities();
     reconcileStaleActivities();
@@ -134,9 +164,10 @@ export default function App() {
   function setGenerationAnalysis(next) { setGenerationAnalysisState(next); if (next) localStorage.setItem(GENERATION_ANALYSIS_KEY, JSON.stringify(next)); else localStorage.removeItem(GENERATION_ANALYSIS_KEY); }
   const clearGenerationAnalysis = useCallback(() => { setGenerationAnalysisState(null); localStorage.removeItem(GENERATION_ANALYSIS_KEY); }, []);
   function openTestCaseGeneration(next) { setGenerationAnalysis(next); setActiveNav("test-cases"); }
-  function handleLogin(userData) { const enrichedUser = { ...userData, name: userData?.name || displayNameFromEmail(userData?.email) }; setUser(enrichedUser); localStorage.setItem("testiq_current_user", JSON.stringify(enrichedUser)); if (!localStorage.getItem("testiq_auth_token")) localStorage.setItem("testiq_local_session", "true"); }
-  async function handleLogout() { try { await logoutUser(); } catch { /* local cleanup still applies */ } localStorage.removeItem("testiq_current_user"); localStorage.removeItem("testiq_auth_token"); localStorage.removeItem("testiq_local_session"); localStorage.removeItem(ACTIVE_NAV_KEY); localStorage.removeItem(GENERATION_ANALYSIS_KEY); setGenerationAnalysisState(null); setActiveNav("projects"); toast.success("You have been logged out successfully."); setUser(null); }
+  function handleLogin(userData) { const enrichedUser = { ...userData, name: userData?.name || displayNameFromEmail(userData?.email) }; setUser(enrichedUser); localStorage.setItem("testiq_current_user", JSON.stringify(enrichedUser)); }
+  async function handleLogout() { try { await logoutUser(); } catch { /* local cleanup still applies */ } localStorage.removeItem("testiq_current_user"); localStorage.removeItem("testiq_auth_token"); localStorage.removeItem(ACTIVE_NAV_KEY); localStorage.removeItem(GENERATION_ANALYSIS_KEY); setGenerationAnalysisState(null); setActiveNav("projects"); toast.success("You have been logged out successfully."); setUser(null); }
   const notifications = <ToastContainer position="top-right" autoClose={3500} newestOnTop closeOnClick pauseOnHover theme="light" />;
+  if (!authReady) return <>{notifications}<div role="status" aria-live="polite" style={{ minHeight: "100vh", display: "grid", placeItems: "center", color: "#26415c" }}>Checking your sign-in… <LoaderCircle className="spin" size={18} /></div></>;
   if (!user) return <>{notifications}{authView === "login" ? <LoginPage onLogin={handleLogin} onRegister={() => setAuthView("register")} /> : <RegisterPage onBack={() => setAuthView("login")} />}</>;
   const name = user?.name || displayNameFromEmail(user?.email) || "Workspace user"; const initials = name.split(" ").map((part) => part[0]).slice(0, 2).join("").toUpperCase();
   const navigate = (destination) => { setActiveNav(destination); setMobileMenuOpen(false); };

@@ -11,9 +11,10 @@ def _client(monkeypatch):
     data = Path(".test-data") / uuid.uuid4().hex
     monkeypatch.setenv("TESTIQ_DATA_DIR", str(data))
     monkeypatch.setenv("TESTIQ_DB_PATH", str(data / "test.db"))
+    monkeypatch.setenv("TESTIQ_AUTH_REQUIRED", "false")
     import importlib
-    import app.config, app.db, app.main
-    importlib.reload(app.config); importlib.reload(app.db); importlib.reload(app.main)
+    import app.config, app.db, app.auth, app.main
+    importlib.reload(app.config); importlib.reload(app.db); importlib.reload(app.auth); importlib.reload(app.main)
     # Uploads now reject unknown projects, so seed the stable IDs used by the
     # API-focused tests instead of weakening the production validation.
     with app.db.connection() as conn:
@@ -181,10 +182,11 @@ def test_supporting_source_manifest_is_traceable(monkeypatch):
     assert fetched_manifest.json()["package_id"] == manifest.json()["package_id"]
     assert all(item["content_hash"] for item in fetched_manifest.json()["items"])
 
-def test_business_use_cases_feed_package_rule_review_before_knowledge_base(monkeypatch):
+def test_business_use_cases_are_auto_approved_and_feed_knowledge_base(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     client = _client(monkeypatch)
     import app.main as main_module
+    monkeypatch.setattr(main_module, "_run_package_automation", lambda *_args, **_kwargs: None)
 
     brd = client.post(
         "/api/v1/projects/p1/sources",
@@ -194,9 +196,6 @@ def test_business_use_cases_feed_package_rule_review_before_knowledge_base(monke
     assert brd.status_code == 202, brd.text
     revision = client.get(f"/api/v1/revisions/{brd.json()['revision_id']}").json()
     fragment = revision["fragments"][0]
-    manifest = client.post("/api/v1/projects/p1/manifests", json={"source_ids": [brd.json()["source_id"]], "scope": "MVP"})
-    assert manifest.status_code == 201, manifest.text
-    package_id = manifest.json()["package_id"]
 
     monkeypatch.setattr(main_module, "_business_requirements_with_timeout", lambda *args, **kwargs: [{
         "business_requirement_id": "BR-001",
@@ -207,12 +206,18 @@ def test_business_use_cases_feed_package_rule_review_before_knowledge_base(monke
         "source_references": [{"fragment_id": fragment["fragment_id"], "source_reference": fragment["source_reference"]}],
         "supporting_source_references": [],
     }])
+    manifest = client.post("/api/v1/projects/p1/manifests", json={"source_ids": [brd.json()["source_id"]], "scope": "MVP"})
+    assert manifest.status_code == 201, manifest.text
+    package_id = manifest.json()["package_id"]
+
     generated = client.post(f"/api/v1/packages/{package_id}/business-requirements/generate")
     assert generated.status_code == 201, generated.text
     assert generated.json()["contract"]["rag_status"]["used"] is False
     package_rules = client.get(f"/api/v1/packages/{package_id}/business-rules").json()
-    assert package_rules["counts"] == {"pending": 1, "approved": 0, "rejected": 0}
+    assert package_rules["counts"] == {"pending": 0, "approved": 1, "rejected": 0}
     assert package_rules["rules"][0]["statement"] == "Eligible members must receive a reminder."
+    assert package_rules["rules"][0]["status"] == "approved"
+    assert package_rules["review_status"] == "approved"
 
     analysis = generated.json()
     review = client.post(
@@ -289,7 +294,7 @@ def test_business_use_cases_feed_package_rule_review_before_knowledge_base(monke
             assert conn.execute("SELECT status FROM knowledge_index WHERE index_id=%s", (index_id,)).fetchone()["status"] == "ready"
         return rag
 
-    def functional_contract(package, _items, _fragments, approved, context):
+    def functional_contract(package, _items, _fragments, approved, context, _previous=None):
         assert package["package_id"] == package_id
         assert approved[0]["business_requirement_id"] == "BR-001"
         assert context["index_id"] == index_id

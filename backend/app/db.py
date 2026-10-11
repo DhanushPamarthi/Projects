@@ -14,6 +14,17 @@ _INIT_LOCK = threading.Lock()
 
 SCHEMA = """
 CREATE SCHEMA IF NOT EXISTS testiq;
+CREATE TABLE IF NOT EXISTS testiq.app_user (
+  user_id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, display_name TEXT NOT NULL,
+  password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'workspace_member',
+  is_active BOOLEAN NOT NULL DEFAULT TRUE, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS testiq.auth_session (
+  session_id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES testiq.app_user(user_id),
+  token_hash TEXT NOT NULL UNIQUE, expires_at TEXT NOT NULL, created_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL, revoked_at TEXT
+);
+CREATE INDEX IF NOT EXISTS testiq_auth_session_user_idx ON testiq.auth_session(user_id,expires_at);
 CREATE TABLE IF NOT EXISTS testiq.project (
   project_id TEXT PRIMARY KEY, project_name TEXT NOT NULL, created_at TEXT NOT NULL
 );

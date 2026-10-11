@@ -711,8 +711,8 @@
 .project-card-identity p { font-size: .62rem; }
 .project-state-badge { display: inline-flex; align-items: center; gap: .32rem; padding: .34rem .55rem; border: 1px solid transparent; border-radius: 999px; font-size: .6rem; font-weight: 800; white-space: nowrap; }
 .project-state-badge.ready { color: #237850; border-color: #cce9da; background: #edf9f3; }.project-state-badge.processing { color: #9a6811; border-color: #f0dfb8; background: #fff9e9; }.project-state-badge.attention { color: #a64640; border-color: #efd2cf; background: #fff4f3; }.project-state-badge.paused, .project-state-badge.waiting { color: #657488; border-color: #dde5ed; background: #f4f7fa; }
-.project-brd-summary { gap: .65rem; margin: .7rem 0 .6rem; padding: .62rem .7rem; border-color: #e7edf3; border-radius: 9px; background: #f8fafc; }
-.project-brd-summary > strong { font-size: .68rem; }
+.project-brd-summary { display: grid; gap: .55rem; margin: .7rem 0 .6rem; padding: .62rem .7rem; border-color: #e7edf3; border-radius: 9px; background: #f8fafc; }
+.project-brd-summary-head { display: flex; align-items: center; justify-content: space-between; gap: .65rem; }
 .project-brd-summary .secondary-button { min-height: 34px; padding: .42rem .62rem; }
 .project-brd-collection { margin: .7rem 0 .6rem; overflow: hidden; border: 1px solid #e1e9f0; border-radius: 11px; background: #f8fafc; }
 .project-brd-collection-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: .58rem .7rem; border-bottom: 1px solid #e5ebf1; background: #f3f7fa; }
@@ -807,6 +807,36 @@
 .test-generation-page .test-case-execution-table td small { margin-top: .2rem; font-size: .58rem; }
 .test-generation-page .test-case-grid-line { margin-bottom: .18rem; font-size: .64rem; }
 .test-generation-page .test-case-review-badge { font-size: .57rem; white-space: nowrap; }
+.project-case-history-panel, .external-test-case-import-panel { display: grid; gap: .65rem; padding: .85rem .9rem; border-color: #dfe7ef; border-radius: 12px; box-shadow: 0 7px 22px rgb(20 43 67 / 4%); }
+.project-case-history-controls { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; padding: .55rem; border: 1px solid #e5ebf1; border-radius: 9px; background: #f8fafc; }
+.project-case-history-controls .secondary-button.active { border-color: #ff806d; color: #bf4f40; background: #fff3f0; }
+.project-case-version-select { display: flex; align-items: center; gap: .4rem; margin-left: auto; color: #607087; font-size: .65rem; font-weight: 700; }
+.project-case-version-select .app-select { min-width: 220px; }
+.project-case-history-list { display: grid; gap: .4rem; }
+.project-case-history-item { overflow: hidden; border: 1px solid #e4eaf0; border-radius: 9px; background: #fff; }
+.project-case-history-item > summary { display: flex; align-items: center; justify-content: space-between; gap: .8rem; padding: .6rem .7rem; cursor: pointer; list-style: none; }
+.project-case-history-item > summary::-webkit-details-marker { display: none; }
+.project-case-history-item > summary > span:first-child { display: grid; min-width: 0; gap: .2rem; }
+.project-case-history-item > summary strong { overflow: hidden; color: #25364b; font-size: .69rem; text-overflow: ellipsis; white-space: nowrap; }
+.project-case-history-item > summary small { overflow: hidden; color: #718096; font-size: .6rem; text-overflow: ellipsis; white-space: nowrap; }
+.project-case-history-details { display: grid; grid-template-columns: 1fr 1fr; gap: .7rem; padding: .65rem .75rem; border-top: 1px solid #edf1f5; color: #53657a; font-size: .64rem; }
+.project-case-history-details b { color: #34465c; }
+.functional-requirement-history-panel .panel-helper { max-width: 52rem; }
+.functional-requirement-history-list { grid-template-columns: 1fr; }
+.functional-requirement-history-item { grid-column: 1 / -1; border: 1px solid #e4eaf0; border-radius: 8px; background: #fff; }
+.functional-requirement-history-item > summary { padding: .55rem .65rem; cursor: pointer; list-style: none; }
+.functional-requirement-history-item > summary::-webkit-details-marker { display: none; }
+.functional-requirement-history-item > summary strong { color: #34465c; font-size: .65rem; }
+.functional-requirement-history-item > summary small { display: block; margin-top: .2rem; color: #718096; font-size: .58rem; }
+.functional-requirement-history-content { display: grid; grid-template-columns: 1fr 1fr; gap: .6rem; padding: .65rem; border-top: 1px solid #edf1f5; color: #53657a; font-size: .62rem; }
+.functional-requirement-history-content > p { grid-column: 1 / -1; margin: 0; }
+.functional-requirement-history-content section { min-width: 0; }
+.functional-requirement-history-content ul { margin: .25rem 0 0; padding-left: 1.1rem; }
+.functional-requirement-history-content li { overflow-wrap: anywhere; }
+.project-case-history-details ol, .project-case-history-details ul { margin: .3rem 0 0; padding-left: 1.2rem; }
+.project-case-empty { margin: 0; color: #718096; font-size: .68rem; }
+.external-test-case-import-panel h2 { margin: 0 0 .15rem; font-size: .9rem; }
+.external-test-case-import-panel .test-case-import-label { display: grid; gap: .25rem; }
 .test-case-pagination { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: .6rem .1rem 0; color: #78869a; font-size: .64rem; }
 .test-case-pagination > div { display: flex; align-items: center; gap: .3rem; }
 .test-case-pagination button { display: grid; width: 30px; height: 30px; place-items: center; padding: 0; border: 1px solid #dce4ec; border-radius: 8px; color: #53657a; background: #fff; font-size: .65rem; font-weight: 800; }
@@ -820,7 +850,7 @@
 .test-generation-page .review-fields input, .test-generation-page .review-fields textarea { height: 42px; min-height: 42px; padding: .55rem .65rem; }
 .test-generation-page .review-fields > .primary-button { height: 42px; }
 @media (max-width: 980px) { .test-design-header { height: auto; grid-template-columns: 1fr; }.test-design-header-actions { justify-content: space-between; }.test-generation-page .review-fields { grid-template-columns: 1fr; }.test-generation-page .review-fields > .primary-button { justify-self: start; }.test-generation-page .project-test-generation-card .project-generation-controls { flex: 1 1 auto; width: 100%; min-width: 0; } }
-@media (max-width: 700px) { .test-design-header { padding: 1rem; }.test-design-header-actions, .test-review-heading { align-items: flex-start; flex-direction: column; }.test-design-project { max-width: 100%; }.test-generation-page .generation-next-card { align-items: stretch; flex-direction: column; }.test-generation-page .project-generation-controls { width: 100%; min-width: 0; }.test-case-pagination { align-items: flex-start; flex-direction: column; }.test-case-pagination > div { width: 100%; justify-content: flex-end; } }
+@media (max-width: 700px) { .test-design-header { padding: 1rem; }.test-design-header-actions, .test-review-heading { align-items: flex-start; flex-direction: column; }.test-design-project { max-width: 100%; }.test-generation-page .generation-next-card { align-items: stretch; flex-direction: column; }.test-generation-page .project-generation-controls { width: 100%; min-width: 0; }.test-case-pagination { align-items: flex-start; flex-direction: column; }.test-case-pagination > div { width: 100%; justify-content: flex-end; }.project-case-version-select { width: 100%; margin-left: 0; align-items: flex-start; flex-direction: column; }.project-case-version-select .app-select { width: 100%; }.project-case-history-details, .functional-requirement-history-content { grid-template-columns: 1fr; } }
 
 .test-case-generation-ready { display: inline-flex; align-items: center; gap: .42rem; padding: .48rem .68rem; border: 1px solid #cdebdc; border-radius: 9px; color: #16764f; background: #edf9f3; font-size: .64rem; font-weight: 800; white-space: nowrap; }
 

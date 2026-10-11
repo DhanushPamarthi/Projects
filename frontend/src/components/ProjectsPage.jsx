@@ -114,35 +114,45 @@ export function ProjectsPage({ onOpenTestCases }) {
 
   function chooseBrd(project, sourceId = "") { uploadTarget.current = { project, sourceId }; brdInput.current?.click(); }
   async function uploadBrd(event) {
-    const target = uploadTarget.current; const project = target?.project; const sourceId = target?.sourceId || ""; const file = event.target.files?.[0]; event.target.value = "";
-    if (!project || !file) return;
+    const target = uploadTarget.current;
+    const project = target?.project;
+    const sourceId = target?.sourceId || "";
+    const files = Array.from(event.target.files || []);
+    event.target.value = "";
+    if (!project || !files.length) return;
+    if (sourceId && files.length > 1) {
+      setError("Choose one file when uploading a new version of an existing BRD.");
+      return;
+    }
     const currentPackageId = dashboardMap[project.project_id]?.packages?.[0]?.package_id || "";
     setBusy(true); setError(""); setProcessingProjectId(project.project_id); setStopRequestedProjectId("");
     setReplacingBrdProjectId(project.project_id); setPreviousPackageId(currentPackageId);
     try {
-      const uploaded = await uploadSource(project.project_id, file, "brd", "", "", sourceId);
+      const uploads = [];
+      for (const file of files) {
+        const upload = await uploadSource(project.project_id, file, "brd", "", "", sourceId);
+        uploads.push({ file, upload });
+      }
       if (sourceId) setVersionHistory((current) => { const next = { ...current }; delete next[sourceId]; return next; });
       localStorage.setItem("testiq_current_project", JSON.stringify(project));
       await refresh();
-      let completed = false;
-      for (let attempt = 0; attempt < 40; attempt += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 2000));
-        const revision = await getRevision(uploaded.revision_id);
-        const status = revision.extraction?.status || "pending";
-        if (["succeeded", "skipped", "failed"].includes(status)) {
-          completed = true;
-          await refresh();
-          if (status === "failed") {
-            setError(revision.extraction?.error || "BRD extraction failed.");
-            setReplacingBrdProjectId(""); setPreviousPackageId("");
-          }
-          else toast.success(sourceId ? "New BRD version uploaded." : "BRD added to the project.");
-          break;
+      const results = await Promise.all(uploads.map(async ({ file, upload }) => {
+        let revision;
+        for (let attempt = 0; attempt < 40; attempt += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+          revision = await getRevision(upload.revision_id);
+          if (["succeeded", "skipped", "failed"].includes(revision.extraction?.status || "pending")) break;
         }
-      }
-      if (!completed) setError("BRD is still processing. Refresh to check its status.");
+        return { file, revision, status: revision?.extraction?.status || "pending" };
+      }));
+      await refresh();
+      const failed = results.find((result) => result.status === "failed");
+      if (failed) setError(`${failed.file.name}: ${failed.revision.extraction?.error || "BRD extraction failed."}`);
+      else if (results.some((result) => result.status === "pending")) setError("One or more BRDs are still processing. Refresh to check their status.");
+      else toast.success(sourceId ? "New BRD version uploaded." : `${results.length} BRD${results.length === 1 ? "" : "s"} added to the project.`);
     }
-    catch (err) { setError(err.message); setReplacingBrdProjectId(""); setPreviousPackageId(""); } finally { setBusy(false); setProcessingProjectId(""); }
+    catch (err) { setError(err.message); setReplacingBrdProjectId(""); setPreviousPackageId(""); refresh().catch(() => {}); }
+    finally { setBusy(false); setProcessingProjectId(""); }
   }
 
   async function toggleVersionHistory(sourceId) {
@@ -229,7 +239,7 @@ export function ProjectsPage({ onOpenTestCases }) {
 
   const visibleProjects = useMemo(() => projects.filter((project) => {
     const sources = sourceMap[project.project_id] || []; const brdStatus = projectBrdStatus(sources.filter((source) => source.source_type === "brd")); const kbStatus = knowledgeLabel(dashboardMap[project.project_id]?.packages?.[0], brdStatus);
-    const haystack = `${project.project_name} ${brdStatus} ${kbStatus}`.toLowerCase();
+    const haystack = `${project.project_name} ${brdStatus} ${kbStatus} ${sources.filter((source) => source.source_type === "brd").map((brd) => brd.active_revision?.filename || brd.logical_name || "").join(" ")}`.toLowerCase();
     return (projectFilter === "all" || project.project_id === projectFilter)
       && haystack.includes(query.trim().toLowerCase())
       && (statusFilter === "all" || (statusFilter === "brd" ? brdStatus === "Ready" : statusFilter === "kb" ? kbStatus === "Ready" : brdStatus === "Not uploaded"));
@@ -246,7 +256,7 @@ export function ProjectsPage({ onOpenTestCases }) {
   useEffect(() => { setPage((current) => Math.min(current, totalPages)); }, [totalPages]);
 
   return <div className="projects-page">
-    <input ref={brdInput} type="file" hidden accept=".docx,.pdf,.txt,.md,.json,.yaml,.yml,.sql,.csv" onChange={uploadBrd} />
+    <input ref={brdInput} type="file" hidden multiple accept=".docx,.pdf,.txt,.md,.json,.yaml,.yml,.sql,.csv" onChange={uploadBrd} />
     <section className="project-intake-hero"><div className="project-intake-copy"><div className="eyebrow">PROCESS.BRD INTAKE</div><h1>Manage Projects &amp; Upload BRD</h1><p>Upload the project BRD and manage its complete version history.</p></div><div className="project-create-form"><label htmlFor="project-name">New project</label><div><input id="project-name" value={name} onChange={(event) => setName(event.target.value)} placeholder="Enter project name" onKeyDown={(event) => { if (event.key === "Enter") create(); }} /><button className="primary-button" onClick={create} disabled={busy || !name.trim()}>{busy ? <LoaderCircle className="spin" size={16} /> : <Plus size={16} />} Create project</button></div></div></section>
     <div className="project-list-toolbar">{projectFilter === "all" && <div className="project-search"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search projects" /></div>}<div className="project-filter-controls"><label className="project-filter-label">Project<AppSelect aria-label="Select project" value={projectFilter} onChange={(event) => { const value = event.target.value; setProjectFilter(value); if (value !== "all") setQuery(""); const selected = projects.find((item) => item.project_id === value); if (selected) localStorage.setItem("testiq_current_project", JSON.stringify(selected)); }}><option value="all">All projects</option>{projects.map((item) => <option key={item.project_id} value={item.project_id}>{item.project_name}</option>)}</AppSelect></label><label className="project-filter-label">Status<AppSelect aria-label="Filter projects by status" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="all">All Projects</option><option value="brd">BRD ready</option><option value="kb">Knowledge Base ready</option><option value="missing">Needs BRD</option></AppSelect></label><span>{visibleProjects.length} project{visibleProjects.length === 1 ? "" : "s"}</span></div></div>
     {error && <div className="error-message">{error}</div>}
@@ -280,7 +290,7 @@ export function ProjectsPage({ onOpenTestCases }) {
       return <article className="project-workspace-card" key={project.project_id}>
         <div className="project-card-top"><div className="project-card-identity"><span className="project-card-icon"><FolderPlus size={20} /></span><div><h2>{project.project_name}</h2><p>Created {project.created_at ? new Date(project.created_at).toLocaleDateString() : "recently"}</p></div></div><span className={`project-state-badge ${cardState.tone}`}>{cardState.tone === "ready" && <CheckCircle2 size={13} />}{cardState.label}</span></div>
         <section className="project-brd-collection" aria-label={`${project.project_name} BRDs`}>
-          <div className="project-brd-collection-head"><div><span className="project-status-label"><FileStack size={14} /> Business requirements</span><strong>{brds.length} BRD{brds.length === 1 ? "" : "s"}</strong></div></div>
+          <div className="project-brd-collection-head"><div><span className="project-status-label"><FileStack size={14} /> Business requirements</span><strong>{brds.length} BRD{brds.length === 1 ? "" : "s"}</strong></div><button type="button" className="secondary-button compact-button" onClick={() => chooseBrd(project)} disabled={busy || isProcessing || isGenerating}><CloudUpload size={14} /> Add BRD</button></div>
           {brds.length ? <div className="project-brd-list">{brds.map((brd) => {
             const activeRevision = brd.active_revision || {};
             const status = extractionLabel(brd);

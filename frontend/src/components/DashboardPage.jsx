@@ -11,7 +11,7 @@ const workflowDestinations = {
   "Source documents": "sources",
   "Business use cases": "business-requirements",
   "Knowledge Base": "knowledge-base",
-  "Requirements": "requirements",
+  "Functional Requirements": "requirements",
   "Test cases": "test-cases",
   "Test data": "test-data",
   "Test results": "test-results",
@@ -71,9 +71,9 @@ export function DashboardPage({ onNavigate }) {
 
   const workflow = useMemo(() => summary ? [
     { label: "Source documents", detail: `${summary.counts.sources} captured`, done: summary.counts.sources > 0 },
-    { label: "Business use cases", detail: summary.counts.business_rules ? `${summary.counts.business_rules - summary.counts.pending_business_rules}/${summary.counts.business_rules} reviewed` : "Waiting", done: summary.counts.business_rules > 0 && summary.counts.pending_business_rules === 0 },
+    { label: "Business use cases", detail: summary.counts.business_rules ? `${summary.counts.approved_business_rules}/${summary.counts.business_rules} approved` : "Waiting", done: summary.counts.business_rules > 0 && summary.counts.approved_business_rules > 0 && summary.counts.pending_business_rules === 0 },
     { label: "Knowledge Base", detail: summary.knowledge_base?.chunk_count ? `${summary.knowledge_base.chunk_count} chunks indexed` : "Not indexed", done: ["ready", "succeeded"].includes(summary.workflow.knowledge_base) },
-    { label: "Requirements", detail: `${summary.counts.approved_requirements}/${summary.counts.requirements} approved`, done: summary.counts.approved_requirements > 0 },
+    { label: "Functional Requirements", detail: `${summary.counts.approved_requirements}/${summary.counts.requirements} auto-approved`, done: summary.counts.requirements > 0 && summary.counts.approved_requirements === summary.counts.requirements },
     { label: "Test cases", detail: `${summary.counts.approved_test_cases}/${summary.counts.test_cases} approved`, done: summary.counts.approved_test_cases > 0 },
     { label: "Test data", detail: `${summary.counts.test_data_records} records`, done: summary.counts.test_data_records > 0 },
     { label: "Test results", detail: `${summary.counts.test_runs} runs`, done: summary.counts.test_runs > 0 },
@@ -91,10 +91,10 @@ export function DashboardPage({ onNavigate }) {
       <section className={`dashboard-hero ${summary.status}`}><div className="dashboard-hero-copy"><span className="dashboard-status"><span />{statusLabels[summary.status] || summary.status}</span><h2>{data.project.project_name}</h2><p>{summary.package_name || `Resource Package v${summary.package_version}`} · Version {summary.package_version} · Updated {dateLabel(summary.updated_at)}</p><button type="button" className="dashboard-hero-action" onClick={() => onNavigate(workflowDestinations[nextStage?.label] || "traceability")}>{summary.status === "delivered" ? "Open traceability" : "Continue workflow"}<ArrowRight size={15} /></button></div><div className="dashboard-progress-overview"><div className="dashboard-progress-ring" style={{ "--dashboard-progress": `${processPercent}%` }}><div><strong>{processPercent}%</strong><span>complete</span></div></div><div className="dashboard-next"><span>Next milestone</span><strong>{summary.next_milestone}</strong><small>{completedStages} of {workflow.length} stages complete</small></div></div></section>
       <section className="dashboard-metrics" aria-label="Package delivery metrics">
         <article><span className="dashboard-metric-icon coral"><FileStack size={16} /></span><div><span>Source documents</span><strong>{summary.counts.sources}</strong><small>Inputs captured</small></div></article>
-        <article><span className="dashboard-metric-icon blue"><ShieldCheck size={16} /></span><div><span>Business use cases</span><strong>{summary.counts.business_rules - summary.counts.pending_business_rules}<small> / {summary.counts.business_rules}</small></strong><small>Reviewed</small></div></article>
-        <article><span className="dashboard-metric-icon amber"><Target size={16} /></span><div><span>Requirements</span><strong>{summary.counts.approved_requirements}<small> / {summary.counts.requirements}</small></strong><small>Approved</small></div></article>
+        <article><span className="dashboard-metric-icon blue"><ShieldCheck size={16} /></span><div><span>Business use cases</span><strong>{summary.counts.approved_business_rules}<small> / {summary.counts.business_rules}</small></strong><small>Approved</small></div></article>
+        <article><span className="dashboard-metric-icon amber"><Target size={16} /></span><div><span>Functional requirements</span><strong>{summary.counts.approved_requirements}<small> / {summary.counts.requirements}</small></strong><small>Auto-approved</small></div></article>
         <article><span className="dashboard-metric-icon violet"><FileCheck2 size={16} /></span><div><span>Approved test cases</span><strong>{summary.counts.approved_test_cases}<small> / {summary.counts.test_cases}</small></strong><small>Generation output</small></div></article>
-        <article><span className="dashboard-metric-icon green"><Database size={16} /></span><div><span>Test data records</span><strong>{summary.counts.test_data_records}</strong><small>{summary.counts.saved_test_data_records} saved to Bronze</small></div></article>
+        <article><span className="dashboard-metric-icon green"><Database size={16} /></span><div><span>Test data records</span><strong>{summary.counts.test_data_records}</strong><small>{summary.counts.saved_test_data_records} saved to Raw layer</small></div></article>
         <article><span className="dashboard-metric-icon cyan"><PlayCircle size={16} /></span><div><span>Test execution</span><strong>{summary.counts.test_runs}</strong><small>Recorded runs</small></div></article>
       </section>
       <section className="dashboard-insight-grid"><article className={`dashboard-card dashboard-health-card ${summary.blockers.length ? "has-alerts" : "is-clear"}`}><div className="dashboard-card-heading"><div><span>DELIVERY HEALTH</span><h2>{summary.blockers.length ? `${summary.blockers.length} item${summary.blockers.length === 1 ? "" : "s"} need attention` : "Ready to move forward"}</h2></div>{summary.blockers.length ? <AlertTriangle size={18} /> : <Target size={18} />}</div>{summary.blockers.length ? <ul className="dashboard-blockers">{summary.blockers.map((blocker) => <li key={blocker}>{blocker}</li>)}</ul> : <p className="dashboard-clear"><CheckCircle2 size={15} /> No blockers detected for this package.</p>}</article>

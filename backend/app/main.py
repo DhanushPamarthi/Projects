@@ -4,10 +4,11 @@ import re
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from typing import Any
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
-from .config import BRONZE_SCHEMA, DATABASE_URL, EXTRACTION_CONFIG_VERSION, EXTRACTION_PROMPT_VERSION, LOCAL_EXTRACTOR_VERSION, MAX_UPLOAD_BYTES, OPENAI_MODEL, OPENAI_TIMEOUT_SECONDS, REQUIRED_BRD_SECTIONS, REQUIREMENTS_ANALYSIS_PROMPT_VERSION, SUPPORTED_EXTENSIONS, TEST_CASE_GENERATION_PROMPT_VERSION, TEST_CASE_OPENAI_TIMEOUT_SECONDS, UPLOAD_DIR
+from .config import AUTH_REQUIRED, BRONZE_SCHEMA, DATABASE_URL, EXTRACTION_CONFIG_VERSION, EXTRACTION_PROMPT_VERSION, LOCAL_EXTRACTOR_VERSION, MAX_UPLOAD_BYTES, OPENAI_MODEL, OPENAI_TIMEOUT_SECONDS, REQUIRED_BRD_SECTIONS, REQUIREMENTS_ANALYSIS_PROMPT_VERSION, SUPPORTED_EXTENSIONS, TEST_CASE_GENERATION_PROMPT_VERSION, TEST_CASE_OPENAI_TIMEOUT_SECONDS, UPLOAD_DIR
 from .openai_requests import responses_create
 from .token_usage import estimate_cost_usd, usage_scope, usage_step
 from .db import close_connection_pool, connection, init_db, warm_connection_pool
@@ -16,9 +17,31 @@ from .validation import validate_file_content
 from .knowledge_fabric import BuildIndexRequest, build_knowledge_index, retrieve_package_context
 from .knowledge_fabric import router as knowledge_fabric_router
 from .test_case_reuse import normalized as normalize_reuse_text, requirement_text as reuse_requirement_text, similarity as reuse_similarity
+from .auth import resolve_bearer_user
+from .auth import router as auth_router
+from starlette.concurrency import run_in_threadpool
 
 app = FastAPI(title="TestIQ Source Package API", version="1.0.0")
 app.include_router(knowledge_fabric_router)
+app.include_router(auth_router)
+
+
+@app.middleware("http")
+async def authenticate_api_requests(request: Request, call_next):
+    """Protect application API routes while leaving health, docs, and auth public."""
+    if request.url.path.startswith("/api/v1/"):
+        authorization = request.headers.get("authorization", "")
+        token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+        if AUTH_REQUIRED and not token:
+            return JSONResponse(status_code=401, content={"detail": "Sign in to access this workspace."})
+        if token:
+            user = await run_in_threadpool(resolve_bearer_user, token)
+            if not user:
+                return JSONResponse(status_code=401, content={"detail": "Your sign-in has expired. Please sign in again."})
+            request.state.user = user
+    return await call_next(request)
+
+
 SOURCE_TYPES = {"brd", "campaign_rules", "api_spec", "database_schema", "message_template", "ui_description"}
 logger = logging.getLogger(__name__)
 _ACTIVE_PACKAGE_AUTOMATIONS = set()
@@ -60,10 +83,10 @@ def _replace_package_rules_from_business_requirements(conn, package_id: str, bus
         references = _merge_source_references(item.get("source_references"), item.get("supporting_source_references"))
         reference = references[0] if references else {}
         conn.execute(
-            "INSERT INTO package_business_rule (rule_id,package_id,ordinal,statement,source_fragment_id,source_reference,impact_if_missing,status,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,'pending',%s,%s)",
+            "INSERT INTO package_business_rule (rule_id,package_id,ordinal,statement,source_fragment_id,source_reference,impact_if_missing,status,reviewer,review_comment,reviewed_at,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,'approved','system:auto','Auto-approved for the current workflow.',%s,%s,%s)",
             (_package_rule_id(package_id, business_id), package_id, ordinal, statement,
              reference.get("fragment_id"), reference.get("source_reference") or "BRD source package",
-             _business_rule_impact(statement), timestamp, timestamp),
+             _business_rule_impact(statement), timestamp, timestamp, timestamp),
         )
     _refresh_package_business_rule_summary(conn, package_id)
 
@@ -1230,6 +1253,146 @@ def _analysis_response(row, discovery_context_count=0):
     result["contract"] = _apply_discovery_readiness(contract, discovery_context_count)
     return result
 
+
+def _project_functional_requirement_history(conn, project_id):
+    """Return immutable Functional Requirement analyses with BRD and test-case lineage."""
+    analyses = conn.execute(
+        "SELECT a.analysis_id,a.package_id,a.analysis_version,a.status,a.contract_json,a.created_at,"
+        "m.package_version,m.package_name FROM requirement_analysis a "
+        "JOIN source_package_manifest m ON m.package_id=a.package_id "
+        "WHERE a.project_id=%s AND a.analysis_kind='functional' "
+        "ORDER BY m.package_version DESC,a.analysis_version DESC,a.created_at DESC", (project_id,)
+    ).fetchall()
+    if not analyses:
+        return []
+
+    package_ids = list(dict.fromkeys(row["package_id"] for row in analyses))
+    package_slots = ",".join("%s" for _ in package_ids)
+    source_rows = conn.execute(
+        "SELECT pi.package_id,pi.source_id,pi.revision_id,s.logical_name,r.filename,r.revision,r.owner_version "
+        "FROM source_package_item pi JOIN source_document s ON s.source_id=pi.source_id "
+        "JOIN source_revision r ON r.revision_id=pi.revision_id "
+        f"WHERE pi.package_id IN ({package_slots}) AND s.source_type='brd' "
+        "ORDER BY pi.package_id,r.revision", package_ids
+    ).fetchall()
+    brds_by_package = {}
+    for source in source_rows:
+        brds_by_package.setdefault(source["package_id"], []).append({
+            "source_id": source["source_id"], "revision_id": source["revision_id"],
+            "logical_name": source["logical_name"], "filename": source["filename"],
+            "revision": source["revision"], "owner_version": source["owner_version"],
+        })
+
+    generations = conn.execute(
+        "SELECT generation_id,analysis_id,package_id,contract_json,created_at "
+        "FROM test_case_generation WHERE project_id=%s ORDER BY created_at DESC", (project_id,)
+    ).fetchall()
+    generations_by_analysis = {}
+    for generation in generations:
+        generations_by_analysis.setdefault(generation["analysis_id"], []).append(generation)
+
+    result = []
+    for analysis in analyses:
+        contract = json.loads(analysis["contract_json"] or "{}")
+        test_cases_by_requirement = {}
+        for generation in generations_by_analysis.get(analysis["analysis_id"], []):
+            generation_contract = json.loads(generation["contract_json"] or "{}")
+            for case in generation_contract.get("test_cases", []):
+                requirement_id = case.get("requirement_id")
+                test_cases_by_requirement.setdefault(requirement_id, []).append({
+                    "generation_id": generation["generation_id"],
+                    "package_id": generation["package_id"],
+                    "test_case_id": case.get("test_case_id"),
+                    "title": case.get("title"),
+                    "review_status": case.get("review_status") or (case.get("approval") or {}).get("status") or "pending",
+                    "created_at": generation["created_at"],
+                })
+        requirements = []
+        for requirement in contract.get("requirements", []):
+            test_case_history = test_cases_by_requirement.get(requirement.get("requirement_id"), [])
+            requirements.append({**requirement, "test_case_history": test_case_history})
+        result.append({
+            "analysis_id": analysis["analysis_id"], "package_id": analysis["package_id"],
+            "analysis_version": analysis["analysis_version"], "package_version": analysis["package_version"],
+            "package_name": analysis["package_name"], "status": analysis["status"],
+            "created_at": analysis["created_at"], "brds": brds_by_package.get(analysis["package_id"], []),
+            "requirements": requirements,
+        })
+    return result
+
+
+def _functional_requirement_history_prompt(history, limit=120):
+    """Keep prior FRs available for comparison without treating them as evidence."""
+    result = []
+    for analysis in history:
+        for requirement in analysis.get("requirements", []):
+            result.append({
+                "previous_analysis_id": analysis["analysis_id"],
+                "previous_package_id": analysis["package_id"],
+                "previous_package_version": analysis.get("package_version"),
+                "previous_brd_versions": analysis.get("brds", []),
+                "requirement_id": requirement.get("requirement_id"),
+                "title": requirement.get("title"),
+                "statement": str(requirement.get("statement") or "")[:1600],
+                "acceptance_criteria": [
+                    {"scenario": item.get("scenario"), "given": item.get("given"), "when": item.get("when"), "then": item.get("then")}
+                    for item in requirement.get("acceptance_criteria", []) if isinstance(item, dict)
+                ][:8],
+                "previous_test_cases": [
+                    {"generation_id": item.get("generation_id"), "test_case_id": item.get("test_case_id"), "title": item.get("title")}
+                    for item in requirement.get("test_case_history", [])
+                ][:8],
+            })
+            if len(result) >= limit:
+                return result
+    return result
+
+
+def _attach_functional_requirement_lineage(contract, history):
+    """Link current FRs to similar prior FRs and their generated test cases."""
+    prior = []
+    for analysis in history:
+        for requirement in analysis.get("requirements", []):
+            text = reuse_requirement_text(requirement)
+            if text.strip():
+                prior.append((analysis, requirement, text))
+
+    counts = {"equivalent_candidate": 0, "related_candidate": 0, "new": 0}
+    for requirement in contract.get("requirements", []):
+        current_text = reuse_requirement_text(requirement)
+        matches = []
+        if current_text.strip():
+            for analysis, previous, previous_text in prior:
+                score = reuse_similarity(current_text, previous_text)
+                if score < 0.55:
+                    continue
+                matches.append({
+                    "previous_analysis_id": analysis["analysis_id"],
+                    "previous_package_id": analysis["package_id"],
+                    "previous_package_version": analysis.get("package_version"),
+                    "previous_analysis_version": analysis.get("analysis_version"),
+                    "previous_brd_versions": analysis.get("brds", []),
+                    "previous_requirement_id": previous.get("requirement_id"),
+                    "previous_title": previous.get("title"),
+                    "similarity": score,
+                    "relationship": "equivalent" if score >= 0.82 else "related_review",
+                    "previous_test_cases": previous.get("test_case_history", []),
+                })
+        matches.sort(key=lambda item: (item["similarity"], item["previous_package_version"] or 0), reverse=True)
+        matches = matches[:10]
+        best_score = matches[0]["similarity"] if matches else 0
+        classification = "equivalent_candidate" if best_score >= 0.82 else "related_candidate" if matches else "new"
+        counts[classification] += 1
+        requirement["history_lineage"] = {"classification": classification, "matches": matches}
+
+    contract["requirement_history_summary"] = {
+        "compared_previous_requirement_count": len(prior),
+        "equivalent_candidate_count": counts["equivalent_candidate"],
+        "related_candidate_count": counts["related_candidate"], "new_count": counts["new"],
+        "match_method": "title, statement, business-rule, and acceptance-criteria text similarity; links are review suggestions",
+    }
+    return contract
+
 def _review_items(contract):
     """Return the individually reviewable contract items, including legacy contracts."""
     items = []
@@ -1333,6 +1496,19 @@ def _case_source_refs(requirement):
         if ref.get("fragment_id") or ref.get("source_reference"):
             unique[(ref.get("fragment_id"), ref.get("source_reference"))] = {"fragment_id": ref.get("fragment_id"), "source_reference": ref.get("source_reference")}
     return list(unique.values())
+
+def _validate_case_citation_pairs(refs, valid_pairs, fragment_ids_by_reference, case_id, location):
+    """Require each test-case citation to preserve an exact source ID/reference pair."""
+    for ref in refs or []:
+        fragment_id = ref.get("fragment_id")
+        source_reference = ref.get("source_reference")
+        if not fragment_id and source_reference:
+            matching_ids = fragment_ids_by_reference.get(source_reference, set())
+            if len(matching_ids) == 1:
+                fragment_id = next(iter(matching_ids))
+                ref["fragment_id"] = fragment_id
+        if (fragment_id, source_reference) not in valid_pairs:
+            raise ValueError(f"test case {case_id} has an unknown or mismatched source citation in {location}")
 
 def _find_requirement_for_terms(approved_requirements, terms):
     for requirement in approved_requirements:
@@ -1530,7 +1706,7 @@ def _test_case_generation_input(approved_requirements, package, requested_count,
                 "Write exactly one action-oriented step for each numbered execution step, using the format Step 1:, Step 2:, and Step 3:.",
                 "For every step, populate actions[].data_inputs with the field names used by that step and include the same fields in data_needs.",
                 "List field-level test data such as member_id, member_status, prescription_id, prescription_status, refill_due_date, and validation_location without inventing actual production identifiers.",
-                "State the validation location explicitly in surfaces and expected_results, such as Gold layer, API response, database table, message queue, or audit log, only when supported by the source package.",
+                "State the validation location explicitly in surfaces and expected_results, such as Analytics layer, API response, database table, message queue, or audit log, only when supported by the source package.",
                 "Cite approved requirement, acceptance criterion, business rule, or knowledge context IDs in source.",
                 "Reference table or schema names only when supplied by source package or knowledge context.",
             ],
@@ -1577,6 +1753,84 @@ def _normalize_test_case_format(contract):
         for index, action in enumerate(case.get("actions") or [], 1):
             if isinstance(action, dict):
                 action["step"] = index
+
+
+_GENERIC_DATA_FIELD_TERMS = {
+    "id", "identifier", "value", "date", "time", "status", "type", "name", "number",
+    "code", "count", "flag", "ind", "indicator", "field", "data", "input", "record",
+}
+
+
+def _repair_test_case_data_alignment(contract):
+    """Map declared fields to actions only when their executable text supports the link.
+
+    This repairs an omitted machine-readable data_inputs entry, not the scenario:
+    it never invents fields, values, or actions. The validator still rejects
+    unknown inputs and fields for which no action can be identified.
+    """
+    findings = []
+    for case in contract.get("test_cases", []) or []:
+        steps = case.get("steps") or []
+        actions = case.get("actions") or []
+        if len(steps) != len(actions):
+            continue
+        needs = case.get("data_needs") or []
+        known_by_key = {}
+        for need in needs:
+            name = need if isinstance(need, str) else need.get("name") if isinstance(need, dict) else None
+            if str(name or "").strip():
+                known_by_key.setdefault(str(name).strip().casefold(), str(name).strip())
+        already_mapped = {
+            str(value).strip().casefold()
+            for action in actions if isinstance(action, dict)
+            for value in action.get("data_inputs", [])
+            if str(value).strip()
+        }
+        for key, name in known_by_key.items():
+            if key in already_mapped:
+                continue
+            field_terms = {
+                token[:-1] if len(token) > 4 and token.endswith("s") else token
+                for token in re.findall(r"[a-z0-9]+", key)
+            } - _GENERIC_DATA_FIELD_TERMS
+            if not field_terms:
+                continue
+            scores = []
+            for index, (step, action) in enumerate(zip(steps, actions)):
+                if not isinstance(action, dict):
+                    scores.append(0)
+                    continue
+                action_text = " ".join([
+                    str(step or ""), str(action.get("action") or ""),
+                    str(action.get("surface") or ""), str(action.get("actor") or ""),
+                ]).casefold()
+                action_terms = {
+                    token[:-1] if len(token) > 4 and token.endswith("s") else token
+                    for token in re.findall(r"[a-z0-9]+", action_text)
+                }
+                scores.append(len(field_terms & action_terms))
+            best_score = max(scores, default=0)
+            if best_score <= 0:
+                continue
+            mapped_steps = []
+            for index, score in enumerate(scores):
+                if score != best_score:
+                    continue
+                inputs = actions[index].setdefault("data_inputs", [])
+                if key not in {str(value).strip().casefold() for value in inputs}:
+                    inputs.append(name)
+                    mapped_steps.append(index + 1)
+            if mapped_steps:
+                findings.append({
+                    "finding_id": f"GEN-DATA-{len(findings) + 1:03d}",
+                    "type": "data_alignment_repaired",
+                    "severity": "medium",
+                    "status": "requires_qa_confirmation",
+                    "requirement_id": case.get("requirement_id"),
+                    "scenario": case.get("test_case_id"),
+                    "message": f"Mapped declared data field {name} to action step(s) {', '.join(map(str, mapped_steps))} based on matching field terms in the step/action text; QA should confirm the mapping.",
+                })
+    return findings
 
 def _sanitize_test_case_traceability(contract, approved_requirements):
     """Keep model traceability IDs scoped to each case's requirement.
@@ -1629,15 +1883,19 @@ def _validate_test_case_contract(contract, approved_requirements, requested_coun
     rag_fragment_ids = {item.get("original_fragment_id") or item.get("fragment_id") for item in (rag_context or {}).get("brd_fragments", []) + (rag_context or {}).get("technical_fragments", [])}
     rag_fragment_ids.discard(None)
     fragment_ids_by_reference = {}
+    valid_fragment_pairs = set()
     for requirement in approved_requirements:
         for ref in _case_source_refs(requirement):
             if ref.get("fragment_id") and ref.get("source_reference"):
                 fragment_ids_by_reference.setdefault(ref["source_reference"], set()).add(ref["fragment_id"])
+                valid_fragment_pairs.add((ref["fragment_id"], ref["source_reference"]))
     for fragment in (rag_context or {}).get("brd_fragments", []) + (rag_context or {}).get("technical_fragments", []):
         fragment_id = fragment.get("original_fragment_id") or fragment.get("fragment_id")
         source_reference = fragment.get("source_reference")
         if fragment_id and source_reference:
             fragment_ids_by_reference.setdefault(source_reference, set()).add(fragment_id)
+            valid_fragment_pairs.add((fragment_id, source_reference))
+
     plan, _ = _test_case_coverage_plan(approved_requirements, requested_count)
     required_categories = {item["category"] for item in plan if item["category"] != "requirement_validation"}
     generated_categories = {case.get("category") for case in contract["test_cases"]}
@@ -1728,13 +1986,19 @@ def _validate_test_case_contract(contract, approved_requirements, requested_coun
             for field in action.get("data_inputs", [])
             if str(field).strip()
         }
-        if action_data_names - data_names:
-            message = f"test case {case_id} data alignment: action data_inputs must be listed in data_needs"
-            if enforce_data_alignment:
-                raise ValueError(message)
-            quality_findings.append({"finding_id": f"GEN-{len(coverage_findings) + len(quality_findings) + 1:03d}", "type": "data_alignment", "severity": "medium", "status": "requires_qa_confirmation", "requirement_id": requirement_id, "scenario": case_id, "message": message})
-        if data_names - action_data_names:
-            message = f"test case {case_id} data alignment: every data_needs field must be used by an action data_inputs list"
+        data_alignment_issues = []
+        unlisted_inputs = sorted(action_data_names - data_names)
+        unused_needs = sorted(data_names - action_data_names)
+        if unlisted_inputs:
+            data_alignment_issues.append(
+                "action data_inputs must be listed in data_needs; unlisted inputs: " + ", ".join(unlisted_inputs)
+            )
+        if unused_needs:
+            data_alignment_issues.append(
+                "every data_needs field must be used by an action data_inputs list; unmapped fields: " + ", ".join(unused_needs)
+            )
+        if data_alignment_issues:
+            message = f"test case {case_id} data alignment: " + "; ".join(data_alignment_issues)
             if enforce_data_alignment:
                 raise ValueError(message)
             quality_findings.append({"finding_id": f"GEN-{len(coverage_findings) + len(quality_findings) + 1:03d}", "type": "data_alignment", "severity": "medium", "status": "requires_qa_confirmation", "requirement_id": requirement_id, "scenario": case_id, "message": message})
@@ -1745,8 +2009,6 @@ def _validate_test_case_contract(contract, approved_requirements, requested_coun
         criterion_ids = {x.get("acceptance_id") for x in item.get("acceptance_criteria", []) if isinstance(x, dict)}
         rule_ids = {x.get("rule_id") for x in item.get("business_rules", []) if isinstance(x, dict)}
         context_ids = {context["context_id"] for context in discovery_contexts}
-        valid_evidence_ids = {requirement_id, *criterion_ids, *rule_ids, *context_ids, *rag_fragment_ids}
-        valid_fragments = {ref.get("fragment_id") for ref in _case_source_refs(item) if ref.get("fragment_id")} | rag_fragment_ids
         invalid_acceptance_ids = sorted(set(test_case.get("acceptance_criteria_ids", [])) - criterion_ids)
         invalid_rule_ids = sorted(set(test_case.get("business_rule_ids", [])) - rule_ids)
         if invalid_acceptance_ids or invalid_rule_ids:
@@ -1786,23 +2048,12 @@ def _validate_test_case_contract(contract, approved_requirements, requested_coun
             evidence_refs = evidence.get("source_references") or []
             if not evidence_refs:
                 raise ValueError(f"AI returned uncited evidence for {case_id}")
-            if valid_fragments:
-                for ref in evidence_refs:
-                    fragment_id = ref.get("fragment_id")
-                    if fragment_id not in valid_fragments:
-                        matching_ids = fragment_ids_by_reference.get(ref.get("source_reference"), set())
-                        if len(matching_ids) == 1:
-                            ref["fragment_id"] = next(iter(matching_ids))
-                            fragment_id = ref["fragment_id"]
-                    if not fragment_id or fragment_id not in valid_fragments:
-                        raise ValueError(f"AI returned an unknown source fragment in evidence for {case_id}")
+            _validate_case_citation_pairs(evidence_refs, valid_fragment_pairs, fragment_ids_by_reference, case_id, "evidence")
         for assertion in test_case.get("assertions", []):
             if assertion.get("evidence_id") not in evidence_record_ids:
                 raise ValueError(f"AI returned an assertion with an unknown evidence-record id for {case_id}")
-        if valid_fragments:
-            for ref in test_case.get("source_references", []):
-                if ref.get("fragment_id") and ref.get("fragment_id") not in valid_fragments:
-                    raise ValueError(f"AI returned an unknown source fragment for {case_id}")
+        if test_case.get("source_references"):
+            _validate_case_citation_pairs(test_case["source_references"], valid_fragment_pairs, fragment_ids_by_reference, case_id, "source_references")
     return coverage_findings + quality_findings
 
 @usage_step("test_cases")
@@ -1932,6 +2183,7 @@ def _test_cases_with_openai(approved_requirements, package, requested_count, dis
             _deduplicate_generated_test_cases(contract)
             _ensure_default_case_categories(contract)
             _normalize_test_case_format(contract)
+            data_alignment_findings = _repair_test_case_data_alignment(contract)
             traceability_findings = _sanitize_test_case_traceability(contract, approved_requirements)
             coverage_findings = _validate_test_case_contract(contract, approved_requirements, requested_count, discovery_contexts, rag_context)
             if requested_count is None:
@@ -1947,7 +2199,7 @@ def _test_cases_with_openai(approved_requirements, package, requested_count, dis
                     raise ValueError(f"acceptance criterion coverage: {scenario}. {missed_coverage.get('message', '')}")
                 if scenario.startswith("BR-"):
                     raise ValueError(f"business rule coverage: {scenario}. {missed_coverage.get('message', '')}")
-            all_findings = traceability_findings + coverage_findings
+            all_findings = data_alignment_findings + traceability_findings + coverage_findings
             contract["agent_attempts"] = [{"attempt": attempt, "status": "passed_with_findings" if all_findings else "passed", "details": "Schema and evidence validation passed; generation findings require QA confirmation." if all_findings else "Schema, evidence, and coverage validation passed."}]
             contract.setdefault("global_gaps", []).extend(payload["context"]["gaps"] + payload.get("coverage_gaps", []))
             contract["generation_findings"] = all_findings
@@ -2522,7 +2774,7 @@ def list_project_workspace_summaries():
                     "owner_version": brd_row["owner_version"], "status": brd_row["revision_status"],
                 } if brd_row["revision_id"] else None),
             })
-        brd = project_brds[0] if project_brds else None
+        brd = project_brds[-1] if project_brds else None
         package = package_by_project.get(project["project_id"])
         latest_package = None
         if package:
@@ -2823,7 +3075,7 @@ def get_project_dashboard(project_id: str, package_id: str | None = None):
             rule_counts = {row["status"]: row["count"] for row in rules}
             indexes = conn.execute("SELECT * FROM knowledge_index WHERE package_id=%s ORDER BY knowledge_version DESC,created_at DESC", (pid,)).fetchall()
             index = row_dict(indexes[0]) if indexes else None
-            analyses = conn.execute("SELECT * FROM requirement_analysis WHERE package_id=%s ORDER BY analysis_version DESC,created_at DESC", (pid,)).fetchall()
+            analyses = conn.execute("SELECT * FROM requirement_analysis WHERE package_id=%s AND analysis_kind!='business' ORDER BY analysis_version DESC,created_at DESC", (pid,)).fetchall()
             analysis = row_dict(analyses[0]) if analyses else None
             business_analysis_row = conn.execute(
                 "SELECT status,analysis_id,updated_at FROM requirement_analysis WHERE package_id=%s AND analysis_kind='business' ORDER BY analysis_version DESC,created_at DESC LIMIT 1",
@@ -2837,6 +3089,10 @@ def get_project_dashboard(project_id: str, package_id: str | None = None):
                 approved_ids = set(contract.get("approved_items", []))
                 requirements_total = len(requirements)
                 requirements_approved = sum(1 for item in requirements if item.get("requirement_id") in approved_ids or item.get("approved") is True or item.get("review_status") == "approved")
+                if contract.get("functional_requirements_generation") and not contract.get("review_metadata"):
+                    # Older generated Functional Requirements are auto-approved
+                    # working context unless a human review record exists.
+                    requirements_approved = requirements_total
             generations = conn.execute("SELECT * FROM test_case_generation WHERE package_id=%s ORDER BY created_at DESC", (pid,)).fetchall()
             generation = row_dict(generations[0]) if generations else None
             cases_total = cases_approved = data_count = saved_data_count = 0
@@ -2872,15 +3128,15 @@ def get_project_dashboard(project_id: str, package_id: str | None = None):
             if saved_data_count:
                 next_milestone = "Review execution results"
             elif generation and data_count:
-                next_milestone = "Save approved test data to Bronze"
+                next_milestone = "Save approved test data to the target data platform"
             elif generation:
                 next_milestone = "Prepare test data"
             elif analysis and requirements_total:
-                next_milestone = "Review requirements and generate test cases"
+                next_milestone = "Generate test cases from Functional Requirements"
             elif index and index.get("status") in {"ready", "succeeded"}:
-                next_milestone = "Generate and review requirements"
+                next_milestone = "Generate Functional Requirements"
             elif rule_counts.get("pending", 0):
-                next_milestone = "Review business rules"
+                next_milestone = "Prepare Business use cases"
             else:
                 next_milestone = "Build the Knowledge Base"
             automation_stage = package.get("automation_stage") or "not_started"
@@ -2892,7 +3148,7 @@ def get_project_dashboard(project_id: str, package_id: str | None = None):
             summaries.append({
                 **package, "automation_stage": automation_stage,
                 "status": overall_status,
-                "counts": {"sources": package.get("source_count", 0), "business_rules": sum(rule_counts.values()), "pending_business_rules": rule_counts.get("pending", 0), "requirements": requirements_total, "approved_requirements": requirements_approved, "test_cases": cases_total, "approved_test_cases": cases_approved, "test_data_records": data_count, "saved_test_data_records": saved_data_count, "test_runs": sum(execution_counts.values())},
+                "counts": {"sources": package.get("source_count", 0), "business_rules": sum(rule_counts.values()), "approved_business_rules": rule_counts.get("approved", 0), "pending_business_rules": rule_counts.get("pending", 0), "rejected_business_rules": rule_counts.get("rejected", 0), "requirements": requirements_total, "approved_requirements": requirements_approved, "test_cases": cases_total, "approved_test_cases": cases_approved, "test_data_records": data_count, "saved_test_data_records": saved_data_count, "test_runs": sum(execution_counts.values())},
                 "workflow": {"package_processing": automation_stage, "business_use_cases": business_analysis.get("status", "not_started") if business_analysis else "not_started", "knowledge_base": index.get("status", "not_started") if index else "not_started", "requirements": analysis.get("status", "not_started") if analysis else "not_started", "test_cases": generation.get("status", "not_started") if generation else "not_started", "test_data": "ready" if data_count else "not_started"},
                 "automation": {"stage": automation_stage, "error": package.get("automation_error"), "business_use_cases_analysis_id": business_analysis.get("analysis_id") if business_analysis else None},
                 "knowledge_base": ({"status": index.get("status"), "knowledge_version": index.get("knowledge_version"), "chunk_count": index.get("chunk_count", 0), "node_count": index.get("node_count", 0), "edge_count": index.get("edge_count", 0), "updated_at": index.get("created_at")} if index else None),
@@ -3198,8 +3454,8 @@ def _business_requirements_to_review_contract(package, items, business_items, mo
             "priority": item.get("priority") or "Must have",
             "data_entities": item.get("data_entities") or [],
             "source_references": _merge_source_references(item.get("source_references"), item.get("supporting_source_references")),
-            "approved": False,
-            "review_status": "pending",
+            "approved": True,
+            "review_status": "approved",
         }
         for item in business_items
     ]
@@ -3213,16 +3469,18 @@ def _business_requirements_to_review_contract(package, items, business_items, mo
             "requirement_id": "BRD-001",
             "title": "Business requirement scope",
             "type": "Business",
-            "statement": "Review the deduplicated business use cases extracted from the BRD and supporting source package.",
+            "statement": "Deduplicated business use cases extracted from the BRD and supporting source package.",
             "priority": "Must have",
             "actors": [],
             "entities": sorted({entity for item in business_items for entity in item.get("data_entities", [])}),
             "business_rules": rules,
-            "acceptance_criteria": [{"acceptance_id": "AC-001", "given": "A source package has been created.", "when": "Business requirements are reviewed.", "then": "Approved business requirements define the scope for Functional Requirements.", "source_references": source_refs or []}],
-            "flow_steps": ["Extract BRD business intent", "Consolidate duplicates", "Review and approve business scope"],
+            "acceptance_criteria": [{"acceptance_id": "AC-001", "given": "A source package has been created.", "when": "Business use cases are generated.", "then": "Generated business use cases define the scope for Functional Requirements.", "source_references": source_refs or [], "approved": True, "review_status": "approved"}],
+            "flow_steps": ["Extract BRD business intent", "Consolidate duplicates", "Auto-approve generated business scope"],
             "ambiguities": [],
             "assumptions": [],
             "source_references": source_refs or [],
+            "approved": True,
+            "review_status": "approved",
         }],
         "business_requirements": business_items,
         "global_gaps": [],
@@ -3238,6 +3496,16 @@ def _business_requirements_to_review_contract(package, items, business_items, mo
     if note:
         contract["generation_note"] = note
         contract["global_gaps"].append(note)
+    approved_items = []
+    for item_id, item, _ in _review_items(contract):
+        item["approved"] = True
+        item["review_status"] = "approved"
+        approved_items.append(item_id)
+    contract["approved_items"] = approved_items
+    contract["rejected_items"] = []
+    contract["pending_items"] = []
+    contract["auto_approved"] = True
+    contract["review_metadata"] = {"reviewer": "system:auto", "decision": "approved", "comments": "Auto-approved for the current workflow.", "reviewed_at": now()}
     contract["readiness"] = _contract_readiness(contract)
     return contract
 
@@ -3376,7 +3644,7 @@ def _functional_requirement_schema():
     return schema
 
 @usage_step("functional_requirements")
-def _generate_functional_contract(package, items, fragments, approved_business_requirements, rag_context):
+def _generate_functional_contract(package, items, fragments, approved_business_requirements, rag_context, previous_functional_requirements=None):
     key = os.getenv("OPENAI_API_KEY")
     if not key:
         raise RuntimeError("OPENAI_API_KEY is not configured")
@@ -3428,10 +3696,13 @@ def _generate_functional_contract(package, items, fragments, approved_business_r
     payload = {
         "source_business_rules": approved_business_requirements,
         "retrieved_knowledge_base_evidence": retrieved_evidence,
+        "previous_functional_requirements": previous_functional_requirements or [],
     }
     prompt = (
         "Generate internal functional behavior context using only the source_business_rules and retrieved_knowledge_base_evidence below. "
         "The source rules define the allowed scope. Use the Knowledge Base to provide the package context, system behavior, entities, rules, and implementation detail needed to make each requirement testable. "
+        "Before drafting, compare the current scope with previous_functional_requirements. They are historical comparison records only: do not treat them as evidence, do not cite them, and do not carry forward behavior unsupported by current source_business_rules and retrieved_knowledge_base_evidence. "
+        "When the current evidence supports the same behavior as a previous requirement, represent that behavior once in the current contract and avoid creating a duplicate. Generate a new requirement for genuinely new behavior, and represent changed behavior from current evidence while allowing the system to link it to its prior version. "
         "Do not use or infer from any other package sources or structured context. Do not expand scope beyond the source rules. Merge the same functional behavior when it appears in multiple selected BRDs, include its combined evidence, and return it only once. "
         "Every requirement must link to one or more supplied business_requirement_ids and cite only source fragments from the source rules or retrieved Knowledge Base evidence. "
         "Set knowledge_context_ids to an empty array; cite Knowledge Base evidence using source_references. Create clear system behaviors, business rules, flow steps, testable acceptance criteria, and at least one observable expected outcome for every requirement. "
@@ -3517,13 +3788,13 @@ def _generate_functional_contract(package, items, fragments, approved_business_r
     contract["conflicts"] = contract.get("conflicting_requirements", [])
     return contract
 
-def _generate_functional_contract_with_timeout(package, items, fragments, approved_business_requirements, rag_context):
+def _generate_functional_contract_with_timeout(package, items, fragments, approved_business_requirements, rag_context, previous_functional_requirements=None):
     result, failure = [], []
 
     def run():
         try:
             with usage_scope("functional_requirements", project_id=package.get("project_id"), package_id=package.get("package_id")):
-                result.append(_generate_functional_contract(package, items, fragments, approved_business_requirements, rag_context))
+                result.append(_generate_functional_contract(package, items, fragments, approved_business_requirements, rag_context, previous_functional_requirements))
         except Exception as exc:
             failure.append(exc)
 
@@ -3585,6 +3856,29 @@ def _build_internal_generation_context(package, items, fragments, source_rules):
     }
 
 
+def _auto_approve_functional_requirements(contract: dict, timestamp: str | None = None) -> dict:
+    """Treat generated Functional Requirements as approved working context for now."""
+    approved_items = []
+    for item_id, item, _ in _review_items(contract):
+        item["approved"] = True
+        item["review_status"] = "approved"
+        approved_items.append(item_id)
+    for requirement in contract.get("requirements", []):
+        requirement["approved"] = True
+        requirement["review_status"] = "approved"
+    contract["approved_items"] = approved_items
+    contract["rejected_items"] = []
+    contract["pending_items"] = []
+    contract["auto_approved"] = True
+    contract["review_metadata"] = {
+        "reviewer": "system:auto",
+        "decision": "approved",
+        "comments": "Auto-approved for the current workflow.",
+        "reviewed_at": timestamp or now(),
+    }
+    return contract
+
+
 @app.post("/api/v1/packages/{package_id}/functional-requirements/generate", status_code=201)
 @usage_step("functional_requirements")
 def generate_functional_requirements(package_id: str, regenerate: bool = False):
@@ -3600,6 +3894,11 @@ def generate_functional_requirements(package_id: str, regenerate: bool = False):
                 if (prior_contract.get("knowledge_index_id") == current_index["index_id"] and
                     prior_contract.get("generation_model") == OPENAI_MODEL and
                     prior_contract.get("prompt_version") == REQUIREMENTS_ANALYSIS_PROMPT_VERSION):
+                    if not prior_contract.get("review_metadata"):
+                        _auto_approve_functional_requirements(prior_contract, now())
+                        conn.execute("UPDATE requirement_analysis SET status='approved',contract_json=%s,updated_at=%s WHERE analysis_id=%s",
+                                     (json.dumps(prior_contract), now(), previous["analysis_id"]))
+                        previous = conn.execute("SELECT * FROM requirement_analysis WHERE analysis_id=%s", (previous["analysis_id"],)).fetchone()
                     return _analysis_response(previous, 0)
         source_items = conn.execute("SELECT pi.*,s.logical_name,s.source_type,r.sha256,e.status AS extraction_status FROM source_package_item pi JOIN source_document s ON s.source_id=pi.source_id JOIN source_revision r ON r.revision_id=pi.revision_id LEFT JOIN source_extraction e ON e.revision_id=pi.revision_id WHERE pi.package_id=%s", (package_id,)).fetchall()
         not_ready = [item["logical_name"] for item in source_items if item["extraction_status"] != "succeeded"]
@@ -3613,6 +3912,7 @@ def generate_functional_requirements(package_id: str, regenerate: bool = False):
         source_types = {item["revision_id"]: item["source_type"] for item in item_rows}
         for fragment in fragment_rows:
             fragment["source_type"] = source_types.get(fragment.get("revision_id"))
+        functional_history = _project_functional_requirement_history(conn, package_row["project_id"])
     try:
         rag = _require_package_context(package_id, requested_by="Functional Requirements")
         if not rag.get("brd_fragments"):
@@ -3625,7 +3925,11 @@ def generate_functional_requirements(package_id: str, regenerate: bool = False):
             raise HTTPException(422, "The LLM returned no business requirements from the BRD evidence")
         business_items = [{**item, "text": str(item.get("text") or item.get("description") or item.get("business_use_case") or "").strip()}
                           for item in business_items]
-        contract = _generate_functional_contract_with_timeout(package_row, item_rows, fragment_rows, business_items, rag)
+        previous_functional_requirements = _functional_requirement_history_prompt(functional_history)
+        contract = _generate_functional_contract_with_timeout(
+            package_row, item_rows, fragment_rows, business_items, rag, previous_functional_requirements
+        )
+        contract = _attach_functional_requirement_lineage(contract, functional_history)
     except HTTPException:
         raise
     except Exception as exc:
@@ -3640,7 +3944,8 @@ def generate_functional_requirements(package_id: str, regenerate: bool = False):
     with connection() as conn:
         version = conn.execute("SELECT COALESCE(MAX(analysis_version),0)+1 AS v FROM requirement_analysis WHERE package_id=%s", (package_id,)).fetchone()["v"]
         analysis_id, timestamp = uid("req"), now()
-        conn.execute("INSERT INTO requirement_analysis (analysis_id,package_id,project_id,analysis_version,status,analysis_kind,contract_json,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)", (analysis_id, package_id, package_row["project_id"], version, "generated", "functional", json.dumps(contract), timestamp, timestamp))
+        _auto_approve_functional_requirements(contract, timestamp)
+        conn.execute("INSERT INTO requirement_analysis (analysis_id,package_id,project_id,analysis_version,status,analysis_kind,contract_json,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)", (analysis_id, package_id, package_row["project_id"], version, "approved", "functional", json.dumps(contract), timestamp, timestamp))
         return _analysis_response(conn.execute("SELECT * FROM requirement_analysis WHERE analysis_id=%s", (analysis_id,)).fetchone(), 0)
 
 
@@ -3689,7 +3994,7 @@ def generate_business_requirements(package_id: str):
         _replace_package_rules_from_business_requirements(conn, package_id, contract.get("business_requirements", []))
         version = conn.execute("SELECT COALESCE(MAX(analysis_version),0)+1 AS v FROM requirement_analysis WHERE package_id=%s", (package_id,)).fetchone()["v"]
         analysis_id, timestamp = uid("req"), now()
-        conn.execute("INSERT INTO requirement_analysis (analysis_id,package_id,project_id,analysis_version,status,analysis_kind,contract_json,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)", (analysis_id, package_id, package_row["project_id"], version, "needs_review", "business", json.dumps(contract), timestamp, timestamp))
+        conn.execute("INSERT INTO requirement_analysis (analysis_id,package_id,project_id,analysis_version,status,analysis_kind,contract_json,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)", (analysis_id, package_id, package_row["project_id"], version, "approved", "business", json.dumps(contract), timestamp, timestamp))
         discovery_count = _discovery_context_count(conn, package_row["project_id"], package_id)
         return _analysis_response(conn.execute("SELECT * FROM requirement_analysis WHERE analysis_id=%s", (analysis_id,)).fetchone(), discovery_count)
 
@@ -3731,6 +4036,14 @@ def list_requirement_analyses(package_id: str):
         package = conn.execute("SELECT * FROM source_package_manifest WHERE package_id=%s", (package_id,)).fetchone()
         discovery_count = _discovery_context_count(conn, package["project_id"], package_id) if package else 0
         return [_analysis_response(x, discovery_count) for x in conn.execute("SELECT * FROM requirement_analysis WHERE package_id=%s ORDER BY analysis_version DESC",(package_id,)).fetchall()]
+
+@app.get("/api/v1/projects/{project_id}/functional-requirement-history")
+def list_project_functional_requirement_history(project_id: str):
+    with connection() as conn:
+        if not conn.execute("SELECT 1 FROM project WHERE project_id=%s", (project_id,)).fetchone():
+            raise HTTPException(404, "Project not found")
+        analyses = _project_functional_requirement_history(conn, project_id)
+        return {"project_id": project_id, "analyses": analyses}
 
 @app.get("/api/v1/packages/{package_id}/requirements/latest-set")
 def get_latest_requirement_analyses(package_id: str):
@@ -3910,6 +4223,73 @@ def list_project_test_case_history(project_id: str):
                  "test_case_count": len(json.loads(row["contract_json"]).get("test_cases", []))}
                 for row in rows]
 
+def _project_case_equivalent(left, right):
+    """Conservative content match for cumulative history across package versions."""
+    def joined(values):
+        return " ".join(str(value) for value in values or [] if value is not None)
+    left_title, right_title = normalize_reuse_text(left.get("title")), normalize_reuse_text(right.get("title"))
+    left_steps = normalize_reuse_text(joined(left.get("steps")))
+    right_steps = normalize_reuse_text(joined(right.get("steps")))
+    left_expected = normalize_reuse_text(joined(left.get("expected_results")))
+    right_expected = normalize_reuse_text(joined(right.get("expected_results")))
+    if left_title and left_title == right_title and left_steps == right_steps and left_expected == right_expected:
+        return True
+    return bool(left_title and right_title and left_steps and right_steps and left_expected and right_expected
+                and reuse_similarity(left_title, right_title) >= 0.94
+                and reuse_similarity(left_steps, right_steps) >= 0.92
+                and reuse_similarity(left_expected, right_expected) >= 0.92)
+
+@app.get("/api/v1/projects/{project_id}/test-cases")
+def list_project_test_cases(project_id: str, package_version: int | None = None):
+    """Return a cumulative unique set, or unique cases scoped to one package/BRD version."""
+    with connection() as conn:
+        if not conn.execute("SELECT 1 FROM project WHERE project_id=%s", (project_id,)).fetchone():
+            raise HTTPException(404, "Project not found")
+        packages = conn.execute(
+            "SELECT package_version,package_name,created_at FROM source_package_manifest "
+            "WHERE project_id=%s ORDER BY package_version DESC", (project_id,)).fetchall()
+        by_version = {row["package_version"]: {"package_version": row["package_version"], "package_name": row["package_name"],
+                                                 "created_at": row["created_at"], "test_case_count": 0}
+                      for row in packages}
+        rows = conn.execute(
+            "SELECT g.generation_id,g.package_id,g.contract_json,g.created_at,m.package_version,m.package_name "
+            "FROM test_case_generation g JOIN source_package_manifest m ON m.package_id=g.package_id "
+            "WHERE g.project_id=%s ORDER BY g.created_at,g.generation_id", (project_id,)).fetchall()
+        records = []
+        for row in rows:
+            version = row["package_version"]
+            contract = json.loads(row["contract_json"] or "{}")
+            version_entry = by_version.setdefault(version, {"package_version": version, "package_name": row["package_name"], "created_at": row["created_at"], "test_case_count": 0})
+            version_entry["test_case_count"] += len(contract.get("test_cases", []))
+            for case in contract.get("test_cases", []):
+                records.append({"case": case, "origin": "generated", "generation_id": row["generation_id"],
+                                "package_id": row["package_id"], "package_version": version,
+                                "created_at": row["created_at"]})
+        if package_version is not None:
+            records = [item for item in records if item["package_version"] == package_version]
+        else:
+            for row in conn.execute("SELECT * FROM external_test_case WHERE project_id=%s ORDER BY created_at", (project_id,)).fetchall():
+                records.append({"case": json.loads(row["case_json"] or "{}"), "origin": "external",
+                                "source_name": row["source_name"], "created_at": row["created_at"], "package_version": None})
+        cases = []
+        for record in records:
+            duplicate = next((item for item in cases if _project_case_equivalent(item["case"], record["case"])), None)
+            if duplicate:
+                if record["package_version"] is not None and record["package_version"] not in duplicate["package_versions"]:
+                    duplicate["package_versions"].append(record["package_version"])
+                if record.get("generation_id") and record["generation_id"] not in duplicate["generation_ids"]:
+                    duplicate["generation_ids"].append(record["generation_id"])
+                if record.get("origin") == "external":
+                    duplicate["sources"].append(record.get("source_name") or "External import")
+                continue
+            cases.append({**record, "case": record["case"],
+                          "package_versions": [record["package_version"]] if record["package_version"] is not None else [],
+                          "generation_ids": [record["generation_id"]] if record.get("generation_id") else [],
+                          "sources": [record.get("source_name")] if record.get("source_name") else []})
+        return {"project_id": project_id, "scope": "version" if package_version is not None else "cumulative",
+                "package_version": package_version, "versions": sorted(by_version.values(), key=lambda item: item["package_version"], reverse=True),
+                "cases": cases, "unique_case_count": len(cases)}
+
 @app.post("/api/v1/projects/{project_id}/external-test-cases", status_code=201)
 def import_external_test_cases(project_id: str, request: ExternalTestCaseImport):
     with connection() as conn:
@@ -3993,7 +4373,30 @@ def generate_test_cases_from_analysis(analysis_id: str, request: TestCaseGenerat
             _raise_test_case_generation_error(exc, "Test Case generation")
         generation_id, timestamp = uid("tcg"), now()
         requirement_contract_hash = hashlib.sha256(json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-        generated.update({"contract_version": "1.0", "generation_id": generation_id, "analysis_id": analysis_id, "analysis_version": analysis["analysis_version"], "project_id": analysis["project_id"], "requirement_contract_hash": requirement_contract_hash, "package_id": package["package_id"], "package_version": package["package_version"], "source_package_run_id": package["run_id"], "requested_test_case_count": len(generated.get("test_cases", [])), "count_strategy": "derived_from_functional_requirements_and_distinct_supported_conditions" if requested_count is None else "user_requested", "generation_mode": "reuse_only" if not pending_requirements else "openai_with_reuse" if reuse_audit else "openai", "generation_model": OPENAI_MODEL if pending_requirements else None, "generation_prompt_version": TEST_CASE_GENERATION_PROMPT_VERSION, "generation_prompt_hash": test_case_generation_prompt_hash(), "generated_at": timestamp, "approved_requirement_ids": [item["requirement_id"] for item in approved_requirements], "source_package_items": contract.get("source_package_items", []), "discovery_contexts": discovery_contexts, "discovery_context_ids": [context["context_id"] for context in discovery_contexts], "rag_metadata": _rag_metadata_or_none(rag), "rag_status": _rag_status(rag, required=True)})
+        requirements_by_id = {item.get("requirement_id"): item for item in contract.get("requirements", [])}
+        for test_case in generated.get("test_cases", []):
+            requirement = requirements_by_id.get(test_case.get("requirement_id"))
+            if requirement:
+                lineage = requirement.get("history_lineage") or {"classification": "new", "matches": []}
+                previous_matches = [{
+                    "previous_analysis_id": match.get("previous_analysis_id"),
+                    "previous_package_id": match.get("previous_package_id"),
+                    "previous_package_version": match.get("previous_package_version"),
+                    "previous_requirement_id": match.get("previous_requirement_id"),
+                    "similarity": match.get("similarity"),
+                    "relationship": match.get("relationship"),
+                    "previous_test_cases": [
+                        {"generation_id": case.get("generation_id"), "test_case_id": case.get("test_case_id")}
+                        for case in match.get("previous_test_cases", [])
+                    ],
+                } for match in lineage.get("matches", [])]
+                test_case["functional_requirement_trace"] = {
+                    "analysis_id": analysis_id, "package_id": package["package_id"],
+                    "requirement_id": requirement.get("requirement_id"),
+                    "classification": lineage.get("classification", "new"),
+                    "previous_matches": previous_matches,
+                }
+        generated.update({"contract_version": "1.0", "generation_id": generation_id, "analysis_id": analysis_id, "analysis_version": analysis["analysis_version"], "project_id": analysis["project_id"], "requirement_contract_hash": requirement_contract_hash, "package_id": package["package_id"], "package_version": package["package_version"], "source_package_run_id": package["run_id"], "requested_test_case_count": len(generated.get("test_cases", [])), "count_strategy": "derived_from_functional_requirements_and_distinct_supported_conditions" if requested_count is None else "user_requested", "generation_mode": "reuse_only" if not pending_requirements else "openai_with_reuse" if reuse_audit else "openai", "generation_model": OPENAI_MODEL if pending_requirements else None, "generation_prompt_version": TEST_CASE_GENERATION_PROMPT_VERSION, "generation_prompt_hash": test_case_generation_prompt_hash(), "generated_at": timestamp, "approved_requirement_ids": [item["requirement_id"] for item in approved_requirements], "source_package_items": contract.get("source_package_items", []), "requirement_history_summary": contract.get("requirement_history_summary", {}), "discovery_contexts": discovery_contexts, "discovery_context_ids": [context["context_id"] for context in discovery_contexts], "rag_metadata": _rag_metadata_or_none(rag), "rag_status": _rag_status(rag, required=True)})
         for test_case in generated.get("test_cases", []):
             test_case["review_status"] = "pending"
             test_case["approved"] = False
@@ -4305,7 +4708,7 @@ def execute_run(run_id: str, request: ExecutionRunExecuteRequest | None = None):
         comments = request.comments if request else None
         observations.append({
             "type": "execution_started",
-            "message": "Execution check started for CDP's Bronze, Silver, Gold, and Transport outputs for each selected test case.",
+            "message": "Execution check started for Raw, Curated, Analytics, and Transport outputs on the target data platform for each selected test case.",
             "created_at": started_at,
             "reviewer": reviewer or row["reviewer"],
             "comments": comments,
@@ -4328,7 +4731,7 @@ def execute_run(run_id: str, request: ExecutionRunExecuteRequest | None = None):
         failed = sum(status == "failed" for status in statuses)
         pending = sum(status == "pending" for status in statuses)
         waiting_for_cdp = pending > 0
-        message = (f"Waiting for CDP to finish processing {pending} test case(s). Run this check again when its layer processing completes."
+        message = (f"Waiting for the target data platform to finish processing {pending} test case(s). Run this check again when its layer processing completes."
                    if waiting_for_cdp else f"Execution completed with {passed} passed and {failed} failed test case(s).")
         observations.append({
             "type": "execution_waiting_for_cdp" if waiting_for_cdp else "execution_completed",
@@ -5348,7 +5751,7 @@ def generate_test_data(generation_id: str, request: TestDataGenerationRequest):
             })
             if sent_case_ids:
                 raise HTTPException(409, {
-                    "message": "Test data already sent to Bronze is immutable. Create a new test-case generation instead of regenerating it.",
+                    "message": "Test data already sent to the Raw layer is immutable. Create a new test-case generation instead of regenerating it.",
                     "test_case_ids": sent_case_ids,
                 })
         regeneration_id = uid("regen") if request.replace_existing_drafts and existing_rows else None
@@ -5799,7 +6202,7 @@ def _assert_equal_if_present(assertions, name: str, expected, actual):
         return
     _add_assertion(assertions, name, expected == actual, expected, actual)
 
-def _add_pending_assertion(assertions, name: str, expected=None, actual=None, message: str = "Waiting for CDP to complete this layer."):
+def _add_pending_assertion(assertions, name: str, expected=None, actual=None, message: str = "Waiting for the target data platform to complete this layer."):
     assertions.append({"name": name, "status": "pending", "expected": expected, "actual": actual, "message": message})
 
 def _expected_test_data_ids(payload):
@@ -5834,7 +6237,7 @@ def _validate_gold_transport(conn, rows, generation_id, test_case_id, assertions
     rx_ids = sorted({rx for row in rows for rx in _expected_test_data_ids(json.loads(row["payload_json"]))[1]})
     gold_actual, transport_actual = [], []
     if not rx_ids:
-        _add_assertion(assertions, "Gold and Transport applicability", True, "Prescription test case", "No Prescription template for this Membership-only case.")
+        _add_assertion(assertions, "Analytics and Transport applicability", True, "Prescription test case", "No Prescription template for this Membership-only case.")
         return gold_actual, transport_actual
     for rx_id in rx_ids:
         gold_rows = conn.execute(
@@ -5850,7 +6253,7 @@ def _validate_gold_transport(conn, rows, generation_id, test_case_id, assertions
             (rx_id,),
         ).fetchall()
         if not audit_rows:
-            _add_pending_assertion(assertions, f"Gold evaluation for {rx_id}", "campaign decision audit", "not recorded yet", "Waiting for CDP's Gold campaign process.")
+            _add_pending_assertion(assertions, f"Analytics evaluation for {rx_id}", "campaign decision audit", "not recorded yet", "Waiting for the Analytics campaign process on the target data platform.")
         else:
             latest_audit = audit_rows[-1]
             prescription_payload = {}
@@ -5867,7 +6270,7 @@ def _validate_gold_transport(conn, rows, generation_id, test_case_id, assertions
             no_refills = isinstance(prescription_payload, dict) and int(prescription_payload.get("refills_remaining") or 0) <= 0
             expects_exclusion = expects_missing_contact or ineligible or no_refills
             expected_action = "EXCLUDED" if expects_exclusion else "QUALIFIED"
-            _add_assertion(assertions, f"Gold campaign decision for {rx_id}", latest_audit["action"] == expected_action, expected_action, latest_audit["action"], latest_audit.get("exclusion_reason"))
+            _add_assertion(assertions, f"Analytics campaign decision for {rx_id}", latest_audit["action"] == expected_action, expected_action, latest_audit["action"], latest_audit.get("exclusion_reason"))
             gold_actual.append({"prescription_id": rx_id, "audit": dict(latest_audit), "refill_rows": [dict(item) for item in gold_rows]})
         if gold_rows:
             refill_ids = [item["refill_gold_sk"] for item in gold_rows]
@@ -5878,15 +6281,15 @@ def _validate_gold_transport(conn, rows, generation_id, test_case_id, assertions
             ).fetchall()
             transport_actual.extend([dict(item) for item in routed])
             if not routed:
-                _add_pending_assertion(assertions, f"Transport result for {rx_id}", "journey audit", "not recorded yet", "Gold qualified the refill; waiting for CDP's Transport process.")
+                _add_pending_assertion(assertions, f"Transport result for {rx_id}", "journey audit", "not recorded yet", "Analytics qualified the refill; waiting for the target data platform Transport process.")
             else:
                 expected_status = "DNC_EXCLUDED" if expects_dnc else "MISSING_CONTACT" if expects_missing_contact else "ROUTED"
                 observed_statuses = sorted({item["result_status"] for item in routed})
                 _add_assertion(assertions, f"Transport outcome for {rx_id}", expected_status in observed_statuses, expected_status, observed_statuses, "; ".join(item.get("failure_reason") or "" for item in routed if item.get("failure_reason")) or None)
         elif audit_rows and audit_rows[-1]["action"] == "EXCLUDED":
-            _add_assertion(assertions, f"Transport not routed for excluded {rx_id}", True, "No Transport journey", "Gold excluded this prescription.")
+            _add_assertion(assertions, f"Transport not routed for Analytics-excluded {rx_id}", True, "No Transport journey", "Analytics excluded this prescription.")
         else:
-            _add_pending_assertion(assertions, f"Gold refill record for {rx_id}", "eligible Gold refill or exclusion result", "not available yet")
+            _add_pending_assertion(assertions, f"Analytics refill record for {rx_id}", "eligible Analytics refill or exclusion result", "not available yet")
     return gold_actual, transport_actual
 
 def _discover_bronze_refs_for_record(conn, row, payload):
@@ -5917,17 +6320,17 @@ def _evaluate_record_payload(payload, actual_by_table, assertions):
         bronze_members = [_item["data"] for _item in actual_by_table.get("membership", [])]
         _add_assertion(assertions, "Membership template row exists", len(bronze_members) == 1, 1, len(bronze_members))
         if bronze_members:
-            _assert_equal_if_present(assertions, "member_id stored in Bronze", payload.get("member_id"), bronze_members[0].get("member_id"))
-            _assert_equal_if_present(assertions, "subscriber_id stored in Bronze", payload.get("subscriber_id"), bronze_members[0].get("subscriber_id"))
-            _assert_equal_if_present(assertions, "member first_name stored in Bronze", payload.get("first_name"), bronze_members[0].get("first_name"))
-            _assert_equal_if_present(assertions, "member last_name stored in Bronze", payload.get("last_name"), bronze_members[0].get("last_name"))
+            _assert_equal_if_present(assertions, "member_id stored in Raw layer", payload.get("member_id"), bronze_members[0].get("member_id"))
+            _assert_equal_if_present(assertions, "subscriber_id stored in Raw layer", payload.get("subscriber_id"), bronze_members[0].get("subscriber_id"))
+            _assert_equal_if_present(assertions, "member first_name stored in Raw layer", payload.get("first_name"), bronze_members[0].get("first_name"))
+            _assert_equal_if_present(assertions, "member last_name stored in Raw layer", payload.get("last_name"), bronze_members[0].get("last_name"))
         return
     if isinstance(payload, dict) and payload.get("prescription_id") and "eligible_ind" in payload:
         bronze_prescriptions = [_item["data"] for _item in actual_by_table.get("prescription", [])]
         _add_assertion(assertions, "Prescription template row exists", len(bronze_prescriptions) == 1, 1, len(bronze_prescriptions))
         if bronze_prescriptions:
             for key in ("prescription_id", "member_id", "eligible_ind", "status", "refills_remaining", "next_refill_date", "drug_name", "strength"):
-                _assert_equal_if_present(assertions, f"{key} stored in Bronze", payload.get(key), bronze_prescriptions[0].get(key))
+                _assert_equal_if_present(assertions, f"{key} stored in Raw layer", payload.get(key), bronze_prescriptions[0].get(key))
         return
     if isinstance(payload, dict) and payload.get("type") == "pharmacy.orders.v1.sample-notification":
         expected_members = payload.get("data", {}).get("members", [])
@@ -5935,10 +6338,10 @@ def _evaluate_record_payload(payload, actual_by_table, assertions):
         bronze_prescriptions = [_item["data"] for _item in actual_by_table.get("prescription", [])]
         expected_member_ids = [item["person"]["resourceID"] for item in expected_members]
         expected_rx_ids = [rx["resourceID"] for item in expected_members for rx in item["prescription"]]
-        _add_assertion(assertions, "PBM membership Bronze rows exist", len(bronze_members) == len(expected_member_ids), len(expected_member_ids), len(bronze_members))
-        _add_assertion(assertions, "PBM prescription Bronze rows exist", len(bronze_prescriptions) == len(expected_rx_ids), len(expected_rx_ids), len(bronze_prescriptions))
-        _add_assertion(assertions, "member resourceIDs mapped to Bronze", sorted(item.get("member_id") for item in bronze_members) == sorted(expected_member_ids), sorted(expected_member_ids), sorted(item.get("member_id") for item in bronze_members))
-        _add_assertion(assertions, "prescription resourceIDs mapped to Bronze", sorted(item.get("prescription_id") for item in bronze_prescriptions) == sorted(expected_rx_ids), sorted(expected_rx_ids), sorted(item.get("prescription_id") for item in bronze_prescriptions))
+        _add_assertion(assertions, "PBM membership Raw rows exist", len(bronze_members) == len(expected_member_ids), len(expected_member_ids), len(bronze_members))
+        _add_assertion(assertions, "PBM prescription Raw rows exist", len(bronze_prescriptions) == len(expected_rx_ids), len(expected_rx_ids), len(bronze_prescriptions))
+        _add_assertion(assertions, "member resourceIDs mapped to Raw layer", sorted(item.get("member_id") for item in bronze_members) == sorted(expected_member_ids), sorted(expected_member_ids), sorted(item.get("member_id") for item in bronze_members))
+        _add_assertion(assertions, "prescription resourceIDs mapped to Raw layer", sorted(item.get("prescription_id") for item in bronze_prescriptions) == sorted(expected_rx_ids), sorted(expected_rx_ids), sorted(item.get("prescription_id") for item in bronze_prescriptions))
         return
     member = payload.get("member") or payload.get("membership") or {}
     decision = payload.get("eligibility_decision") or {}
@@ -5951,9 +6354,9 @@ def _evaluate_record_payload(payload, actual_by_table, assertions):
     if member or decision:
         _add_assertion(assertions, "membership row exists", bool(membership), "membership row", "found" if membership else "missing")
     if membership:
-        _assert_equal_if_present(assertions, "member_id stored in Bronze", member.get("member_id") or decision.get("member_id") or communication.get("member_id"), membership.get("member_id"))
-        _assert_equal_if_present(assertions, "member status stored in Bronze", member.get("member_status") or member.get("status") or decision.get("eligibility_status"), membership.get("status"))
-        _assert_equal_if_present(assertions, "eligibility status stored in Bronze", member.get("eligibility_status") or decision.get("eligibility_status"), membership.get("eligibility_status"))
+        _assert_equal_if_present(assertions, "member_id stored in Raw layer", member.get("member_id") or decision.get("member_id") or communication.get("member_id"), membership.get("member_id"))
+        _assert_equal_if_present(assertions, "member status stored in Raw layer", member.get("member_status") or member.get("status") or decision.get("eligibility_status"), membership.get("status"))
+        _assert_equal_if_present(assertions, "eligibility status stored in Raw layer", member.get("eligibility_status") or decision.get("eligibility_status"), membership.get("eligibility_status"))
         if expected_outcome.get("should_identify_member") is not None:
             _add_assertion(assertions, "member can be identified", bool(membership.get("member_id")) == bool(expected_outcome.get("should_identify_member")), expected_outcome.get("should_identify_member"), bool(membership.get("member_id")))
 
@@ -5961,21 +6364,21 @@ def _evaluate_record_payload(payload, actual_by_table, assertions):
     if prescription:
         _add_assertion(assertions, "prescription row exists", bool(prescription_row), "prescription row", "found" if prescription_row else "missing")
     if prescription_row:
-        _assert_equal_if_present(assertions, "prescription_id stored in Bronze", prescription.get("prescription_id"), prescription_row.get("prescription_id"))
-        _assert_equal_if_present(assertions, "prescription member_id stored in Bronze", prescription.get("member_id") or member.get("member_id"), prescription_row.get("member_id"))
-        _assert_equal_if_present(assertions, "refill eligibility stored in Bronze", prescription.get("refill_eligible"), prescription_row.get("eligible_ind"))
-        _assert_equal_if_present(assertions, "refill status stored in Bronze", prescription.get("refill_status"), prescription_row.get("refill_status"))
+        _assert_equal_if_present(assertions, "prescription_id stored in Raw layer", prescription.get("prescription_id"), prescription_row.get("prescription_id"))
+        _assert_equal_if_present(assertions, "prescription member_id stored in Raw layer", prescription.get("member_id") or member.get("member_id"), prescription_row.get("member_id"))
+        _assert_equal_if_present(assertions, "refill eligibility stored in Raw layer", prescription.get("refill_eligible"), prescription_row.get("eligible_ind"))
+        _assert_equal_if_present(assertions, "refill status stored in Raw layer", prescription.get("refill_status"), prescription_row.get("refill_status"))
 
     order_row = _first_actual(actual_by_table, "order")
     if communication or campaign:
         _add_assertion(assertions, "communication or campaign row exists", bool(order_row), "order row", "found" if order_row else "missing")
     if order_row:
-        _assert_equal_if_present(assertions, "communication member_id stored in Bronze", communication.get("member_id") or member.get("member_id"), order_row.get("member_id"))
-        _assert_equal_if_present(assertions, "primary channel stored in Bronze", communication.get("primary_channel"), order_row.get("primary_channel"))
-        _assert_equal_if_present(assertions, "SMS status stored in Bronze", communication.get("sms_delivery_status"), order_row.get("sms_delivery_status"))
-        _assert_equal_if_present(assertions, "phone fallback flag stored in Bronze", communication.get("phone_call_required"), order_row.get("phone_call_required"))
-        _assert_equal_if_present(assertions, "campaign_id stored in Bronze", campaign.get("campaign_id"), order_row.get("campaign_id"))
-        _assert_equal_if_present(assertions, "suppression flag stored in Bronze", campaign.get("suppress_communication"), order_row.get("suppress_communication"))
+        _assert_equal_if_present(assertions, "communication member_id stored in Raw layer", communication.get("member_id") or member.get("member_id"), order_row.get("member_id"))
+        _assert_equal_if_present(assertions, "primary channel stored in Raw layer", communication.get("primary_channel"), order_row.get("primary_channel"))
+        _assert_equal_if_present(assertions, "SMS status stored in Raw layer", communication.get("sms_delivery_status"), order_row.get("sms_delivery_status"))
+        _assert_equal_if_present(assertions, "phone fallback flag stored in Raw layer", communication.get("phone_call_required"), order_row.get("phone_call_required"))
+        _assert_equal_if_present(assertions, "campaign_id stored in Raw layer", campaign.get("campaign_id"), order_row.get("campaign_id"))
+        _assert_equal_if_present(assertions, "suppression flag stored in Raw layer", campaign.get("suppress_communication"), order_row.get("suppress_communication"))
         if expected_outcome.get("should_send_sms") is not None:
             _add_assertion(assertions, "SMS expectation matches setup", (order_row.get("primary_channel") == "SMS") == bool(expected_outcome.get("should_send_sms")), expected_outcome.get("should_send_sms"), order_row.get("primary_channel") == "SMS")
         if expected_outcome.get("should_trigger_phone_call") is not None:
@@ -6027,12 +6430,12 @@ def _execute_case_against_bronze(conn, run_id: str, generation_id: str, test_cas
         member_ids, prescription_ids = _expected_test_data_ids(payload)
         expected_bronze = (["membership"] if member_ids else []) + (["prescription"] if prescription_ids else [])
         if not refs:
-            _add_pending_assertion(assertions, f"{row['record_id']} appears in Bronze", expected_bronze, "not found yet")
+            _add_pending_assertion(assertions, f"{row['record_id']} appears in Raw layer", expected_bronze, "not found yet")
         actual_by_table = {}
         for ref in refs:
             bronze_row = _fetch_bronze_domain_row(conn, ref["bronze_table"], ref["bronze_id"])
             if not bronze_row:
-                _add_pending_assertion(assertions, f"{ref['bronze_table']}:{ref['bronze_id']} exists", "Bronze row", "not found yet")
+                _add_pending_assertion(assertions, f"{ref['bronze_table']}:{ref['bronze_id']} exists", "Raw layer row", "not found yet")
             if bronze_row:
                 actual_item = {
                     "record_id": row["record_id"],
@@ -6047,29 +6450,29 @@ def _execute_case_against_bronze(conn, run_id: str, generation_id: str, test_cas
         found_prescriptions = {item.get("data", {}).get("prescription_id") for item in actual_by_table.get("prescription", [])}
         bronze_complete = set(member_ids).issubset(found_members) and set(prescription_ids).issubset(found_prescriptions)
         if bronze_complete:
-            _add_assertion(assertions, f"{row['record_id']} Bronze rows exist", True, expected_bronze, "found")
+            _add_assertion(assertions, f"{row['record_id']} Raw layer rows exist", True, expected_bronze, "found")
             _evaluate_record_payload(payload, actual_by_table, assertions)
         else:
-            _add_pending_assertion(assertions, f"{row['record_id']} Bronze rows are complete", expected_bronze, {"members": sorted(found_members), "prescriptions": sorted(found_prescriptions)})
+            _add_pending_assertion(assertions, f"{row['record_id']} Raw layer rows are complete", expected_bronze, {"members": sorted(found_members), "prescriptions": sorted(found_prescriptions)})
         if payload.get("type") == "pharmacy.orders.v1.sample-notification" or str(row["entity_name"]).lower() in {"membership", "prescription", "test_dataset"}:
             load_ids = sorted({str(ref["bronze_load_id"]) for ref in refs if ref.get("bronze_load_id")})
             for load_id in load_ids:
                 load = conn.execute("SELECT status,error_message FROM testiq.ingestion_load WHERE load_id=%s", (load_id,)).fetchone()
                 if not load:
-                    _add_pending_assertion(assertions, f"CDP load {load_id} exists", "testiq.ingestion_load row", "not visible yet")
+                    _add_pending_assertion(assertions, f"Target platform load {load_id} exists", "testiq.ingestion_load row", "not visible yet")
                     continue
                 if load["status"] in {"BRONZE_LOADED", "SILVER_PROCESSING", "DISCOVERED"}:
-                    _add_pending_assertion(assertions, f"CDP Silver processing {load_id}", "COMPLETED", load["status"], "CDP still has this load in progress; recheck after its pipeline runs.")
+                    _add_pending_assertion(assertions, f"Target platform Curated-layer processing {load_id}", "COMPLETED", load["status"], "The target platform still has this load in progress; recheck after its pipeline runs.")
                     continue
                 if load["status"] in {"FAILED", "COMPLETED_WITH_ERRORS", "QUARANTINED"}:
-                    _add_assertion(assertions, f"CDP Silver processing {load_id}", False, "COMPLETED", load["status"], load.get("error_message") or "CDP reported a failed or partial load.")
+                    _add_assertion(assertions, f"Target platform Curated-layer processing {load_id}", False, "COMPLETED", load["status"], load.get("error_message") or "The target platform reported a failed or partial load.")
                     continue
-                _add_assertion(assertions, f"CDP Silver processing {load_id}", load["status"] == "COMPLETED", "COMPLETED", load["status"], load.get("error_message") or "CDP load did not complete cleanly.")
+                _add_assertion(assertions, f"Target platform Curated-layer processing {load_id}", load["status"] == "COMPLETED", "COMPLETED", load["status"], load.get("error_message") or "Target platform load did not complete cleanly.")
                 audit = conn.execute("SELECT status,membership_records_read,membership_records_processed,membership_records_failed,prescription_records_read,prescription_records_processed,prescription_records_failed,unhandled_entity_counts,error_message FROM testiq.bronze_silver_run_audit WHERE load_id=%s ORDER BY started_at DESC LIMIT 1", (load_id,)).fetchone()
                 if not audit:
-                    _add_pending_assertion(assertions, f"CDP layer audit {load_id}", "completed audit", "not recorded yet")
+                    _add_pending_assertion(assertions, f"Target platform pipeline audit {load_id}", "completed audit", "not recorded yet")
                 else:
-                    _add_assertion(assertions, f"CDP layer audit {load_id} completed", audit["status"] == "COMPLETED", "COMPLETED audit", audit["status"], audit.get("error_message") or "CDP audit did not complete cleanly.")
+                    _add_assertion(assertions, f"Target platform pipeline audit {load_id} completed", audit["status"] == "COMPLETED", "COMPLETED audit", audit["status"], audit.get("error_message") or "Target platform audit did not complete cleanly.")
                 if audit:
                     _add_assertion(assertions, f"PBM membership rows processed {load_id}", audit["membership_records_failed"] == 0 and audit["membership_records_processed"] == audit["membership_records_read"], audit["membership_records_read"], audit["membership_records_processed"])
                     _add_assertion(assertions, f"PBM prescription rows processed {load_id}", audit["prescription_records_failed"] == 0 and audit["prescription_records_processed"] == audit["prescription_records_read"], audit["prescription_records_read"], audit["prescription_records_processed"])
@@ -6082,8 +6485,8 @@ def _execute_case_against_bronze(conn, run_id: str, generation_id: str, test_cas
                 domain_expected = expected_domain_by_case.get(test_case_id, {})
                 expected_member_ids = sorted(item["person"]["resourceID"] for item in event_members) if is_event_payload else ([domain_expected["member_id"]] if domain_expected.get("member_id") else [])
                 expected_rx = sorted(rx["resourceID"] for item in event_members for rx in item["prescription"]) if is_event_payload else ([domain_expected["prescription_id"]] if domain_expected.get("prescription_id") else [])
-                _add_assertion(assertions, f"Silver member IDs match event {load_id}", sorted(item["member_id"] for item in silver_members) == expected_member_ids, expected_member_ids, sorted(item["member_id"] for item in silver_members))
-                _add_assertion(assertions, f"Silver prescription IDs match event {load_id}", sorted(item["prescription_id"] for item in silver_prescriptions) == expected_rx, expected_rx, sorted(item["prescription_id"] for item in silver_prescriptions))
+                _add_assertion(assertions, f"Curated member IDs match event {load_id}", sorted(item["member_id"] for item in silver_members) == expected_member_ids, expected_member_ids, sorted(item["member_id"] for item in silver_members))
+                _add_assertion(assertions, f"Curated prescription IDs match event {load_id}", sorted(item["prescription_id"] for item in silver_prescriptions) == expected_rx, expected_rx, sorted(item["prescription_id"] for item in silver_prescriptions))
                 silver_preferences = conn.execute(
                     "SELECT m.member_id,p.channel,p.value,p.enabled,p.preference_type "
                     "FROM silverbox.member_communication_preference p "
@@ -6103,14 +6506,14 @@ def _execute_case_against_bronze(conn, run_id: str, generation_id: str, test_cas
                 )
                 actual_preferences = sorted((item["member_id"], item["channel"].upper(), item["value"], item["enabled"]) for item in silver_preferences)
                 if is_event_payload:
-                    _add_assertion(assertions, f"Silver communication preferences match event {load_id}", actual_preferences == expected_preferences, expected_preferences, actual_preferences)
+                    _add_assertion(assertions, f"Curated communication preferences match event {load_id}", actual_preferences == expected_preferences, expected_preferences, actual_preferences)
                 actual_rx = {item["prescription_id"]: item for item in silver_prescriptions}
                 for event_member in event_members:
                     member_id = event_member["person"]["resourceID"]
                     for expected in event_member["prescription"]:
                         actual = actual_rx.get(expected["resourceID"])
                         if actual:
-                            prefix = f"Silver prescription {expected['resourceID']}"
+                            prefix = f"Curated prescription {expected['resourceID']}"
                             _assert_equal_if_present(assertions, f"{prefix} member", member_id, actual["member_id"])
                             _assert_equal_if_present(assertions, f"{prefix} status", expected.get("rxStatus", "ACTIVE"), actual["status"])
                             _assert_equal_if_present(assertions, f"{prefix} eligibility", expected.get("eligibleInd", True), actual["eligible_ind"])
@@ -6121,13 +6524,13 @@ def _execute_case_against_bronze(conn, run_id: str, generation_id: str, test_cas
                 if not is_event_payload:
                     if row["entity_name"] == "membership":
                         actual_member = next((item for item in silver_members if item["member_id"] == payload.get("member_id")), None)
-                        _add_assertion(assertions, f"Silver member {payload.get('member_id')} exists", bool(actual_member), payload.get("member_id"), actual_member.get("member_id") if actual_member else None)
+                        _add_assertion(assertions, f"Curated member {payload.get('member_id')} exists", bool(actual_member), payload.get("member_id"), actual_member.get("member_id") if actual_member else None)
                         if actual_member:
                             for key in ("first_name", "last_name", "status"):
-                                _assert_equal_if_present(assertions, f"Silver member {key}", payload.get(key), actual_member.get(key))
+                                _assert_equal_if_present(assertions, f"Curated member {key}", payload.get(key), actual_member.get(key))
                     elif row["entity_name"] == "prescription":
                         actual_prescription = next((item for item in silver_prescriptions if item["prescription_id"] == payload.get("prescription_id")), None)
-                        _add_assertion(assertions, f"Silver prescription {payload.get('prescription_id')} exists", bool(actual_prescription), payload.get("prescription_id"), actual_prescription.get("prescription_id") if actual_prescription else None)
+                        _add_assertion(assertions, f"Curated prescription {payload.get('prescription_id')} exists", bool(actual_prescription), payload.get("prescription_id"), actual_prescription.get("prescription_id") if actual_prescription else None)
                         if actual_prescription:
                             for key in ("member_id", "eligible_ind", "refills_remaining", "next_refill_date", "drug_name", "strength"):
                                 expected_value = payload.get(key)
@@ -6136,17 +6539,17 @@ def _execute_case_against_bronze(conn, run_id: str, generation_id: str, test_cas
                                 actual_value = actual_prescription.get(key)
                                 if key == "next_refill_date" and actual_value:
                                     actual_value = str(actual_value)
-                                _assert_equal_if_present(assertions, f"Silver prescription {key}", expected_value, actual_value)
+                                _assert_equal_if_present(assertions, f"Curated prescription {key}", expected_value, actual_value)
                     elif str(row["entity_name"]).lower() == "test_dataset":
                         member_payload = payload.get("membership") or {}
                         prescription_payload = payload.get("prescription") or {}
                         actual_member = next((item for item in silver_members if item["member_id"] == member_payload.get("member_id")), None)
                         actual_prescription = next((item for item in silver_prescriptions if item["prescription_id"] == prescription_payload.get("prescription_id")), None)
-                        _add_assertion(assertions, f"Silver member {member_payload.get('member_id')} exists", bool(actual_member), member_payload.get("member_id"), actual_member.get("member_id") if actual_member else None)
-                        _add_assertion(assertions, f"Silver prescription {prescription_payload.get('prescription_id')} exists", bool(actual_prescription), prescription_payload.get("prescription_id"), actual_prescription.get("prescription_id") if actual_prescription else None)
+                        _add_assertion(assertions, f"Curated member {member_payload.get('member_id')} exists", bool(actual_member), member_payload.get("member_id"), actual_member.get("member_id") if actual_member else None)
+                        _add_assertion(assertions, f"Curated prescription {prescription_payload.get('prescription_id')} exists", bool(actual_prescription), prescription_payload.get("prescription_id"), actual_prescription.get("prescription_id") if actual_prescription else None)
                         if actual_member:
                             for key in ("first_name", "last_name", "status"):
-                                _assert_equal_if_present(assertions, f"Silver member {key}", member_payload.get(key), actual_member.get(key))
+                                _assert_equal_if_present(assertions, f"Curated member {key}", member_payload.get(key), actual_member.get(key))
                         if actual_prescription:
                             for key in ("member_id", "eligible_ind", "refills_remaining", "next_refill_date", "drug_name", "strength"):
                                 expected_value = prescription_payload.get(key)
@@ -6154,7 +6557,7 @@ def _execute_case_against_bronze(conn, run_id: str, generation_id: str, test_cas
                                 if key == "next_refill_date":
                                     expected_value = str(expected_value) if expected_value else None
                                     actual_value = str(actual_value) if actual_value else None
-                                _assert_equal_if_present(assertions, f"Silver prescription {key}", expected_value, actual_value)
+                                _assert_equal_if_present(assertions, f"Curated prescription {key}", expected_value, actual_value)
         expected_records.append({
             "record_id": row["record_id"],
             "entity_name": row["entity_name"],
@@ -6166,7 +6569,7 @@ def _execute_case_against_bronze(conn, run_id: str, generation_id: str, test_cas
     failed = [item for item in assertions if item["status"] == "failed"]
     pending = [item for item in assertions if item["status"] == "pending"]
     status = "failed" if failed else "pending" if pending else "passed"
-    error = "; ".join(item["name"] for item in failed[:5]) if failed else "Waiting for CDP: " + "; ".join(item["name"] for item in pending[:5]) if pending else None
+    error = "; ".join(item["name"] for item in failed[:5]) if failed else "Waiting for target data platform: " + "; ".join(item["name"] for item in pending[:5]) if pending else None
     result_id = "xres_" + hashlib.sha256(f"{run_id}:{test_case_id}".encode("utf-8")).hexdigest()[:24]
     conn.execute(
         "INSERT INTO test_execution_result (result_id,run_id,generation_id,test_case_id,status,expected_json,actual_json,assertions_json,bronze_refs_json,started_at,completed_at,error) "
@@ -6180,12 +6583,12 @@ def _execute_case_against_bronze(conn, run_id: str, generation_id: str, test_cas
 def save_test_data_to_bronze(generation_id: str, request: TestDataSubmitRequest):
     with connection() as conn:
         if not DATABASE_URL:
-            raise HTTPException(503, "Sending test data to Bronze requires the shared PostgreSQL database.")
+            raise HTTPException(503, "Sending test data to the target data platform requires the shared PostgreSQL database.")
         procedure = conn.execute(
             "SELECT to_regprocedure('testiq.process_pending_testiq_to_bronze(integer,text)') AS procedure"
         ).fetchone()
         if not procedure or not procedure["procedure"]:
-            raise HTTPException(503, "The Process Pending TestIQ to Bronze stored procedure is not installed.")
+            raise HTTPException(503, "The Process Pending TestIQ to database load procedure is not installed.")
         generation = conn.execute("SELECT * FROM test_case_generation WHERE generation_id=%s", (generation_id,)).fetchone()
         if not generation:
             raise HTTPException(404, "Test-case generation run not found")
@@ -6240,7 +6643,7 @@ def save_test_data_to_bronze(generation_id: str, request: TestDataSubmitRequest)
                 already_sent.append(row["record_id"])
         if already_sent:
             raise HTTPException(409, {
-                "message": "Duplicate handoff prevented. One or more selected test data records were already sent to the Bronze layer.",
+                "message": "Duplicate handoff prevented. One or more selected test data records were already sent to the Raw layer.",
                 "record_ids": already_sent,
             })
         unknown_cases = sorted(set(selected_case_ids) - set(cases))
@@ -6257,7 +6660,7 @@ def save_test_data_to_bronze(generation_id: str, request: TestDataSubmitRequest)
         records_by_case = {}
         case_statuses = set(selected_case_ids)
         if {row["test_case_id"] for row in rows} != case_statuses:
-            raise HTTPException(422, {"message": "Generate test data for every selected case before saving it for CDP", "missing_test_data": sorted(case_statuses - {row["test_case_id"] for row in rows})})
+            raise HTTPException(422, {"message": "Generate test data for every selected case before sending it to the target data platform", "missing_test_data": sorted(case_statuses - {row["test_case_id"] for row in rows})})
         for row in rows:
             test_case = cases.get(row["test_case_id"])
             if not test_case:
@@ -6325,7 +6728,7 @@ def save_test_data_to_bronze(generation_id: str, request: TestDataSubmitRequest)
             bronze_references.extend(references)
         if failed_records:
             raise HTTPException(502, {
-                "message": "The Bronze stored procedure did not complete every selected record. No selected test data was committed.",
+                "message": "The database load did not complete every selected record. No selected test data was committed.",
                 "records": failed_records,
             })
         run_request = ExecutionRunRequest(
@@ -6341,7 +6744,7 @@ def save_test_data_to_bronze(generation_id: str, request: TestDataSubmitRequest)
             "sent_count": len(staged),
             "ready_case_count": len(case_statuses),
             "handoff_status": "sent_to_bronze",
-            "message": f"{len(staged)} test data record(s) sent to the Bronze layer successfully.",
+            "message": f"{len(staged)} test data record(s) sent to the target data platform successfully.",
             "records": staged,
             "bronze_references": bronze_references,
             "execution_run": execution_run,

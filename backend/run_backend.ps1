@@ -2,7 +2,10 @@ $ErrorActionPreference = "Stop"
 
 $backendRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Split-Path -Parent $backendRoot
-$python = Join-Path $repoRoot ".venv\Scripts\python.exe"
+$python = Join-Path $backendRoot ".venv\Scripts\python.exe"
+if (-not (Test-Path -LiteralPath $python)) {
+    $python = Join-Path $repoRoot ".venv\Scripts\python.exe"
+}
 if (-not (Test-Path -LiteralPath $python)) {
     $python = "python"
 }

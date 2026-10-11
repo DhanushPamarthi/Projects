@@ -12,12 +12,15 @@ def _modules(monkeypatch):
     data = Path(".test-data") / uuid.uuid4().hex
     monkeypatch.setenv("TESTIQ_DATA_DIR", str(data))
     monkeypatch.setenv("TESTIQ_DB_PATH", str(data / "test.db"))
+    monkeypatch.setenv("TESTIQ_AUTH_REQUIRED", "false")
     monkeypatch.delenv("DATABASE_URL", raising=False)
-    for name in ["app.knowledge_fabric", "app.db", "app.config"]:
+    monkeypatch.delenv("TESTIQ_POSTGRES_HOST", raising=False)
+    for name in ["app.main", "app.auth", "app.knowledge_fabric", "app.db", "app.config"]:
         sys.modules.pop(name, None)
-    import app.config, app.db, app.knowledge_fabric
+    import app.config, app.db, app.auth, app.knowledge_fabric
     importlib.reload(app.config)
     importlib.reload(app.db)
+    importlib.reload(app.auth)
     importlib.reload(app.knowledge_fabric)
     return app.db, app.knowledge_fabric
 
