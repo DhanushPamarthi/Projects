@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { ArrowRight, CheckCheck, LoaderCircle, X } from "lucide-react";
-import { generateTestData, listTestData, reviewTestData, saveTestDataToBronze } from "../api/client.js";
+import { generateTestData, listExecutionRuns, listTestData, reviewTestData, saveTestDataToBronze } from "../api/client.js";
 import { Pagination } from "./Pagination.jsx";
 
 function displayCaseName(testCase) {
@@ -34,14 +34,17 @@ function recordTemplateLabel(record) {
   if (String(record.entity_name || "").toLowerCase() === "test_dataset") return "Membership + Prescription";
   return String(record.entity_name || record.template_name || "Test data").replace(/_/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
-export function TestDataStage({ projectId, generationId, approvedCases, reviewer, onGoToTestCases, onContinueToResults }) {
+export function TestDataStage({ projectId, generationId, approvedCases, reviewer, generationInProgress = false, onGoToTestCases, onContinueToResults }) {
   const [selectedCases, setSelectedCases] = useState([]);
   const [selectedDataCaseIds, setSelectedDataCaseIds] = useState([]);
   const [records, setRecords] = useState([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
-  const [executionRun, setExecutionRun] = useState(null);
+  const [executionRun, setExecutionRun] = useState(() => {
+    if (!generationId || typeof window === "undefined") return null;
+    try { return JSON.parse(window.sessionStorage.getItem(`testiq_execution_run_${generationId}`) || "null"); } catch { return null; }
+  });
   const [caseFilter, setCaseFilter] = useState("");
   const [casePage, setCasePage] = useState(1); const [recordPage, setRecordPage] = useState(1);
   useEffect(() => {
@@ -54,10 +57,23 @@ export function TestDataStage({ projectId, generationId, approvedCases, reviewer
   }, [approvedCases.map((item) => `${item.test_case_id}:${item.reviewStatus}`).join("|")]);
   useEffect(() => {
     if (!generationId) return;
+    let active = true;
     listTestData(generationId).then((items) => {
       const nextRecords = items.map((item) => ({ ...item, payload_text: JSON.stringify(item.payload, null, 2) }));
-      setRecords(nextRecords);
-    }).catch(() => setRecords([]));
+      if (active) setRecords(nextRecords);
+    }).catch(() => { if (active) setRecords([]); });
+    return () => { active = false; };
+  }, [generationId, generationInProgress]);
+  useEffect(() => {
+    if (!generationId) return undefined;
+    let active = true;
+    listExecutionRuns(generationId).then((runs) => {
+      if (!active) return;
+      const latestRun = Array.isArray(runs) ? runs[0] || null : null;
+      setExecutionRun(latestRun);
+      if (latestRun) window.sessionStorage.setItem(`testiq_execution_run_${generationId}`, JSON.stringify(latestRun));
+    }).catch(() => {});
+    return () => { active = false; };
   }, [generationId]);
 
   async function generate(replaceExistingDrafts = false) {
@@ -89,7 +105,9 @@ export function TestDataStage({ projectId, generationId, approvedCases, reviewer
       const result = await saveTestDataToBronze(generationId, selectedExecutionCaseIds, reviewer || "Product Owner");
       const savedById = new Map(result.records.map((item) => [item.record_id, { ...item, payload_text: JSON.stringify(item.payload, null, 2) }]));
       setRecords((current) => current.map((item) => savedById.get(item.record_id) || item));
-      setExecutionRun(result.execution_run || null);
+      const createdRun = result.execution_run || null;
+      setExecutionRun(createdRun);
+      if (createdRun) window.sessionStorage.setItem(`testiq_execution_run_${generationId}`, JSON.stringify(createdRun));
       setSelectedDataCaseIds([]);
       setMessage(result.message || `${result.sent_count || result.saved_count} test data record(s) sent to the database successfully.`);
     } catch (err) { setError(err.message); }
@@ -137,13 +155,23 @@ export function TestDataStage({ projectId, generationId, approvedCases, reviewer
   return <section className="requirements-panel test-data-stage-panel">
     <div className="panel-title-row"><div><h2>Approved cases and generated records</h2></div><span>{groupedRecords.length} case(s) · {records.length} template record(s)</span></div>
     {error && <div className="error-message">{error}</div>}{message && <div className="toast-message test-data-toast" role="status" aria-live="polite">{message}</div>}
-    {executionRun && <div className="test-data-run-created" role="status"><div><strong>Execution run created</strong><span>{executionRun.run_id} · {executionRun.selected_test_case_ids?.length || selectedExecutionCaseIds.length} approved case(s) sent to the database</span></div><button type="button" className="primary-button compact-button" onClick={onContinueToResults}><ArrowRight size={15} /> View Test Results</button></div>}
-    <div className="test-data-cases-picker"><div className="test-data-case-heading"><div><h3>Approved test cases</h3><p className="panel-helper">Select cases for controlled data generation.</p></div><span>{selectedCases.length} of {approvedCases.length} selected</span></div><div className="test-data-case-actions"><input aria-label="Filter test cases" value={caseFilter} onChange={(event) => setCaseFilter(event.target.value)} placeholder="Filter by ID or title" /><div className="test-data-selection-actions"><button type="button" className="test-data-selection-action" onClick={() => setSelectedCases((items) => [...new Set([...items, ...visibleCases.map((item) => item.test_case_id)])])}><CheckCheck size={15} />{caseFilter.trim() ? "Select filtered" : "Select all"}</button><button type="button" className="test-data-selection-action clear-selection-action" onClick={() => setSelectedCases([])}><X size={15} />Clear</button></div></div><div className="test-data-case-list">{pagedCases.map((item) => <label className="test-data-case-item" key={item.test_case_id}><input type="checkbox" checked={selectedCases.includes(item.test_case_id)} onChange={() => toggle(selectedCases, setSelectedCases, item.test_case_id)} /><span><strong>{item.test_case_id} · {displayCaseName(item)}</strong></span></label>)}</div><Pagination page={casePage} pageSize={casesPerPage} totalItems={visibleCases.length} onPageChange={setCasePage} label="approved test cases" />
-      <button type="button" className="primary-button" disabled={busy || (!selectedCases.length && !canRegenerateDrafts) || (records.length > 0 && !canRegenerateDrafts)} onClick={() => generate(canRegenerateDrafts)}>{busy ? <><LoaderCircle className="spin" size={16} /> {canRegenerateDrafts ? "Regenerating..." : "Generating..."}</> : canRegenerateDrafts ? <>Regenerate {new Set(records.map((item) => item.test_case_id)).size} case(s)</> : allReadyForExecution ? "Ready for execution" : allSavedToBronze ? "Data saved" : hasSavedRecords ? "Ready for execution" : <>Generate data for {selectedCaseCount} case{selectedCaseCount === 1 ? "" : "s"}</>}</button></div>
+    <div className="test-data-cases-picker">
+      <div className="test-data-case-heading">
+        <div><h3>Approved test cases</h3><p className="panel-helper">Select cases for controlled data generation.</p></div>
+        <div className="test-data-case-heading-actions">
+          <span>{selectedCases.length} of {approvedCases.length} selected</span>
+        </div>
+      </div>
+      <div className="test-data-case-actions"><input aria-label="Filter test cases" value={caseFilter} onChange={(event) => setCaseFilter(event.target.value)} placeholder="Filter by ID or title" /><div className="test-data-selection-actions"><button type="button" className="test-data-selection-action" onClick={() => setSelectedCases((items) => [...new Set([...items, ...visibleCases.map((item) => item.test_case_id)])])}><CheckCheck size={15} />{caseFilter.trim() ? "Select filtered" : "Select all"}</button><button type="button" className="test-data-selection-action clear-selection-action" onClick={() => setSelectedCases([])}><X size={15} />Clear</button></div></div>
+      <div className="test-data-case-list">{pagedCases.map((item) => <label className="test-data-case-item" key={item.test_case_id}><input type="checkbox" checked={selectedCases.includes(item.test_case_id)} onChange={() => toggle(selectedCases, setSelectedCases, item.test_case_id)} /><span><strong>{item.test_case_id} · {displayCaseName(item)}</strong></span></label>)}</div>
+      <Pagination page={casePage} pageSize={casesPerPage} totalItems={visibleCases.length} onPageChange={setCasePage} label="approved test cases" />
+          <button type="button" className="primary-button test-data-generate-button" disabled={busy || generationInProgress || (!selectedCases.length && !canRegenerateDrafts) || (records.length > 0 && !canRegenerateDrafts)} onClick={() => generate(canRegenerateDrafts)}>{busy || generationInProgress ? <><LoaderCircle className="spin" size={16} /> {canRegenerateDrafts ? "Regenerating..." : "Generating..."}</> : canRegenerateDrafts ? <>Regenerate {new Set(records.map((item) => item.test_case_id)).size} case(s)</> : allReadyForExecution ? "Ready for execution" : allSavedToBronze ? "Data saved" : hasSavedRecords ? "Ready for execution" : "Generate test data"}</button>
+    </div>
     {records.length > 0 && <>
       <div className="test-data-record-list">
         <div className="test-data-overall-status"><span>Status</span><strong className={overallStatus === "Ready for Database" ? "test-data-ready-status" : ""}>{overallStatus}</strong></div>
         <div className="test-data-group-column-head"><span>Test case</span><span>Templates used</span></div>
+        {selectableCaseIds.length > 0 && <label className="test-data-record-select-all"><input type="checkbox" checked={selectableCaseIds.every((id) => selectedExecutionCaseIds.includes(id))} onChange={(event) => setSelectedDataCaseIds(event.target.checked ? selectableCaseIds : [])} /><span>Select all</span></label>}
         {pagedRecordGroups.map(([testCaseId, caseRecords]) => {
           const testCase = approvedCases.find((item) => item.test_case_id === testCaseId);
           const labels = [...new Set(caseRecords.flatMap((record) => {
@@ -165,10 +193,11 @@ export function TestDataStage({ projectId, generationId, approvedCases, reviewer
             </div>
             </details>
           </div>;
-        })}<Pagination page={recordPage} pageSize={recordsPerPage} totalItems={groupedRecords.length} onPageChange={setRecordPage} label="test-data cases" />
-      </div>{selectableCaseIds.length > 0 && <div className="test-data-record-selection-bar"><span>{selectedExecutionCaseIds.length} test case(s) selected · {selectedExecutionRecordCount} template record(s)</span><div className="test-data-selection-actions"><button type="button" className="test-data-selection-action" onClick={() => setSelectedDataCaseIds(selectableCaseIds)}><CheckCheck size={15} />Select all available cases</button><button type="button" className="test-data-selection-action clear-selection-action" onClick={() => setSelectedDataCaseIds([])}><X size={15} />Clear</button></div></div>}{selectedExecutionCaseIds.length > 0 && <button type="button" className="primary-button" disabled={busy} onClick={save}>
-        {busy ? <><LoaderCircle className="spin" size={16} /> Sending to Database...</> : <>Send to Database</>}
+        })}
+      </div><Pagination page={recordPage} pageSize={recordsPerPage} totalItems={groupedRecords.length} onPageChange={setRecordPage} label="test-data cases" itemLabel="test cases" />{selectableCaseIds.length > 0 && <div className="test-data-record-selection-bar"><span>{selectedExecutionCaseIds.length} test case(s) selected · {selectedExecutionRecordCount} template record(s)</span></div>}{selectedExecutionCaseIds.length > 0 && <button type="button" className="primary-button" disabled={busy} onClick={save}>
+      {busy ? <><LoaderCircle className="spin" size={16} /> Sending to Database...</> : <>Send to Database</>}
       </button>}
     </>}
+    {executionRun && <div className="test-data-run-created" role="status"><div><strong>Execution run created</strong><span>{executionRun.run_id} · {executionRun.selected_test_case_ids?.length || selectedExecutionCaseIds.length} approved case(s) sent to the database</span></div><button type="button" className="primary-button compact-button" onClick={onContinueToResults}><ArrowRight size={15} /> View Test Results</button></div>}
   </section>;
 }

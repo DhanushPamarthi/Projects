@@ -316,6 +316,10 @@
   padding: 1.5rem 1rem;
 }
 
+.loginForm {
+  width: 100%;
+}
+
 .formTitle {
   font-weight: 700;
   margin-bottom: 0.25rem;
@@ -329,6 +333,7 @@
 }
 
 .formGroup {
+  width: 100%;
   margin-bottom: 1rem;
 }
 
@@ -341,6 +346,10 @@
 
 .inputWrapper {
   position: relative;
+  display: flex;
+  align-items: center;
+  width: 100%;
+  max-width: 100%;
 }
 
 .inputIcon {
@@ -353,11 +362,15 @@
 }
 
 .formInput {
+  width: 100% !important;
+  flex: 1 1 auto;
+  min-width: 0;
   border-color: #dee2e5;
   border-radius: 10px;
   padding-top: 0.68rem;
   padding-bottom: 0.68rem;
   padding-left: 2.7rem;
+  padding-right: 3rem;
   min-height: 2.65rem;
 }
 
@@ -367,22 +380,18 @@
 }
 
 .passwordToggle {
-  position: absolute;
-  top: 50%;
-  right: 0;
-  transform: translateY(-50%);
-  margin-right: 0.75rem;
+  position: relative;
+  flex: 0 0 2.75rem;
+  height: 2.65rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: -2.75rem;
   padding: 0;
+  z-index: 2;
   color: #9aa6ad;
   background: transparent;
   border: none;
-}
-
-.formExtras {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 1.5rem;
 }
 
 .rememberCheck {
@@ -403,14 +412,6 @@
 .rememberCheck :global(.form-check-input):focus {
   border-color: var(--brand-orange);
   box-shadow: 0 0 0 0.2rem rgba(255, 86, 64, 0.25);
-}
-
-.forgotLink {
-  padding: 0;
-  text-decoration: none;
-  font-size: 0.875rem;
-  color: var(--brand-orange);
-  font-weight: 500;
 }
 
 .submitBtn {

@@ -192,7 +192,7 @@ export function RegisterPage({ onBack }) {
                     Enter your details to get started
                   </p> */}
 
-                  <Form onSubmit={handleSubmit}>
+                  <Form onSubmit={handleSubmit} className={styles.loginForm}>
                     <Form.Group className={styles.formGroup}>
                       <Form.Label className={styles.formLabel}>
                         Email address

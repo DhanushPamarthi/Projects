@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { AlertCircle, ArrowLeft, Check, CheckCircle2, ChevronLeft, ChevronRight, ClipboardList, Database, LoaderCircle, Pencil, RotateCcw, ShieldCheck, Sparkles, X } from "lucide-react";
+import { AlertCircle, ArrowLeft, Check, CheckCircle2, ChevronLeft, ChevronRight, ClipboardList, LoaderCircle, Pencil, RotateCcw, ShieldCheck, Sparkles, X } from "lucide-react";
 import { generateFunctionalRequirements, generateTestCasesFromAnalysis, getRequirementAnalysis, getTestCaseGeneration, importExternalTestCases, listGeneratedTestCases, listProjectFunctionalRequirementHistory, listProjectTestCases, listProjectTestCaseHistory, listProjectTestCaseLibrary, listRequirementAnalyses, listTestData, previewTestCaseReuse, reviewTestCaseGeneration } from "../api/client.js";
 import { useActivities } from "../activity/activityStore.js";
 import { AppSelect } from "./AppSelect.jsx";
@@ -89,7 +89,7 @@ function caseDisplayTitle(item, allCases = []) {
   return `${title} · ${sameSource.length > 1 ? item.test_case_id : sourceId}`;
 }
 
-export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData, onReviewSaved, onAnalysisUnavailable, onAnalysisPrepared }) {
+export function TestCaseGenerationPage({ analysis, onBack, onReviewSaved, onAnalysisUnavailable, onAnalysisPrepared }) {
   const activities = useActivities();
   const [verifiedAnalysis, setVerifiedAnalysis] = useState(null);
   const [analysisLoading, setAnalysisLoading] = useState(Boolean(analysis?.analysis_id));
@@ -141,6 +141,12 @@ export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData,
   const generationRequirements = approvedRequirements.length ? approvedRequirements : requirements;
   const contract = caseContract(generation);
   const coverageSummary = contract.coverage_review?.summary || {};
+  const coverageGaps = (contract.coverage_review?.matrix || []).flatMap((requirement) => [
+    ...(requirement.status === "missing" ? [{ kind: "Functional requirement", id: requirement.requirement_id, label: requirement.title }] : []),
+    ...(requirement.acceptance_criteria || []).filter((item) => item.status === "missing").map((item) => ({ kind: "Acceptance criterion", id: item.id, label: item.label, requirementId: requirement.requirement_id })),
+    ...(requirement.business_rules || []).filter((item) => item.status === "missing").map((item) => ({ kind: "Business rule", id: item.id, label: item.label, requirementId: requirement.requirement_id })),
+    ...(requirement.scenario_branches || []).filter((item) => item.status === "missing").map((item) => ({ kind: "Scenario", id: item.id, label: item.label, requirementId: requirement.requirement_id })),
+  ]);
   const generationId = generation?.generation_id || contract.generation_id;
   const testCases = contract.test_cases || [];
   const generationMode = contract.generation_mode;
@@ -213,11 +219,17 @@ export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData,
 
   useEffect(() => {
     let active = true;
-    setVerifiedAnalysis(null);
     setAnalysisError("");
     if (!analysis?.analysis_id) {
       setAnalysisLoading(false);
-      setGeneration(null);
+      if (!analysis?.generation_pipeline) {
+        setGeneration(null);
+        setVerifiedAnalysis(null);
+      }
+      return () => { active = false; };
+    }
+    if (verifiedAnalysis?.analysis_id === analysis.analysis_id) {
+      setAnalysisLoading(false);
       return () => { active = false; };
     }
     setAnalysisLoading(true);
@@ -233,7 +245,7 @@ export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData,
       })
       .finally(() => { if (active) setAnalysisLoading(false); });
     return () => { active = false; };
-  }, [analysis?.analysis_id, onAnalysisUnavailable]);
+  }, [analysis?.analysis_id, analysis?.generation_pipeline, verifiedAnalysis?.analysis_id, onAnalysisUnavailable]);
   useEffect(() => {
     if (!analysis?.generation_pipeline || !analysis?.package_id || analysis?.analysis_id) return undefined;
     let active = true;
@@ -257,11 +269,11 @@ export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData,
   }, [analysis?.generation_pipeline, analysis?.package_id, analysis?.analysis_id, analysis?.project_id, analysis?.project_name, onAnalysisPrepared]);
 
   useEffect(() => {
-    if (isAnalysisLoading || !currentAnalysis?.analysis_id) return;
+    if (isAnalysisLoading || loading || !currentAnalysis?.analysis_id) return;
     listGeneratedTestCases(currentAnalysis.analysis_id)
       .then((items) => applyGeneration(items[0] || null))
       .catch((err) => setError(err.message || "Could not load generated test cases."));
-  }, [currentAnalysis?.analysis_id, isAnalysisLoading, generationActivityKey]);
+  }, [currentAnalysis?.analysis_id, isAnalysisLoading, loading, generationActivityKey]);
 
   useEffect(() => {
     if (!analysis?.generation_pipeline) return;
@@ -302,17 +314,27 @@ export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData,
     let progressTimer;
     setLoading(true);
     setError("");
+    setSuccess("");
     setWorkflowProgress({ percent: 5, label: "Preparing Functional Requirements" });
+    let requirementsReady = false;
     try {
       setWorkflowProgress({ percent: 18, label: "Generating Functional Requirements" });
       const nextAnalysis = await generateFunctionalRequirements(analysis.package_id);
-      setWorkflowProgress({ percent: 50, label: "Functional Requirements complete" });
+      requirementsReady = true;
+      setWorkflowProgress({ percent: 50, label: "Preparing test cases" });
       setVerifiedAnalysis(nextAnalysis);
       onAnalysisPrepared?.({ ...nextAnalysis, generation_pipeline: true, project_id: analysis.project_id, project_name: analysis.project_name });
-      setWorkflowProgress({ percent: 100, label: "Functional Requirements ready" });
-      setSuccess("Functional Requirements are ready. Generate cases for this version or review the project-wide test-case history below.");
+      setWorkflowProgress({ percent: 58, label: "Generating test cases" });
+      progressTimer = advanceProgressUntilComplete(setWorkflowProgress);
+      const nextGeneration = await generateTestCasesFromAnalysis(nextAnalysis.analysis_id, {});
+      applyGeneration(nextGeneration);
+      setSelected([]);
+      setWorkflowProgress({ percent: 100, label: "Test cases generated" });
+      setSuccess("Test cases are ready for review. You can also review project-wide test-case history below.");
     } catch (err) {
-      setError(err.message || "Could not complete Test Case generation.");
+      setError(requirementsReady
+        ? `Functional Requirements are ready, but test-case generation failed: ${err.message || "Please try again."}`
+        : err.message || "Could not prepare Functional Requirements.");
     } finally {
       if (progressTimer) window.clearInterval(progressTimer);
       setLoading(false);
@@ -490,8 +512,9 @@ export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData,
     if (!projectId) return null;
     const history = functionalHistory?.analyses || [];
     const requirementCount = history.reduce((total, item) => total + (item.requirements?.length || 0), 0);
-    return <section className="requirements-panel project-case-history-panel functional-requirement-history-panel">
-      <div className="panel-title-row"><div><h2>Functional Requirement history</h2><p className="panel-helper">Prior FRs stay attached to their BRD / package versions, with links to generated test cases. Similarity matches are review suggestions, not automatic merges.</p></div><span>{requirementCount} FRs · {history.length} analyses</span></div>
+    return <details className="requirements-panel project-case-history-panel functional-requirement-history-panel history-collapse-panel">
+      <summary className="history-collapse-summary"><div><h2>Functional Requirement history</h2><p className="panel-helper">Prior FRs stay attached to their BRD / package versions, with links to generated test cases. Similarity matches are review suggestions, not automatic merges.</p></div><span className="history-collapse-count">{requirementCount} FRs · {history.length} analyses</span></summary>
+      <div className="history-collapse-content">
       {functionalHistoryLoading && !functionalHistory ? <p className="project-case-empty">Loading Functional Requirement history…</p> : null}
       {functionalHistoryError ? <p className="error-message">{functionalHistoryError}</p> : null}
       {!functionalHistoryLoading && !history.length ? <p className="project-case-empty">No previous Functional Requirement analyses are saved for this project.</p> : null}
@@ -518,22 +541,25 @@ export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData,
           })}</div>
         </details>;
       })}</div>}
-    </section>;
+      </div>
+    </details>;
   }
 
   function projectHistorySection() {
     if (!projectId) return null;
     const versions = projectCaseData?.versions || [];
     const cases = projectCaseMode === "cumulative" ? (projectCaseData?.cases || []) : (versionCaseData?.cases || []);
-    return <section className="requirements-panel project-case-history-panel">
-      <div className="panel-title-row"><div><h2>Project test cases</h2><p className="panel-helper">View the unique cumulative set or cases from one BRD / Resource Package version.</p></div><span>{cases.length} unique</span></div>
+    return <details className="requirements-panel project-case-history-panel history-collapse-panel">
+      <summary className="history-collapse-summary"><div><h2>Project test cases</h2><p className="panel-helper">View the unique cumulative set or cases from one BRD / Resource Package version.</p></div><span className="history-collapse-count">{cases.length} unique</span></summary>
+      <div className="history-collapse-content">
       <div className="project-case-history-controls"><button type="button" className={`secondary-button compact-button ${projectCaseMode === "cumulative" ? "active" : ""}`} aria-pressed={projectCaseMode === "cumulative"} onClick={() => setProjectCaseMode("cumulative")}>Cumulative test cases</button><button type="button" className={`secondary-button compact-button ${projectCaseMode === "version" ? "active" : ""}`} aria-pressed={projectCaseMode === "version"} onClick={() => setProjectCaseMode("version")} disabled={!versions.length}>BRD version</button>{projectCaseMode === "version" && versions.length > 0 && <label className="project-case-version-select">Version<AppSelect aria-label="Select BRD version" value={selectedPackageVersion} onChange={(event) => setSelectedPackageVersion(event.target.value)}>{versions.map((version) => <option key={version.package_version} value={version.package_version}>Version {version.package_version} · {version.test_case_count} cases</option>)}</AppSelect></label>}</div>
       {projectCaseMode === "version" && !versions.length ? <p className="project-case-empty">No BRD versions are available yet.</p> : projectCaseMode === "version" && !versionCaseData ? <p className="project-case-empty">Loading version test cases…</p> : cases.length ? <div className="project-case-history-list">{cases.map((item, index) => {
         const testCase = item.case || {};
         const sourceVersions = item.package_versions?.length ? item.package_versions.map((version) => `v${version}`).join(", ") : item.package_version ? `v${item.package_version}` : "External import";
         return <details className="project-case-history-item" key={`${item.generation_ids?.[0] || item.generation_id || item.source_name || "external"}:${testCase.test_case_id || testCase.title || index}`}><summary><span><strong>{testCase.title || testCase.test_case_id || "Imported test case"}</strong><small>{testCase.requirement_id || displayText(testCase.requirement_text) || "External"} · {item.origin === "external" ? (item.sources?.join(", ") || item.source_name || "External import") : `BRD / Resource Package ${sourceVersions}`}</small></span><span className={`test-case-review-badge ${testCase.review_status || "pending"}`}>{testCase.review_status || "Imported"}</span></summary><div className="project-case-history-details"><section><b>Steps</b><ol>{(testCase.steps || []).map((step, stepIndex) => <li key={stepIndex}>{displayText(step)}</li>)}</ol></section><section><b>Expected results</b><ul>{(testCase.expected_results || []).map((result, resultIndex) => <li key={resultIndex}>{displayText(result)}</li>)}</ul></section></div></details>;
       })}</div> : <p className="project-case-empty">No test cases are saved for this selection yet.</p>}
-    </section>;
+      </div>
+    </details>;
   }
 
   function externalImportSection() {
@@ -614,11 +640,11 @@ export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData,
         : [{ status: "pending", label: "Move to pending", icon: <RotateCcw size={14} />, className: "pending-action" }, { status: "approved", label: "Approve", icon: <Check size={14} />, className: "approved-action" }];
     const selectedInTable = items.map((item) => item.test_case_id).filter((id) => selected.includes(id));
     const showComments = title === "Rejected test cases";
-    return <section className={`requirements-panel generated-cases-panel review-status-panel review-status-${title.toLowerCase().replace(/\s+/g, "-")}`}><div className="panel-title-row"><div><h2>{title}</h2><p className="panel-helper">{items.length} test case{items.length === 1 ? "" : "s"}</p></div><div className="review-panel-heading-actions"><span>{items.length}</span>{title === "Approved test cases" && <button type="button" className="primary-button compact-button sync-test-data-button" onClick={onContinueToTestData}><Database size={14} /> Sync Test Data</button>}</div></div>{selectable && <div className="selection-actions"><label className="select-all"><input type="checkbox" checked={allSelected} onChange={(event) => setSelected(event.target.checked ? items.map((item) => item.test_case_id) : [])} /> Select all</label><div className="review-move-actions">{actions.map((action) => <button key={action.status} type="button" className={`review-icon-action ${action.className}`} disabled={!selectedInTable.length || saving} title={`${action.label} selected test cases`} onClick={() => handleStatusAction(action.status, selectedInTable)}>{action.icon} {action.label}</button>)}</div></div>}<div className="test-case-execution-table-wrap"><table className="test-case-execution-table"><thead><tr><th className="test-case-grid-select-heading"></th><th>TC#</th><th>Test Title</th><th>Test Steps</th><th>Test data</th><th>Expected</th><th>Status</th>{showComments && <th>Review comment</th>}<th className="test-case-grid-actions"></th></tr></thead><tbody>{visibleItems.map((item) => testCaseTableRow(item, selectable))}</tbody></table></div>{pageCount > 1 && <nav className="test-case-pagination" aria-label={`${title} pages`}><span>Showing {(currentPage - 1) * casesPerPage + 1}–{Math.min(currentPage * casesPerPage, items.length)} of {items.length}</span><div><button type="button" aria-label="Previous page" disabled={currentPage === 1} onClick={() => setCasePage(currentPage - 1)}><ChevronLeft size={16} /></button>{Array.from({ length: pageCount }, (_, index) => index + 1).map((pageNumber) => <button type="button" className={currentPage === pageNumber ? "active" : ""} aria-current={currentPage === pageNumber ? "page" : undefined} key={pageNumber} onClick={() => setCasePage(pageNumber)}>{pageNumber}</button>)}<button type="button" aria-label="Next page" disabled={currentPage === pageCount} onClick={() => setCasePage(currentPage + 1)}><ChevronRight size={16} /></button></div></nav>}</section>;
+    return <section className={`requirements-panel generated-cases-panel review-status-panel review-status-${title.toLowerCase().replace(/\s+/g, "-")}`}><div className="panel-title-row"><div><h2>{title}</h2><p className="panel-helper">{items.length} test case{items.length === 1 ? "" : "s"}</p></div><div className="review-panel-heading-actions"><span>{items.length}</span></div></div>{selectable && <div className="selection-actions"><label className="select-all"><input type="checkbox" checked={allSelected} onChange={(event) => setSelected(event.target.checked ? items.map((item) => item.test_case_id) : [])} /> Select all</label><div className="review-move-actions">{actions.map((action) => <button key={action.status} type="button" className={`review-icon-action ${action.className}`} disabled={!selectedInTable.length || saving} title={`${action.label} selected test cases`} onClick={() => handleStatusAction(action.status, selectedInTable)}>{action.icon} {action.label}</button>)}</div></div>}<div className="test-case-execution-table-wrap"><table className="test-case-execution-table"><thead><tr><th className="test-case-grid-select-heading"></th><th>TC#</th><th>Test Title</th><th>Test Steps</th><th>Test data</th><th>Expected</th><th>Status</th>{showComments && <th>Review comment</th>}<th className="test-case-grid-actions"></th></tr></thead><tbody>{visibleItems.map((item) => testCaseTableRow(item, selectable))}</tbody></table></div>{pageCount > 1 && <nav className="test-case-pagination" aria-label={`${title} pages`}><span>Showing {(currentPage - 1) * casesPerPage + 1}–{Math.min(currentPage * casesPerPage, items.length)} of {items.length}</span><div><button type="button" aria-label="Previous page" disabled={currentPage === 1} onClick={() => setCasePage(currentPage - 1)}><ChevronLeft size={16} /></button>{Array.from({ length: pageCount }, (_, index) => index + 1).map((pageNumber) => <button type="button" className={currentPage === pageNumber ? "active" : ""} aria-current={currentPage === pageNumber ? "page" : undefined} key={pageNumber} onClick={() => setCasePage(pageNumber)}>{pageNumber}</button>)}<button type="button" aria-label="Next page" disabled={currentPage === pageCount} onClick={() => setCasePage(currentPage + 1)}><ChevronRight size={16} /></button></div></nav>}</section>;
   }
 
-  if (isAnalysisLoading) {
-    return <div className="requirements-page test-generation-page"><section className="generation-empty" role="status"><LoaderCircle className="spin" size={22} /><h3>Checking project generation context</h3></section></div>;
+  if (isAnalysisLoading && !currentAnalysis) {
+    return <div className="requirements-page test-generation-page">{pageHeader()}<section className="generation-empty generation-context-loading" role="status"><LoaderCircle className="spin" size={22} /><div><h3>Preparing test case generation</h3><p>Loading the selected project’s requirements and generation history.</p></div></section></div>;
   }
   if (!currentAnalysis && analysis?.generation_pipeline && analysis?.package_id) {
     const progress = workflowProgress || { percent: 0, label: "Ready to start" };
@@ -639,13 +665,13 @@ export function TestCaseGenerationPage({ analysis, onBack, onContinueToTestData,
     {pageHeader()}
     {error && <div className="error-message"><AlertCircle size={17} /> {error}</div>}
     {success && <div className="toast-message"><CheckCircle2 size={17} /> {success}</div>}
-    {generation && <section className="requirements-panel test-case-coverage-summary" aria-label="Test case coverage and evidence"><h2>Coverage and grounding</h2><div className="test-case-coverage-metrics"><span>FRs: {coverageSummary.requirements_covered || 0}/{coverageSummary.requirements_total || 0}</span><span>Acceptance criteria: {coverageSummary.acceptance_criteria_covered || 0}/{coverageSummary.acceptance_criteria_total || 0}</span><span>Business rules: {coverageSummary.business_rules_covered || 0}/{coverageSummary.business_rules_total || 0}</span><span>{knowledgeUsed ? "Knowledge Base evidence used" : "Knowledge Base evidence unavailable"}</span></div><p>{testCases.length} cases generated for this version. The cumulative history combines exact or equivalent cases across versions.</p>{(contract.global_gaps || []).length > 0 && <details><summary>Open coverage gaps ({contract.global_gaps.length})</summary><ul>{contract.global_gaps.map((gap, index) => <li key={index}>{gap}</li>)}</ul></details>}</section>}
     <section className="generation-next-card"><div><div className="eyebrow">GENERATION</div><h2>{generation ? "Test cases ready for review" : activeGenerationActivity ? "Generation in progress" : "Generate test cases"}</h2><p>{generation ? `${testCases.length} cases generated from the approved project context.` : activeGenerationActivity ? "Generation continues in the background. You can safely open another page." : "Create positive and negative cases from approved requirements."}</p></div><div className="generation-controls project-generation-controls">{analysis?.generation_pipeline && loading && workflowProgress && <div className="test-case-inline-progress" aria-label="Test Case generation progress"><div className={`project-progress-track ${workflowProgress.percent === 100 ? "completed" : ""} running`} role="progressbar" aria-label="Test Case generation" aria-valuemin="0" aria-valuemax="100" aria-valuenow={workflowProgress.percent}><span style={{ width: `${workflowProgress.percent}%` }} /></div><div className={`project-progress-meta ${workflowProgress.percent === 100 ? "completed" : ""}`}><strong>{workflowProgress.percent}%</strong><span>{workflowProgress.label}</span></div></div>}{generation ? <span className="test-case-generation-ready"><CheckCircle2 size={16} /> Generated · {testCases.length} cases</span> : !(analysis?.generation_pipeline && loading) && !activeGenerationActivity && <button type="button" className="primary-button" disabled={!generationRequirements.length || loading} onClick={generate}><ShieldCheck size={16} /> Generate test cases</button>}</div></section>
     {generation && <section className="review-tabs-shell"><div className="review-tabs" role="tablist" aria-label="Test case review status"><button type="button" className={reviewTab === "pending" ? "active" : ""} role="tab" aria-selected={reviewTab === "pending"} onClick={() => { setReviewTab("pending"); setCasePage(1); }}>Pending Review <span>{pendingCaseItems.length}</span></button><button type="button" className={reviewTab === "approved" ? "active" : ""} role="tab" aria-selected={reviewTab === "approved"} onClick={() => { setReviewTab("approved"); setCasePage(1); }}>Approved <span>{approvedCaseItems.length}</span></button><button type="button" className={reviewTab === "rejected" ? "active" : ""} role="tab" aria-selected={reviewTab === "rejected"} onClick={() => { setReviewTab("rejected"); setCasePage(1); }}>Rejected <span>{rejectedCaseItems.length}</span></button></div><div className="review-tab-content">{reviewTab === "pending" && reviewTable("Pending review", pendingCaseItems, true)}{reviewTab === "approved" && reviewTable("Approved test cases", approvedCaseItems, true)}{reviewTab === "rejected" && reviewTable("Rejected test cases", rejectedCaseItems, true)}</div></section>}
     {editingId && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setEditingId(""); }}><div className="confirm-modal case-edit-modal" role="dialog" aria-modal="true" aria-labelledby="case-edit-heading"><button type="button" className="modal-close" aria-label="Close edit test case" onClick={() => setEditingId("")}><X size={18} /></button><div className="eyebrow">EDIT TEST CASE · {editingId}</div><h2 id="case-edit-heading">Update test case details</h2><p className="case-edit-context">Update the test design and capture reviewer notes for this case. Use <strong>Save review</strong> below the table to persist all review changes.</p><label className="case-edit-field">Test title<input className="test-case-grid-input" value={editingTitle} onChange={(event) => setEditingTitle(event.target.value)} /></label><label className="case-edit-field">Test steps<textarea className="test-case-grid-input test-case-grid-textarea" value={editingSteps} onChange={(event) => setEditingSteps(event.target.value)} /></label><label className="case-edit-field">Expected results<textarea className="test-case-grid-input test-case-grid-textarea" value={editingExpected} onChange={(event) => setEditingExpected(event.target.value)} /></label><label className="case-edit-field case-edit-review-notes">Review notes<span className="case-edit-help">{(statuses[editingId] || testCases.find((item) => item.test_case_id === editingId)?.review_status || testCases.find((item) => item.test_case_id === editingId)?.approval?.status || "pending") === "rejected" ? "Required for rejected test cases." : "Optional reviewer context or revision guidance."}</span><textarea className="test-case-grid-input test-case-grid-textarea" value={editingReviewComment} onChange={(event) => setEditingReviewComment(event.target.value)} placeholder="Add a review comment" /></label><div className="confirm-actions"><button type="button" className="secondary-button" onClick={() => setEditingId("")}>Cancel</button><button type="button" className="primary-button" onClick={() => saveEdit(editingId)}>Save changes</button></div></div></div>}
-    {generation && <section className="requirements-review-card"><div className="test-review-heading"><div><div className="eyebrow">HUMAN REVIEW</div><h2>{allApproved ? "Review complete" : "Finalize review"}</h2></div>{approvedCaseItems.length > 0 && <button type="button" className="secondary-button compact-button" disabled={hasUnsavedDecisions} title={hasUnsavedDecisions ? "Save review decisions first" : undefined} onClick={onContinueToTestData}>Continue to test data</button>}</div><div className="review-fields"><label>Reviewer<input value={reviewer} onChange={(event) => setReviewer(event.target.value)} /></label><label>Review comments<textarea value={comments} onChange={(event) => setComments(event.target.value)} placeholder="Optional review notes" /></label><button className="primary-button" onClick={saveReview} disabled={saving || !testCases.length}>{saving ? <><LoaderCircle className="spin" size={16} /> Saving...</> : <><ShieldCheck size={16} /> Save review</>}</button></div></section>}
+    {generation && <section className="requirements-review-card"><div className="test-review-heading"><div><div className="eyebrow">HUMAN REVIEW</div><h2>{allApproved ? "Review complete" : "Finalize review"}</h2></div></div><div className="review-fields"><label>Reviewer<input value={reviewer} onChange={(event) => setReviewer(event.target.value)} /></label><label>Review comments<textarea value={comments} onChange={(event) => setComments(event.target.value)} placeholder="Optional review notes" /></label><button className="primary-button" onClick={saveReview} disabled={saving || !testCases.length}>{saving ? <><LoaderCircle className="spin" size={16} /> Saving...</> : <><ShieldCheck size={16} /> Save review</>}</button></div></section>}
     {functionalRequirementHistorySection()}
     {projectHistorySection()}
+    {generation && <details className="requirements-panel test-case-coverage-summary coverage-collapse-panel" aria-label="Test case coverage and evidence"><summary className="coverage-collapse-summary"><h2>Coverage and grounding</h2><span>{coverageSummary.requirements_covered || 0}/{coverageSummary.requirements_total || 0} requirements covered</span></summary><div className="coverage-collapse-content"><div className="test-case-coverage-metrics"><span>FRs: {coverageSummary.requirements_covered || 0}/{coverageSummary.requirements_total || 0}</span><span>Acceptance criteria: {coverageSummary.acceptance_criteria_covered || 0}/{coverageSummary.acceptance_criteria_total || 0}</span><span>Business rules: {coverageSummary.business_rules_covered || 0}/{coverageSummary.business_rules_total || 0}</span><span>{knowledgeUsed ? "Knowledge Base evidence used" : "Knowledge Base evidence unavailable"}</span></div><p>{testCases.length} cases generated for this version. The cumulative history combines exact or equivalent cases across versions.</p>{(coverageGaps.length > 0 || (contract.global_gaps || []).length > 0) && <details className="coverage-gap-details"><summary>View coverage gaps ({coverageGaps.length + (contract.global_gaps || []).length})</summary>{coverageGaps.length > 0 && <ul className="coverage-gap-list">{coverageGaps.map((gap, index) => <li key={`${gap.kind}-${gap.id}-${index}`}><strong>{gap.kind}{gap.id ? ` ${gap.id}` : ""}{gap.requirementId ? ` · ${gap.requirementId}` : ""}:</strong> {gap.label || "No description available"}</li>)}</ul>}{(contract.global_gaps || []).length > 0 && <ul className="coverage-gap-list">{contract.global_gaps.map((gap, index) => <li key={`global-${index}`}>{gap}</li>)}</ul>}</details>}</div></details>}
     {externalImportSection()}
   </div>;
 }

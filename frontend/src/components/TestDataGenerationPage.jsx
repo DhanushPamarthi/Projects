@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { ClipboardList } from "lucide-react";
 import { listGeneratedTestCases, listRequirementAnalyses } from "../api/client.js";
+import { useActivities } from "../activity/activityStore.js";
 import { TestDataStage } from "./TestDataStage.jsx";
 import { LoadingSpinner } from "./LoadingSpinner.jsx";
 import { WorkspacePageHero } from "./WorkspacePageHero.jsx";
@@ -10,6 +11,8 @@ function getContract(generation) {
 }
 
 export function TestDataGenerationPage({ analysis, onGoToTestCases, onContinueToResults }) {
+  const activities = useActivities();
+  const testDataActivity = activities.find((item) => item.status === "running" && item.label === "Generating test data");
   const [generation, setGeneration] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -45,7 +48,8 @@ export function TestDataGenerationPage({ analysis, onGoToTestCases, onContinueTo
 
   return <div className="requirements-page test-generation-page professional-workspace-page">
     <WorkspacePageHero productLabel="TestIQ · Test Data" eyebrow="TEST DATA" title="Test Data Intelligence" context={analysis?.project_name} cues={["Approved scope", "Controlled generation", "Raw layer readiness"]} />
+    {testDataActivity && <section className="test-data-generation-progress" role="status" aria-live="polite"><div className="test-data-generation-progress-track" role="progressbar" aria-label="Test data generation in progress"><span /></div><div><strong>Generating test data</strong><p>Creating data for the selected cases. You can move to another page and return while this continues.</p></div></section>}
     {error && <div className="error-message">{error}</div>}
-    {loading ? <LoadingSpinner variant="section" label="Loading approved test cases" detail="Preparing test-data generation context." /> : !analysis ? <section className="generation-empty"><ClipboardList size={22} /><h3>No test-case analysis selected</h3><p>Generate and approve test cases first.</p><button type="button" className="primary-button" onClick={onGoToTestCases}>Open test cases</button></section> : !generationId ? <section className="generation-empty"><ClipboardList size={22} /><h3>Generate test cases first</h3><p>Approved test cases are required.</p><button type="button" className="primary-button" onClick={onGoToTestCases}>Open test cases</button></section> : approvedCases.length === 0 ? <section className="generation-empty"><ClipboardList size={22} /><h3>No approved test cases</h3><p>Approve at least one test case.</p><button type="button" className="primary-button" onClick={onGoToTestCases}>Review test cases</button></section> : <TestDataStage projectId={analysis.project_id || contract.project_id} generationId={generationId} approvedCases={approvedCases} reviewer="Product Owner" onGoToTestCases={onGoToTestCases} onContinueToResults={onContinueToResults} />}
+    {loading ? testDataActivity ? <div className="test-data-generation-loading">Refreshing approved cases and generated records…</div> : <LoadingSpinner variant="section" label="Loading approved test cases" detail="Preparing test-data generation context." /> : !analysis ? <section className="generation-empty"><ClipboardList size={22} /><h3>No test-case analysis selected</h3><p>Generate and approve test cases first.</p><button type="button" className="primary-button" onClick={onGoToTestCases}>Open test cases</button></section> : !generationId ? <section className="generation-empty"><ClipboardList size={22} /><h3>Generate test cases first</h3><p>Approved test cases are required.</p><button type="button" className="primary-button" onClick={onGoToTestCases}>Open test cases</button></section> : approvedCases.length === 0 ? <section className="generation-empty"><ClipboardList size={22} /><h3>No approved test cases</h3><p>Approve at least one test case.</p><button type="button" className="primary-button" onClick={onGoToTestCases}>Review test cases</button></section> : <TestDataStage projectId={analysis.project_id || contract.project_id} generationId={generationId} approvedCases={approvedCases} reviewer="Product Owner" generationInProgress={Boolean(testDataActivity)} onGoToTestCases={onGoToTestCases} onContinueToResults={onContinueToResults} />}
   </div>;
 }

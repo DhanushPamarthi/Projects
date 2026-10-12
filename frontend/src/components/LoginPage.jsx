@@ -129,7 +129,6 @@ export function LoginPage({ onLogin, onRegister }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
-  const [rememberMe, setRememberMe] = useState(false);
   const [error, setError] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
 
@@ -185,7 +184,7 @@ export function LoginPage({ onLogin, onRegister }) {
                     </Alert>
                   )}
 
-                  <Form onSubmit={handleSubmit}>
+                  <Form onSubmit={handleSubmit} className={styles.loginForm}>
                     <Form.Group className={styles.formGroup}>
                       <Form.Label className={styles.formLabel}>
                         Email address
@@ -230,20 +229,6 @@ export function LoginPage({ onLogin, onRegister }) {
                         </button>
                       </div>
                     </Form.Group>
-
-                    <div className={styles.formExtras}>
-                      <Form.Check
-                        type="checkbox"
-                        id="rememberMe"
-                        checked={rememberMe}
-                        onChange={(e) => setRememberMe(e.target.checked)}
-                        label="Remember me"
-                        className={styles.rememberCheck}
-                      />
-                      <a href="#forgot" className={styles.forgotLink}>
-                        Forgot password?
-                      </a>
-                    </div>
 
                     <Button
                       type="submit"

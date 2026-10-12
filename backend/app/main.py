@@ -1874,6 +1874,27 @@ def _sanitize_test_case_traceability(contract, approved_requirements):
                 "scenario": case_id,
                 "message": f"{case_id} cited out-of-scope {label} ID(s): {', '.join(map(str, invalid))}. Invalid IDs were removed; verify coverage for the owning requirement.",
             })
+        for field, items, id_key, label, acceptance in (
+            ("acceptance_criteria_ids", requirement.get("acceptance_criteria", []), "acceptance_id", "acceptance criterion", True),
+            ("business_rule_ids", requirement.get("business_rules", []), "rule_id", "business rule", False),
+        ):
+            cited_ids = set(test_case.get(field) or [])
+            inferred_ids = [
+                item.get(id_key) for item in items
+                if isinstance(item, dict) and item.get(id_key) and item.get(id_key) not in cited_ids
+                and _test_case_exercises_item(test_case, item, acceptance=acceptance)
+            ]
+            if inferred_ids:
+                test_case[field] = list(dict.fromkeys([*(test_case.get(field) or []), *inferred_ids]))
+                findings.append({
+                    "finding_id": f"GEN-{len(findings) + 1:03d}",
+                    "type": "traceability_inferred_from_executable_coverage",
+                    "severity": "low",
+                    "status": "requires_qa_confirmation",
+                    "requirement_id": requirement.get("requirement_id"),
+                    "scenario": case_id,
+                    "message": f"{case_id} was mapped to {label} ID(s) {', '.join(inferred_ids)} because its executable content matches the approved item. Confirm this inferred traceability during review.",
+                })
     return findings
 
 def _validate_test_case_contract(contract, approved_requirements, requested_count=None, discovery_contexts=None, rag_context=None, enforce_coverage=True, enforce_data_alignment=True):
@@ -1921,8 +1942,7 @@ def _validate_test_case_contract(contract, approved_requirements, requested_coun
             if not criterion_id:
                 continue
             exercised = any(
-                criterion_id in (case.get("acceptance_criteria_ids") or [])
-                and _test_case_exercises_item(case, criterion, acceptance=True)
+                _test_case_exercises_item(case, criterion, acceptance=True)
                 for case in requirement_cases
             )
             if not exercised:
@@ -1941,8 +1961,7 @@ def _validate_test_case_contract(contract, approved_requirements, requested_coun
             if not rule_id:
                 continue
             exercised = any(
-                rule_id in (case.get("business_rule_ids") or [])
-                and _test_case_exercises_item(case, rule)
+                _test_case_exercises_item(case, rule)
                 for case in requirement_cases
             )
             if not exercised:
@@ -2139,10 +2158,11 @@ def _test_cases_with_openai(approved_requirements, package, requested_count, dis
                                      if item.get("rule_id") == rule_id), None)
                         if rule:
                             repair_guidance += (
-                                f"The missing business rule {rule_id} belongs to requirement {requirement.get('requirement_id')}. "
+                                f"Business rule {rule_id} belongs to requirement {requirement.get('requirement_id')} and failed executable coverage. "
                                 f"Create or update a case for that requirement and include the exact ID {rule_id} "
                                 f"in business_rule_ids. The approved rule is: {rule.get('text')}. "
-                                "The case must exercise the rule's behavior, not merely add an unrelated citation. "
+                                "The steps, data needs, actions, and expected results must explicitly exercise the rule's condition and outcome. "
+                                "If the current evidence cannot support an executable case, do not cite the rule; record it as a coverage gap for QA. "
                             )
                             break
                 missing_category = re.search(r"required category coverage: ([a-z_]+)", previous_error, re.IGNORECASE)
@@ -2212,7 +2232,7 @@ def _test_cases_with_openai(approved_requirements, package, requested_count, dis
     # Preserve usable cases when one or more cases fail strict evidence
     # validation. The failed cases become explicit QA findings instead of
     # discarding the entire generation.
-    if isinstance(previous_invalid_output, dict) and requested_count is not None:
+    if isinstance(previous_invalid_output, dict):
         usable_cases = []
         findings = []
         for candidate in previous_invalid_output.get("test_cases", []) or []:
@@ -2248,6 +2268,7 @@ def _test_cases_with_openai(approved_requirements, package, requested_count, dis
             }
             findings.extend(finding for finding in salvage_validation if finding.get("type") in coverage_types)
             salvaged["generation_findings"] = findings + [{"finding_id": f"GEN-{len(findings)+1:03d}", "type": "generation_attempt", "severity": "high", "status": "requires_qa_confirmation", "requirement_id": None, "scenario": None, "message": failures[-1]["details"]}]
+            salvaged["partial_generation"] = True
             salvaged["agent_attempts"] = [{"attempt": TEST_CASE_GENERATION_MAX_ATTEMPTS, "status": "passed_with_findings", "details": "Usable test cases were retained; failed scenarios were recorded for QA confirmation."}]
             return salvaged
     raise ValueError(f"LLM test-case generation failed validation after {TEST_CASE_GENERATION_MAX_ATTEMPTS} attempts: {failures[-1]['details']}")
@@ -2270,17 +2291,30 @@ def _validate_requirement_case_mapping(cases, requirements):
         raise ValueError(f"Test cases must map to every current Functional Requirement; missing={missing}, unknown={unknown}")
     for case in cases:
         owner = by_id[case["requirement_id"]]
+        acceptance_criteria = [item for item in owner.get("acceptance_criteria", []) if isinstance(item, dict)]
+        business_rules = [item for item in owner.get("business_rules", []) if isinstance(item, dict)]
         supported = any(
-            item.get("acceptance_id") in (case.get("acceptance_criteria_ids") or []) and
             _test_case_exercises_item(case, item, acceptance=True)
-            for item in owner.get("acceptance_criteria", []) if isinstance(item, dict)
+            for item in acceptance_criteria if item.get("acceptance_id")
         ) or any(
-            item.get("rule_id") in (case.get("business_rule_ids") or []) and
             _test_case_exercises_item(case, item)
-            for item in owner.get("business_rules", []) if isinstance(item, dict)
+            for item in business_rules if item.get("rule_id")
         )
+        traceable_items = any(item.get("acceptance_id") for item in acceptance_criteria) or any(item.get("rule_id") for item in business_rules)
+        if not supported and not traceable_items:
+            # Some approved Functional Requirements contain only a statement
+            # and source references. In that case, validate executable overlap
+            # against the documented behavior instead of requiring IDs that do
+            # not exist in the requirement contract.
+            requirement_text = " ".join([
+                str(owner.get("title") or ""),
+                str(owner.get("statement") or owner.get("description") or ""),
+                " ".join(str(item.get(key) or "") for item in acceptance_criteria for key in ("given", "when", "then", "scenario")),
+                " ".join(str(item.get("text") or "") for item in business_rules),
+            ]).strip()
+            supported = _test_case_exercises_item(case, {"text": requirement_text})
         if not supported:
-            raise ValueError(f"Test case {case.get('test_case_id')} is not supported by executable coverage of {case['requirement_id']}")
+            raise ValueError(f"Test case {case.get('test_case_id')} is not supported by executable coverage of {case['requirement_id']}; ensure its steps and expected results exercise an acceptance criterion, business rule, or documented requirement behavior")
 
 def _deduplicate_generated_test_cases(contract):
     def normalize(value):
@@ -2359,11 +2393,9 @@ def _build_test_case_coverage_review(contract, approved_requirements):
         requirement_cases = [case for case in test_cases if case.get("requirement_id") == requirement_id]
         requirement_case_ids = [case.get("test_case_id") for case in requirement_cases if case.get("test_case_id")]
         if any(
-            any(item.get("acceptance_id") in (case.get("acceptance_criteria_ids") or []) and
-                _test_case_exercises_item(case, item, acceptance=True)
+            any(_test_case_exercises_item(case, item, acceptance=True)
                 for item in requirement.get("acceptance_criteria", []) if isinstance(item, dict)) or
-            any(item.get("rule_id") in (case.get("business_rule_ids") or []) and
-                _test_case_exercises_item(case, item)
+            any(_test_case_exercises_item(case, item)
                 for item in requirement.get("business_rules", []) if isinstance(item, dict))
             for case in requirement_cases
         ):
@@ -2375,8 +2407,7 @@ def _build_test_case_coverage_review(contract, approved_requirements):
                 continue
             criterion_id = criterion.get("acceptance_id")
             mapped = [case.get("test_case_id") for case in requirement_cases
-                      if criterion_id in (case.get("acceptance_criteria_ids") or []) and
-                      _test_case_exercises_item(case, criterion, acceptance=True)]
+                      if _test_case_exercises_item(case, criterion, acceptance=True)]
             acceptance_items.append(_coverage_item(criterion_id, criterion.get("scenario") or criterion.get("then") or criterion.get("text"), mapped))
         totals["acceptance_criteria_total"] += len(acceptance_items)
         totals["acceptance_criteria_covered"] += sum(1 for item in acceptance_items if item["status"] == "covered")
@@ -2387,8 +2418,7 @@ def _build_test_case_coverage_review(contract, approved_requirements):
                 continue
             rule_id = rule.get("rule_id")
             mapped = [case.get("test_case_id") for case in requirement_cases
-                      if rule_id in (case.get("business_rule_ids") or []) and
-                      _test_case_exercises_item(case, rule)]
+                      if _test_case_exercises_item(case, rule)]
             rule_items.append(_coverage_item(rule_id, rule.get("text"), mapped))
         totals["business_rules_total"] += len(rule_items)
         totals["business_rules_covered"] += sum(1 for item in rule_items if item["status"] == "covered")
@@ -4366,16 +4396,18 @@ def generate_test_cases_from_analysis(analysis_id: str, request: TestCaseGenerat
                 generated["generation_findings"].extend(part.get("generation_findings", []))
                 generated["agent_attempts"].extend(part.get("agent_attempts", []))
                 generated["coverage"]["required_categories"].extend(part.get("coverage", {}).get("required_categories", []))
+                generated["partial_generation"] = generated.get("partial_generation", False) or bool(part.get("partial_generation"))
             generated["test_cases"] = copied + generated["test_cases"]
-            if requested_count is None:
+            partial_generation = bool(generated.get("partial_generation"))
+            if requested_count is None and not partial_generation:
                 _validate_requirement_case_mapping(generated["test_cases"], approved_requirements)
             _deduplicate_generated_test_cases(generated)
-            if requested_count is None:
+            if requested_count is None and not partial_generation:
                 _validate_requirement_case_mapping(generated["test_cases"], approved_requirements)
                 combined_findings = _validate_test_case_contract(generated, approved_requirements, None, discovery_contexts, rag)
                 uncovered = next((item for item in combined_findings if item.get("type") in {
                     "missing_acceptance_criterion", "unexercised_acceptance_criterion", "missing_business_rule", "unexercised_business_rule"}), None)
-                if uncovered:
+                if uncovered and not partial_generation:
                     raise ValueError(f"Incomplete FR coverage: {uncovered['message']}")
             generated["reuse_decisions"] = reuse_audit
         except Exception as exc:
@@ -4417,7 +4449,15 @@ def generate_test_cases_from_analysis(analysis_id: str, request: TestCaseGenerat
 @app.get("/api/v1/requirement-analyses/{analysis_id}/test-cases")
 def list_generated_test_cases(analysis_id: str):
     with connection() as conn:
-        return [_test_case_generation_response(row) for row in conn.execute("SELECT * FROM test_case_generation WHERE analysis_id=%s ORDER BY created_at DESC", (analysis_id,)).fetchall()]
+        responses = []
+        analysis = conn.execute("SELECT contract_json FROM requirement_analysis WHERE analysis_id=%s", (analysis_id,)).fetchone()
+        requirements = _approved_requirement_payload(json.loads(analysis["contract_json"])) if analysis else []
+        for row in conn.execute("SELECT * FROM test_case_generation WHERE analysis_id=%s ORDER BY created_at DESC", (analysis_id,)).fetchall():
+            result = _test_case_generation_response(row)
+            if requirements:
+                _apply_coverage_and_quality_review(result["contract"], requirements)
+            responses.append(result)
+        return responses
 
 @app.get("/api/v1/test-case-generations/{generation_id}")
 def get_test_case_generation(generation_id: str):
@@ -4425,7 +4465,12 @@ def get_test_case_generation(generation_id: str):
         row = conn.execute("SELECT * FROM test_case_generation WHERE generation_id=%s", (generation_id,)).fetchone()
         if not row:
             raise HTTPException(404, "Test-case generation run not found")
-        return _test_case_generation_response(row)
+        result = _test_case_generation_response(row)
+        analysis = conn.execute("SELECT contract_json FROM requirement_analysis WHERE analysis_id=%s", (row["analysis_id"],)).fetchone()
+        if analysis:
+            requirements = _approved_requirement_payload(json.loads(analysis["contract_json"]))
+            _apply_coverage_and_quality_review(result["contract"], requirements)
+        return result
 
 @app.post("/api/v1/test-case-generations/{generation_id}/review")
 def review_test_case_generation(generation_id: str, request: TestCaseReviewRequest):
