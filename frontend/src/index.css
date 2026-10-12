@@ -3,6 +3,8 @@
 @import "react-toastify/dist/ReactToastify.css";
 
 :root { --ink: #18283a; --muted: #718096; --line: #e7ebf0; --soft: #f6f8fb; --orange: #ff654f; --orange-dark: #e95540; --brand-navy: #192b37; --brand-orange: #ff5640; --green: #22a06b; --sidebar: #132438; }
+/* Consistent application-wide Title Case for headings and primary interface labels. */
+.workspace-content :is(h1, h2, h3, h4, th, .panel-title, .panel-title-row > div > span, .card-kicker, .workspace-page-context, .primary-button, .secondary-button, .text-button) { text-transform: capitalize; }
 * { box-sizing: border-box; }
 .Toastify__toast-container { width: min(360px, calc(100vw - 32px)); }
 .Toastify__toast { min-height: 58px; border: 1px solid #bfe8d2; border-radius: 10px; color: #237850; background: #f8fffb; box-shadow: 0 14px 35px #1324381c; font-family: 'DM Sans', sans-serif; font-size: 12px; }
@@ -584,6 +586,7 @@ button {
   font-size: 10px;
   font-weight: 800;
   letter-spacing: 0.13em;
+  text-transform: capitalize;
 }
 .page-heading h1 {
   margin: 6px 0 7px;
@@ -3223,23 +3226,48 @@ button {
 .test-case-review-status { vertical-align: middle !important; }
 .test-case-grid-select { width: 42px; text-align: center; vertical-align: middle !important; }
 .test-case-grid-select-heading { width: 42px; }
-.test-case-grid-actions { width: 46px; min-width: 46px; text-align: center; vertical-align: middle !important; }
-.test-case-grid-edit-action { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; padding: 0; border: 1px solid #d6dce5; border-radius: 6px; background: #fff; color: #52667e; cursor: pointer; }
-.test-case-grid-edit-action:hover { border-color: #ff6b5f; color: #e9574e; background: #fff9f7; }
+.test-case-grid-actions { width: 40px; min-width: 40px; padding-inline: 5px !important; text-align: center; vertical-align: middle !important; }
+.test-case-grid-edit-action, .test-case-grid-add-action { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; padding: 0; border: 1px solid #d6dfe8; border-radius: 8px; background: #fff; color: #52667e; cursor: pointer; transition: border-color .15s ease, color .15s ease, background .15s ease, transform .15s ease, box-shadow .15s ease; }
+.test-case-grid-edit-action:hover { border-color: #ff8f7e; color: #df5c4c; background: #fff7f5; box-shadow: 0 5px 12px rgba(223, 92, 76, .12); transform: translateY(-1px); }
+.test-case-grid-add-action { border-color: #c9dce9; color: #2d6f9f; background: #f7fbfe; }
+.test-case-grid-add-action:hover { border-color: #3b82b6; color: #1e618f; background: #edf7fc; box-shadow: 0 5px 12px rgba(45, 111, 159, .13); transform: translateY(-1px); }
 .test-case-grid-input { width: 100%; min-width: 0; box-sizing: border-box; padding: 7px 8px; border: 1px solid #d6dce5; border-radius: 5px; color: #182b43; background: #fff; font: inherit; }
 .test-case-grid-textarea { min-height: 86px; resize: vertical; line-height: 1.45; }
-.case-edit-modal { width: min(100%, 680px); max-height: min(88vh, 760px); overflow-y: auto; padding: 30px 32px 0; border-radius: 18px; box-shadow: 0 28px 90px rgba(16, 34, 56, .24); }
-.case-edit-modal h2 { margin: 7px 0 8px; color: #1c2d45; font-size: 22px; letter-spacing: -.02em; }
-.case-edit-context { max-width: 560px; margin-bottom: 20px !important; color: #718197 !important; font-size: 12px !important; line-height: 1.55 !important; }
+.case-modal-backdrop { left: var(--sidebar-collapsed-width); padding: 18px; background: rgba(11, 28, 45, .48); backdrop-filter: blur(4px); }
+.workspace-shell.sidebar-is-expanded .case-modal-backdrop { left: var(--sidebar-expanded-width); }
+.case-edit-modal { width: min(100%, 700px); max-height: min(84vh, 680px); overflow: hidden; padding: 0; border: 1px solid rgba(218, 228, 237, .95); border-radius: 15px; background: #fff; box-shadow: 0 24px 70px rgba(10, 31, 52, .24); }
+.case-modal-header { position: relative; display: grid; grid-template-columns: 38px minmax(0, 1fr) 32px; align-items: start; gap: 11px; overflow: hidden; padding: 15px 18px 14px; color: #fff; background: radial-gradient(circle at 91% -65%, rgba(116, 190, 224, .24), transparent 42%), linear-gradient(128deg, #102a43, #174a6c); }
+.case-modal-header::after { position: absolute; right: -42px; bottom: -94px; width: 175px; height: 175px; border: 30px solid rgba(255, 255, 255, .07); border-radius: 50%; content: ""; pointer-events: none; }
+.case-modal-header > * { position: relative; z-index: 1; }
+.case-modal-icon { display: grid; width: 36px; height: 36px; place-items: center; border: 1px solid rgba(255, 255, 255, .16); border-radius: 10px; color: #ffd0c8; background: rgba(255, 255, 255, .09); box-shadow: inset 0 1px rgba(255, 255, 255, .12); }
+.case-add-modal .case-modal-icon { color: #bfe4f7; }
+.case-modal-header .eyebrow { color: #a9c3d6; font-size: 10px; letter-spacing: .14em; }
+.case-edit-modal h2 { margin: 4px 0 2px; color: #fff; font: 800 18px/1.2 "Plus Jakarta Sans", sans-serif; letter-spacing: -.02em; }
+.case-edit-context { max-width: 540px; margin: 0 !important; color: #c2d2df !important; font-size: 10px !important; line-height: 1.4 !important; }
 .case-edit-context strong { color: #40566f; font-weight: 700; }
-.case-edit-field { display: grid; gap: 6px; margin: 14px 0; color: #526176; font-size: 12px; font-weight: 700; }
-.case-edit-modal .test-case-grid-textarea { min-height: 100px; }
-.case-edit-review-notes { margin-top: 20px; padding-top: 18px; border-top: 1px solid #edf0f4; }
+.case-modal-header .modal-close { position: static; display: grid; width: 34px; height: 34px; place-items: center; padding: 0; border: 1px solid rgba(255, 255, 255, .16); border-radius: 10px; color: #dce8f0; background: rgba(255, 255, 255, .08); }
+.case-modal-header .modal-close:hover { color: #fff; background: rgba(255, 255, 255, .15); }
+.case-modal-body { max-height: calc(84vh - 158px); overflow-y: auto; padding: 11px 18px 2px; background: linear-gradient(180deg, #fbfdff, #fff 64px); }
+.case-modal-error { display: flex; align-items: flex-start; gap: 8px; margin: 0 0 12px; padding: 10px 12px; border: 1px solid #f1c9c2; border-radius: 9px; color: #a64137; background: #fff5f3; font-size: 11px; font-weight: 700; line-height: 1.45; }
+.case-modal-error svg { flex: 0 0 auto; margin-top: 1px; }
+.case-modal-field-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.case-edit-field { display: grid; gap: 5px; margin: 7px 0 10px; color: #344a62; font-size: 11px; font-weight: 800; }
+.case-edit-field > small { color: #8a99aa; font-size: 10px; font-weight: 600; }
+.case-edit-modal .test-case-grid-textarea { min-height: 82px; }
+.case-edit-review-notes { margin-top: 3px; padding-top: 10px; border-top: 1px solid #edf1f5; }
 .case-edit-help { color: #8b99aa; font-size: 11px; font-weight: 500; line-height: 1.4; }
-.case-edit-modal .test-case-grid-input { min-height: 40px; padding: 10px 12px; border-color: #d6dfe9; border-radius: 8px; transition: border-color .15s ease, box-shadow .15s ease; }
+.case-edit-modal .test-case-grid-input { min-height: 38px; padding: 8px 10px; border-color: #d7e1e9; border-radius: 8px; color: #1b3047; background: #fff; font-size: 11px; font-weight: 600; transition: border-color .15s ease, box-shadow .15s ease, background .15s ease; }
+.case-edit-modal .test-case-grid-input::placeholder { color: #a3afbc; }
 .case-edit-modal .test-case-grid-input:focus { outline: none; border-color: #ec6c5d; box-shadow: 0 0 0 3px rgba(236, 108, 93, .12); }
-.case-edit-modal .test-case-grid-textarea { min-height: 108px; line-height: 1.5; }
-.case-edit-modal .confirm-actions { position: sticky; bottom: 0; margin: 24px -32px 0; padding: 16px 32px; border-top: 1px solid #edf0f4; background: rgba(255, 255, 255, .96); }
+.case-add-modal .test-case-grid-input:focus { border-color: #3b82b6; box-shadow: 0 0 0 3px rgba(59, 130, 182, .12); }
+.case-edit-modal .test-case-grid-textarea { line-height: 1.55; resize: vertical; }
+.case-edit-modal .case-edit-review-notes .test-case-grid-textarea { min-height: 52px; }
+.case-edit-modal .confirm-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin: 0; padding: 10px 18px; border-top: 1px solid #e8edf2; background: rgba(255, 255, 255, .98); }
+.case-edit-modal .confirm-actions .case-modal-required { margin-right: auto; color: #8a99aa; font-size: 10px; font-weight: 600; }
+.case-edit-modal .confirm-actions button { min-width: 92px; min-height: 36px; border-radius: 8px; }
+.case-add-modal .confirm-actions .primary-button { background: linear-gradient(135deg, #2d719e, #1d5c86); box-shadow: 0 7px 16px rgba(39, 104, 148, .2); }
+.item-icon-button.item-add { color: #2d6f9f; border-color: #c9dce9; background: #f4f9fc; }
+@media (max-width: 700px) { .case-modal-backdrop, .workspace-shell.sidebar-is-expanded .case-modal-backdrop { left: 0; padding: 10px; }.case-edit-modal { max-height: 92vh; border-radius: 13px; }.case-modal-header { grid-template-columns: 34px minmax(0, 1fr) 30px; padding: 13px; }.case-modal-icon { width: 32px; height: 32px; }.case-edit-modal h2 { font-size: 17px; }.case-modal-body { max-height: calc(92vh - 145px); padding: 10px 13px 2px; }.case-modal-field-grid { grid-template-columns: 1fr; gap: 0; }.case-edit-modal .confirm-actions { padding: 10px 13px; }.case-modal-required { display: none; } }
 .review-move-actions .review-icon-action { display: inline-flex; align-items: center; justify-content: center; gap: 7px; width: auto; min-width: 104px; height: 36px; padding: 0 14px; border-radius: 8px; font-size: 13px; font-weight: 700; line-height: 1; white-space: nowrap; }
 .review-move-actions .approved-action { border-color: #b9e1ca; background: #f3fbf6; color: #188957; }
 .review-move-actions .approved-action:hover:not(:disabled) { border-color: #188957; background: #e8f7ef; }

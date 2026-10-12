@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
-import { AlertCircle, ArrowLeft, Check, CheckCircle2, ChevronLeft, ChevronRight, ClipboardList, LoaderCircle, Pencil, RotateCcw, ShieldCheck, Sparkles, X } from "lucide-react";
-import { generateFunctionalRequirements, generateTestCasesFromAnalysis, getRequirementAnalysis, getTestCaseGeneration, importExternalTestCases, listGeneratedTestCases, listProjectFunctionalRequirementHistory, listProjectTestCases, listProjectTestCaseHistory, listProjectTestCaseLibrary, listRequirementAnalyses, listTestData, previewTestCaseReuse, reviewTestCaseGeneration } from "../api/client.js";
+import { AlertCircle, ArrowLeft, Check, CheckCircle2, ChevronLeft, ChevronRight, ClipboardList, LoaderCircle, Pencil, Plus, RotateCcw, ShieldCheck, Sparkles, X } from "lucide-react";
+import { addTestCaseToGeneration, generateFunctionalRequirements, generateTestCasesFromAnalysis, getRequirementAnalysis, getTestCaseGeneration, importExternalTestCases, listGeneratedTestCases, listProjectFunctionalRequirementHistory, listProjectTestCases, listProjectTestCaseHistory, listProjectTestCaseLibrary, listRequirementAnalyses, listTestData, previewTestCaseReuse, reviewTestCaseGeneration } from "../api/client.js";
 import { useActivities } from "../activity/activityStore.js";
 import { AppSelect } from "./AppSelect.jsx";
 
@@ -99,6 +99,7 @@ export function TestCaseGenerationPage({ analysis, onBack, onReviewSaved, onAnal
   const [statuses, setStatuses] = useState({});
   const [reviewCommentsByCase, setReviewCommentsByCase] = useState({});
   const [editingId, setEditingId] = useState("");
+  const [addingAfterId, setAddingAfterId] = useState("");
   const [editingTitle, setEditingTitle] = useState("");
   const [editingSteps, setEditingSteps] = useState("");
   const [editingExpected, setEditingExpected] = useState("");
@@ -112,6 +113,8 @@ export function TestCaseGenerationPage({ analysis, onBack, onReviewSaved, onAnal
   const [generatedDataByCase, setGeneratedDataByCase] = useState({});
   const [workflowProgress, setWorkflowProgress] = useState(null);
   const [casePage, setCasePage] = useState(1);
+  const [functionalHistoryPage, setFunctionalHistoryPage] = useState(1);
+  const [projectHistoryPage, setProjectHistoryPage] = useState(1);
   const [reusePreview, setReusePreview] = useState(null);
   const [reuseSelections, setReuseSelections] = useState({});
   const [library, setLibrary] = useState([]);
@@ -140,26 +143,28 @@ export function TestCaseGenerationPage({ analysis, onBack, onReviewSaved, onAnal
   const approvedRequirements = requirements.filter((item) => approvedIds.has(item.requirement_id) || item.review_status === "approved");
   const generationRequirements = approvedRequirements.length ? approvedRequirements : requirements;
   const contract = caseContract(generation);
+  /* Coverage and grounding is intentionally hidden for the current release.
   const coverageSummary = contract.coverage_review?.summary || {};
-  const coverageGaps = (contract.coverage_review?.matrix || []).flatMap((requirement) => [
-    ...(requirement.status === "missing" ? [{ kind: "Functional requirement", id: requirement.requirement_id, label: requirement.title }] : []),
-    ...(requirement.acceptance_criteria || []).filter((item) => item.status === "missing").map((item) => ({ kind: "Acceptance criterion", id: item.id, label: item.label, requirementId: requirement.requirement_id })),
-    ...(requirement.business_rules || []).filter((item) => item.status === "missing").map((item) => ({ kind: "Business rule", id: item.id, label: item.label, requirementId: requirement.requirement_id })),
-    ...(requirement.scenario_branches || []).filter((item) => item.status === "missing").map((item) => ({ kind: "Scenario", id: item.id, label: item.label, requirementId: requirement.requirement_id })),
-  ]);
+  const coverageGaps = (contract.coverage_review?.matrix || []).flatMap((requirement) => []);
+  */
   const generationId = generation?.generation_id || contract.generation_id;
   const testCases = contract.test_cases || [];
   const generationMode = contract.generation_mode;
   const generationModel = contract.generation_model;
-  const ragStatus = contract.rag_status;
-  const ragMetadata = contract.rag_metadata;
-  const knowledgeUsed = Boolean(ragStatus?.used ?? ragMetadata?.index_id);
-  const knowledgeContextMessage = generation
-    ? (knowledgeUsed ? `Knowledge Base used${ragMetadata?.index_id ? ` · ${ragMetadata.index_id}` : ""}` : "Knowledge Base not used for this run")
-    : "A ready, approved Knowledge Base and configured OpenAI model are required.";
   const approvedCount = testCases.filter((item) => (statuses[item.test_case_id] || item.review_status || item.approval?.status || "pending") === "approved").length;
   const hasUnsavedDecisions = testCases.some((item) => (statuses[item.test_case_id] || "pending") !== (item.review_status || item.approval?.status || "pending"));
   const allApproved = testCases.length > 0 && approvedCount === testCases.length && !hasUnsavedDecisions;
+
+  useEffect(() => {
+    if (!editingId && !addingAfterId) return undefined;
+    const previousOverflow = document.body.style.overflow;
+    const closeOnEscape = (event) => {
+      if (event.key === "Escape" && !saving) { setEditingId(""); setAddingAfterId(""); }
+    };
+    document.body.style.overflow = "hidden";
+    window.addEventListener("keydown", closeOnEscape);
+    return () => { document.body.style.overflow = previousOverflow; window.removeEventListener("keydown", closeOnEscape); };
+  }, [editingId, addingAfterId, saving]);
 
   useEffect(() => {
     if (!projectId) { setFunctionalHistory(null); return undefined; }
@@ -437,11 +442,55 @@ export function TestCaseGenerationPage({ analysis, onBack, onReviewSaved, onAnal
   }
 
   function startEdit(item) {
+    setAddingAfterId("");
+    setError("");
     setEditingId(item.test_case_id);
     setEditingTitle(caseDisplayTitle(item, testCases));
     setEditingSteps((item.steps || []).join("\n"));
     setEditingExpected((item.expected_results || []).join("\n"));
     setEditingReviewComment(reviewCommentsByCase[item.test_case_id] || item.approval?.comments || item.review_comments || "");
+  }
+
+  function startAdd(item) {
+    setEditingId("");
+    setAddingAfterId(item.test_case_id);
+    setEditingTitle("");
+    setEditingSteps("");
+    setEditingExpected("");
+    setEditingReviewComment("");
+    setError("");
+  }
+
+  function closeCaseModal() {
+    setEditingId("");
+    setAddingAfterId("");
+    setError("");
+  }
+
+  async function addTestCase() {
+    const title = editingTitle.trim();
+    const steps = lines(editingSteps);
+    const expectedResults = lines(editingExpected);
+    if (!title || !steps.length || !expectedResults.length) { setError("Title, steps, and expected results are required."); return; }
+    setSaving(true); setError(""); setSuccess("");
+    try {
+      const next = await addTestCaseToGeneration(generationId, {
+        source_test_case_id: addingAfterId,
+        reviewer: reviewer.trim() || "Product Owner",
+        title,
+        steps,
+        expected_results: expectedResults,
+        comments: editingReviewComment.trim() || null,
+      });
+      const nextPending = (caseContract(next).test_cases || []).filter((item) => (item.review_status || item.approval?.status || "pending") === "pending");
+      applyGeneration(next);
+      setReviewTab("pending");
+      setCasePage(Math.max(1, Math.ceil(nextPending.length / 6)));
+      closeCaseModal();
+      await refreshProjectCases();
+      setSuccess(`${next.created_test_case_id || "New test case"} added and ready for review.`);
+    } catch (err) { setError(err.message); }
+    finally { setSaving(false); }
   }
 
   async function saveEdit(id) {
@@ -508,20 +557,44 @@ export function TestCaseGenerationPage({ analysis, onBack, onReviewSaved, onAnal
     return <section className="test-design-header"><div className="test-design-header-copy"><div className="test-design-header-meta"><span><Sparkles size={12} /> TestIQ Test Design</span><div className="eyebrow">QUALITY ASSURANCE WORKSPACE</div></div><h1>Test Design Intelligence</h1><div className="test-design-cues"><span>AI-assisted generation</span><span>Human approval</span><span>Traceable coverage</span></div></div><div className="test-design-header-actions">{analysis?.project_name && <span className="test-design-project">{analysis.project_name}</span>}<button type="button" className="test-design-back" onClick={onBack}><ArrowLeft size={15} /> Manage Projects &amp; Upload BRD</button></div></section>;
   }
 
+  function sectionPagination(page, total, pageSize, setPage, label) {
+    const pageCount = Math.max(1, Math.ceil(total / pageSize));
+    if (pageCount <= 1) return null;
+    const currentPage = Math.min(page, pageCount);
+    const firstPage = Math.max(1, Math.min(currentPage - 2, pageCount - 4));
+    const visiblePages = Array.from({ length: Math.min(5, pageCount) }, (_, index) => firstPage + index);
+    return <nav className="app-pagination history-card-pagination" aria-label={`${label} pages`}><span>Showing {(currentPage - 1) * pageSize + 1}–{Math.min(currentPage * pageSize, total)} of {total}</span><div><button type="button" aria-label={`Previous ${label} page`} disabled={currentPage === 1} onClick={() => setPage(currentPage - 1)}><ChevronLeft size={15} /></button>{visiblePages.map((pageNumber) => <button type="button" className={currentPage === pageNumber ? "active" : ""} aria-current={currentPage === pageNumber ? "page" : undefined} key={pageNumber} onClick={() => setPage(pageNumber)}>{pageNumber}</button>)}<button type="button" aria-label={`Next ${label} page`} disabled={currentPage === pageCount} onClick={() => setPage(currentPage + 1)}><ChevronRight size={15} /></button></div></nav>;
+  }
+
   function functionalRequirementHistorySection() {
     if (!projectId) return null;
     const history = functionalHistory?.analyses || [];
+    const pageSize = 4;
     const requirementCount = history.reduce((total, item) => total + (item.requirements?.length || 0), 0);
+    const currentPage = Math.min(functionalHistoryPage, Math.max(1, Math.ceil(requirementCount / pageSize)));
+    const pageStart = (currentPage - 1) * pageSize;
+    const pageEnd = pageStart + pageSize;
+    let requirementOffset = 0;
+    const visibleHistory = history.map((item) => {
+      const itemStart = requirementOffset;
+      const itemRequirements = item.requirements || [];
+      requirementOffset += itemRequirements.length;
+      const visibleRequirements = itemRequirements.filter((_, index) => {
+        const absoluteIndex = itemStart + index;
+        return absoluteIndex >= pageStart && absoluteIndex < pageEnd;
+      });
+      return { ...item, requirements: visibleRequirements, total_requirement_count: itemRequirements.length };
+    }).filter((item) => item.requirements.length > 0);
     return <details className="requirements-panel project-case-history-panel functional-requirement-history-panel history-collapse-panel">
-      <summary className="history-collapse-summary"><div><h2>Functional Requirement history</h2><p className="panel-helper">Prior FRs stay attached to their BRD / package versions, with links to generated test cases. Similarity matches are review suggestions, not automatic merges.</p></div><span className="history-collapse-count">{requirementCount} FRs · {history.length} analyses</span></summary>
+      <summary className="history-collapse-summary"><div><h2>Functional Requirement history</h2><p className="panel-helper">Versioned requirements and linked test coverage.</p></div><span className="history-collapse-count">{requirementCount} FRs · {history.length} analyses</span></summary>
       <div className="history-collapse-content">
       {functionalHistoryLoading && !functionalHistory ? <p className="project-case-empty">Loading Functional Requirement history…</p> : null}
       {functionalHistoryError ? <p className="error-message">{functionalHistoryError}</p> : null}
       {!functionalHistoryLoading && !history.length ? <p className="project-case-empty">No previous Functional Requirement analyses are saved for this project.</p> : null}
-      {history.length > 0 && <div className="project-case-history-list">{history.map((item) => {
+      {history.length > 0 && <div className="project-case-history-list">{visibleHistory.map((item) => {
         const brdNames = (item.brds || []).map((brd) => `${brd.filename || brd.logical_name || "BRD"}${brd.owner_version ? ` · ${brd.owner_version}` : ` · revision ${brd.revision}`}`);
         return <details className="project-case-history-item" key={item.analysis_id} open={item.analysis_id === currentAnalysis?.analysis_id}>
-          <summary><span><strong>Package v{item.package_version} · Analysis v{item.analysis_version}</strong><small>{brdNames.join("; ") || item.package_name || "BRD source details unavailable"} · {(item.requirements || []).length} FRs · {item.created_at}</small></span><span className={`test-case-review-badge ${item.status === "generated" ? "approved" : "pending"}`}>{item.status}</span></summary>
+          <summary><span><strong>Package v{item.package_version} · Analysis v{item.analysis_version}</strong><small>{brdNames.join("; ") || item.package_name || "BRD source details unavailable"} · {item.total_requirement_count} FRs · {item.created_at}</small></span><span className={`test-case-review-badge ${item.status === "generated" ? "approved" : "pending"}`}>{item.status}</span></summary>
           <div className="project-case-history-details functional-requirement-history-list">{(item.requirements || []).map((requirement, index) => {
             const lineage = requirement.history_lineage || {};
             const matches = lineage.matches || [];
@@ -541,6 +614,7 @@ export function TestCaseGenerationPage({ analysis, onBack, onReviewSaved, onAnal
           })}</div>
         </details>;
       })}</div>}
+      {sectionPagination(currentPage, requirementCount, pageSize, setFunctionalHistoryPage, "Functional Requirement history")}
       </div>
     </details>;
   }
@@ -549,22 +623,26 @@ export function TestCaseGenerationPage({ analysis, onBack, onReviewSaved, onAnal
     if (!projectId) return null;
     const versions = projectCaseData?.versions || [];
     const cases = projectCaseMode === "cumulative" ? (projectCaseData?.cases || []) : (versionCaseData?.cases || []);
+    const pageSize = 6;
+    const currentPage = Math.min(projectHistoryPage, Math.max(1, Math.ceil(cases.length / pageSize)));
+    const visibleCases = cases.slice((currentPage - 1) * pageSize, currentPage * pageSize);
     return <details className="requirements-panel project-case-history-panel history-collapse-panel">
-      <summary className="history-collapse-summary"><div><h2>Project test cases</h2><p className="panel-helper">View the unique cumulative set or cases from one BRD / Resource Package version.</p></div><span className="history-collapse-count">{cases.length} unique</span></summary>
+      <summary className="history-collapse-summary"><div><h2>Project test cases</h2><p className="panel-helper">Review cumulative coverage or a specific BRD version.</p></div><span className="history-collapse-count">{cases.length} unique</span></summary>
       <div className="history-collapse-content">
-      <div className="project-case-history-controls"><button type="button" className={`secondary-button compact-button ${projectCaseMode === "cumulative" ? "active" : ""}`} aria-pressed={projectCaseMode === "cumulative"} onClick={() => setProjectCaseMode("cumulative")}>Cumulative test cases</button><button type="button" className={`secondary-button compact-button ${projectCaseMode === "version" ? "active" : ""}`} aria-pressed={projectCaseMode === "version"} onClick={() => setProjectCaseMode("version")} disabled={!versions.length}>BRD version</button>{projectCaseMode === "version" && versions.length > 0 && <label className="project-case-version-select">Version<AppSelect aria-label="Select BRD version" value={selectedPackageVersion} onChange={(event) => setSelectedPackageVersion(event.target.value)}>{versions.map((version) => <option key={version.package_version} value={version.package_version}>Version {version.package_version} · {version.test_case_count} cases</option>)}</AppSelect></label>}</div>
-      {projectCaseMode === "version" && !versions.length ? <p className="project-case-empty">No BRD versions are available yet.</p> : projectCaseMode === "version" && !versionCaseData ? <p className="project-case-empty">Loading version test cases…</p> : cases.length ? <div className="project-case-history-list">{cases.map((item, index) => {
+      <div className="project-case-history-controls"><button type="button" className={`secondary-button compact-button ${projectCaseMode === "cumulative" ? "active" : ""}`} aria-pressed={projectCaseMode === "cumulative"} onClick={() => { setProjectCaseMode("cumulative"); setProjectHistoryPage(1); }}>Cumulative test cases</button><button type="button" className={`secondary-button compact-button ${projectCaseMode === "version" ? "active" : ""}`} aria-pressed={projectCaseMode === "version"} onClick={() => { setProjectCaseMode("version"); setProjectHistoryPage(1); }} disabled={!versions.length}>BRD version</button>{projectCaseMode === "version" && versions.length > 0 && <label className="project-case-version-select">Version<AppSelect aria-label="Select BRD version" value={selectedPackageVersion} onChange={(event) => { setSelectedPackageVersion(event.target.value); setProjectHistoryPage(1); }}>{versions.map((version) => <option key={version.package_version} value={version.package_version}>Version {version.package_version} · {version.test_case_count} cases</option>)}</AppSelect></label>}</div>
+      {projectCaseMode === "version" && !versions.length ? <p className="project-case-empty">No BRD versions are available yet.</p> : projectCaseMode === "version" && !versionCaseData ? <p className="project-case-empty">Loading version test cases…</p> : cases.length ? <div className="project-case-history-list">{visibleCases.map((item, index) => {
         const testCase = item.case || {};
         const sourceVersions = item.package_versions?.length ? item.package_versions.map((version) => `v${version}`).join(", ") : item.package_version ? `v${item.package_version}` : "External import";
         return <details className="project-case-history-item" key={`${item.generation_ids?.[0] || item.generation_id || item.source_name || "external"}:${testCase.test_case_id || testCase.title || index}`}><summary><span><strong>{testCase.title || testCase.test_case_id || "Imported test case"}</strong><small>{testCase.requirement_id || displayText(testCase.requirement_text) || "External"} · {item.origin === "external" ? (item.sources?.join(", ") || item.source_name || "External import") : `BRD / Resource Package ${sourceVersions}`}</small></span><span className={`test-case-review-badge ${testCase.review_status || "pending"}`}>{testCase.review_status || "Imported"}</span></summary><div className="project-case-history-details"><section><b>Steps</b><ol>{(testCase.steps || []).map((step, stepIndex) => <li key={stepIndex}>{displayText(step)}</li>)}</ol></section><section><b>Expected results</b><ul>{(testCase.expected_results || []).map((result, resultIndex) => <li key={resultIndex}>{displayText(result)}</li>)}</ul></section></div></details>;
       })}</div> : <p className="project-case-empty">No test cases are saved for this selection yet.</p>}
+      {sectionPagination(currentPage, cases.length, pageSize, setProjectHistoryPage, "Project test cases")}
       </div>
     </details>;
   }
 
   function externalImportSection() {
     if (!projectId) return null;
-    return <section className="requirements-panel external-test-case-import-panel"><div><h2>Import external test cases</h2><p className="panel-helper">Add JSON cases to the project history. Matches appear once in the cumulative view.</p></div><label className="test-case-import-label"><strong>Choose JSON file</strong><span>Include requirement_text, title, steps, and expected_results.</span><input type="file" accept="application/json,.json" onChange={uploadExternalCases} /></label></section>;
+    return <section className="requirements-panel external-test-case-import-panel"><div className="external-import-copy"><span className="external-import-icon"><Plus size={17} /></span><div><div className="eyebrow">EXTEND COVERAGE</div><h2>Import external test cases</h2><p className="panel-helper">Add approved JSON test designs to this project.</p></div></div><label className="test-case-import-label"><strong>Choose JSON file</strong><span>Required: requirement_text, title, steps, expected_results</span><input type="file" accept="application/json,.json" onChange={uploadExternalCases} /></label></section>;
   }
 
   function listBlock(title, items, empty = "Not specified") {
@@ -594,7 +672,7 @@ export function TestCaseGenerationPage({ analysis, onBack, onReviewSaved, onAnal
             {listBlock("Expected results", item.expected_results)}
           </div>
         </div>
-        <div className="test-case-item-actions"><button type="button" className="item-icon-button item-edit" title="Edit test case" aria-label={`Edit ${item.test_case_id}`} onClick={() => startEdit(item)}><Pencil size={14} /></button></div>
+        <div className="test-case-item-actions"><button type="button" className="item-icon-button item-edit" title="Edit test case" aria-label={`Edit ${item.test_case_id}`} onClick={() => startEdit(item)}><Pencil size={14} /></button><button type="button" className="item-icon-button item-add" title="Add a related test case" aria-label={`Add test case after ${item.test_case_id}`} onClick={() => startAdd(item)}><Plus size={14} /></button></div>
       </div>
     </article>;
   }
@@ -622,7 +700,6 @@ export function TestCaseGenerationPage({ analysis, onBack, onReviewSaved, onAnal
       <td>{expected.map((value, index) => <div key={`${item.test_case_id}-expected-${index}`} className="test-case-grid-line">{value}</div>)}</td>
       <td className="test-case-review-status"><span className={`test-case-review-badge ${item.reviewStatus}`}>{item.reviewStatus === "approved" ? "Approved" : item.reviewStatus === "rejected" ? "Rejected" : "Pending review"}</span></td>
       {item.reviewStatus === "rejected" && <td className="test-case-review-comment">{reviewComment || "No comment"}</td>}
-      <td className="test-case-grid-actions"><button type="button" className="test-case-grid-edit-action" title="Edit test case" aria-label={`Edit ${item.test_case_id}`} onClick={() => startEdit(item)}><Pencil size={15} /></button></td>
     </tr>;
   }
 
@@ -639,8 +716,10 @@ export function TestCaseGenerationPage({ analysis, onBack, onReviewSaved, onAnal
         ? [{ status: "pending", label: "Move to pending", icon: <RotateCcw size={14} />, className: "pending-action" }, { status: "rejected", label: "Reject", icon: <X size={14} />, className: "rejected-action" }]
         : [{ status: "pending", label: "Move to pending", icon: <RotateCcw size={14} />, className: "pending-action" }, { status: "approved", label: "Approve", icon: <Check size={14} />, className: "approved-action" }];
     const selectedInTable = items.map((item) => item.test_case_id).filter((id) => selected.includes(id));
+    const selectedCase = selectedInTable.length === 1 ? items.find((item) => item.test_case_id === selectedInTable[0]) : null;
+    const showApprovedCaseActions = title === "Approved test cases";
     const showComments = title === "Rejected test cases";
-    return <section className={`requirements-panel generated-cases-panel review-status-panel review-status-${title.toLowerCase().replace(/\s+/g, "-")}`}><div className="panel-title-row"><div><h2>{title}</h2><p className="panel-helper">{items.length} test case{items.length === 1 ? "" : "s"}</p></div><div className="review-panel-heading-actions"><span>{items.length}</span></div></div>{selectable && <div className="selection-actions"><label className="select-all"><input type="checkbox" checked={allSelected} onChange={(event) => setSelected(event.target.checked ? items.map((item) => item.test_case_id) : [])} /> Select all</label><div className="review-move-actions">{actions.map((action) => <button key={action.status} type="button" className={`review-icon-action ${action.className}`} disabled={!selectedInTable.length || saving} title={`${action.label} selected test cases`} onClick={() => handleStatusAction(action.status, selectedInTable)}>{action.icon} {action.label}</button>)}</div></div>}<div className="test-case-execution-table-wrap"><table className="test-case-execution-table"><thead><tr><th className="test-case-grid-select-heading"></th><th>TC#</th><th>Test Title</th><th>Test Steps</th><th>Test data</th><th>Expected</th><th>Status</th>{showComments && <th>Review comment</th>}<th className="test-case-grid-actions"></th></tr></thead><tbody>{visibleItems.map((item) => testCaseTableRow(item, selectable))}</tbody></table></div>{pageCount > 1 && <nav className="test-case-pagination" aria-label={`${title} pages`}><span>Showing {(currentPage - 1) * casesPerPage + 1}–{Math.min(currentPage * casesPerPage, items.length)} of {items.length}</span><div><button type="button" aria-label="Previous page" disabled={currentPage === 1} onClick={() => setCasePage(currentPage - 1)}><ChevronLeft size={16} /></button>{Array.from({ length: pageCount }, (_, index) => index + 1).map((pageNumber) => <button type="button" className={currentPage === pageNumber ? "active" : ""} aria-current={currentPage === pageNumber ? "page" : undefined} key={pageNumber} onClick={() => setCasePage(pageNumber)}>{pageNumber}</button>)}<button type="button" aria-label="Next page" disabled={currentPage === pageCount} onClick={() => setCasePage(currentPage + 1)}><ChevronRight size={16} /></button></div></nav>}</section>;
+    return <section className={`requirements-panel generated-cases-panel review-status-panel review-status-${title.toLowerCase().replace(/\s+/g, "-")}`}><div className="panel-title-row"><div><h2>{title}</h2><p className="panel-helper">{items.length} test case{items.length === 1 ? "" : "s"}</p></div><div className="review-panel-heading-actions"><span>{items.length}</span></div></div>{selectable && <div className="selection-actions"><label className="select-all"><input type="checkbox" checked={allSelected} onChange={(event) => setSelected(event.target.checked ? items.map((item) => item.test_case_id) : [])} /> Select All</label><div className="review-move-actions">{showApprovedCaseActions && <><button type="button" className="review-icon-action case-toolbar-edit" disabled={!selectedCase || saving} title="Select one approved test case to edit" onClick={() => startEdit(selectedCase)}><Pencil size={14} /> Edit</button><button type="button" className="review-icon-action case-toolbar-add" disabled={saving} title="Add a new test case" onClick={() => startAdd(selectedCase || items[0])}><Plus size={14} /> Add New</button></>}{actions.map((action) => <button key={action.status} type="button" className={`review-icon-action ${action.className}`} disabled={!selectedInTable.length || saving} title={`${action.label} selected test cases`} onClick={() => handleStatusAction(action.status, selectedInTable)}>{action.icon} {action.label}</button>)}</div></div>}<div className="test-case-execution-table-wrap"><table className="test-case-execution-table"><thead><tr><th className="test-case-grid-select-heading"></th><th>TC#</th><th>Test Title</th><th>Test Steps</th><th>Test Data</th><th>Expected</th><th>Status</th>{showComments && <th>Review Comment</th>}</tr></thead><tbody>{visibleItems.map((item) => testCaseTableRow(item, selectable))}</tbody></table></div>{pageCount > 1 && <nav className="test-case-pagination" aria-label={`${title} pages`}><span>Showing {(currentPage - 1) * casesPerPage + 1}–{Math.min(currentPage * casesPerPage, items.length)} of {items.length}</span><div><button type="button" aria-label="Previous page" disabled={currentPage === 1} onClick={() => setCasePage(currentPage - 1)}><ChevronLeft size={16} /></button>{Array.from({ length: pageCount }, (_, index) => index + 1).map((pageNumber) => <button type="button" className={currentPage === pageNumber ? "active" : ""} aria-current={currentPage === pageNumber ? "page" : undefined} key={pageNumber} onClick={() => setCasePage(pageNumber)}>{pageNumber}</button>)}<button type="button" aria-label="Next page" disabled={currentPage === pageCount} onClick={() => setCasePage(currentPage + 1)}><ChevronRight size={16} /></button></div></nav>}</section>;
   }
 
   if (isAnalysisLoading && !currentAnalysis) {
@@ -667,11 +746,13 @@ export function TestCaseGenerationPage({ analysis, onBack, onReviewSaved, onAnal
     {success && <div className="toast-message"><CheckCircle2 size={17} /> {success}</div>}
     <section className="generation-next-card"><div><div className="eyebrow">GENERATION</div><h2>{generation ? "Test cases ready for review" : activeGenerationActivity ? "Generation in progress" : "Generate test cases"}</h2><p>{generation ? `${testCases.length} cases generated from the approved project context.` : activeGenerationActivity ? "Generation continues in the background. You can safely open another page." : "Create positive and negative cases from approved requirements."}</p></div><div className="generation-controls project-generation-controls">{analysis?.generation_pipeline && loading && workflowProgress && <div className="test-case-inline-progress" aria-label="Test Case generation progress"><div className={`project-progress-track ${workflowProgress.percent === 100 ? "completed" : ""} running`} role="progressbar" aria-label="Test Case generation" aria-valuemin="0" aria-valuemax="100" aria-valuenow={workflowProgress.percent}><span style={{ width: `${workflowProgress.percent}%` }} /></div><div className={`project-progress-meta ${workflowProgress.percent === 100 ? "completed" : ""}`}><strong>{workflowProgress.percent}%</strong><span>{workflowProgress.label}</span></div></div>}{generation ? <span className="test-case-generation-ready"><CheckCircle2 size={16} /> Generated · {testCases.length} cases</span> : !(analysis?.generation_pipeline && loading) && !activeGenerationActivity && <button type="button" className="primary-button" disabled={!generationRequirements.length || loading} onClick={generate}><ShieldCheck size={16} /> Generate test cases</button>}</div></section>
     {generation && <section className="review-tabs-shell"><div className="review-tabs" role="tablist" aria-label="Test case review status"><button type="button" className={reviewTab === "pending" ? "active" : ""} role="tab" aria-selected={reviewTab === "pending"} onClick={() => { setReviewTab("pending"); setCasePage(1); }}>Pending Review <span>{pendingCaseItems.length}</span></button><button type="button" className={reviewTab === "approved" ? "active" : ""} role="tab" aria-selected={reviewTab === "approved"} onClick={() => { setReviewTab("approved"); setCasePage(1); }}>Approved <span>{approvedCaseItems.length}</span></button><button type="button" className={reviewTab === "rejected" ? "active" : ""} role="tab" aria-selected={reviewTab === "rejected"} onClick={() => { setReviewTab("rejected"); setCasePage(1); }}>Rejected <span>{rejectedCaseItems.length}</span></button></div><div className="review-tab-content">{reviewTab === "pending" && reviewTable("Pending review", pendingCaseItems, true)}{reviewTab === "approved" && reviewTable("Approved test cases", approvedCaseItems, true)}{reviewTab === "rejected" && reviewTable("Rejected test cases", rejectedCaseItems, true)}</div></section>}
-    {editingId && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setEditingId(""); }}><div className="confirm-modal case-edit-modal" role="dialog" aria-modal="true" aria-labelledby="case-edit-heading"><button type="button" className="modal-close" aria-label="Close edit test case" onClick={() => setEditingId("")}><X size={18} /></button><div className="eyebrow">EDIT TEST CASE · {editingId}</div><h2 id="case-edit-heading">Update test case details</h2><p className="case-edit-context">Update the test design and capture reviewer notes for this case. Use <strong>Save review</strong> below the table to persist all review changes.</p><label className="case-edit-field">Test title<input className="test-case-grid-input" value={editingTitle} onChange={(event) => setEditingTitle(event.target.value)} /></label><label className="case-edit-field">Test steps<textarea className="test-case-grid-input test-case-grid-textarea" value={editingSteps} onChange={(event) => setEditingSteps(event.target.value)} /></label><label className="case-edit-field">Expected results<textarea className="test-case-grid-input test-case-grid-textarea" value={editingExpected} onChange={(event) => setEditingExpected(event.target.value)} /></label><label className="case-edit-field case-edit-review-notes">Review notes<span className="case-edit-help">{(statuses[editingId] || testCases.find((item) => item.test_case_id === editingId)?.review_status || testCases.find((item) => item.test_case_id === editingId)?.approval?.status || "pending") === "rejected" ? "Required for rejected test cases." : "Optional reviewer context or revision guidance."}</span><textarea className="test-case-grid-input test-case-grid-textarea" value={editingReviewComment} onChange={(event) => setEditingReviewComment(event.target.value)} placeholder="Add a review comment" /></label><div className="confirm-actions"><button type="button" className="secondary-button" onClick={() => setEditingId("")}>Cancel</button><button type="button" className="primary-button" onClick={() => saveEdit(editingId)}>Save changes</button></div></div></div>}
+    {(editingId || addingAfterId) && <div className="modal-backdrop case-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !saving) closeCaseModal(); }}><div className={`confirm-modal case-edit-modal ${addingAfterId ? "case-add-modal" : ""}`} role="dialog" aria-modal="true" aria-labelledby="case-edit-heading"><header className="case-modal-header"><span className="case-modal-icon">{addingAfterId ? <Plus size={20} /> : <Pencil size={19} />}</span><div><div className="eyebrow">{addingAfterId ? `NEW TEST CASE · RELATED TO ${addingAfterId}` : `EDIT TEST CASE · ${editingId}`}</div><h2 id="case-edit-heading">{addingAfterId ? "Add test case" : "Update test case details"}</h2><p className="case-edit-context">{addingAfterId ? "Create additional coverage using the selected case’s requirement and traceability context." : "Refine the test design while preserving its requirement and execution history."}</p></div><button type="button" className="modal-close" disabled={saving} aria-label={addingAfterId ? "Close add test case" : "Close edit test case"} onClick={closeCaseModal}><X size={18} /></button></header><div className="case-modal-body">{error && <div className="case-modal-error" role="alert"><AlertCircle size={15} /> {error}</div>}<label className="case-edit-field"><span>Test title</span><input className="test-case-grid-input" value={editingTitle} onChange={(event) => setEditingTitle(event.target.value)} placeholder="Describe the behavior being validated" autoFocus /></label><div className="case-modal-field-grid"><label className="case-edit-field"><span>Test steps</span><small>Enter one action per line.</small><textarea className="test-case-grid-input test-case-grid-textarea" value={editingSteps} onChange={(event) => setEditingSteps(event.target.value)} placeholder={'Open the workflow\nSubmit valid test data\nVerify the processed result'} /></label><label className="case-edit-field"><span>Expected results</span><small>Enter one outcome per line.</small><textarea className="test-case-grid-input test-case-grid-textarea" value={editingExpected} onChange={(event) => setEditingExpected(event.target.value)} placeholder={'Request is accepted\nExpected record is created\nStatus is updated correctly'} /></label></div><label className="case-edit-field case-edit-review-notes"><span>{addingAfterId ? "Creation notes" : "Review notes"}</span><small className="case-edit-help">{addingAfterId ? "Optional context for reviewers." : (statuses[editingId] || testCases.find((item) => item.test_case_id === editingId)?.review_status || testCases.find((item) => item.test_case_id === editingId)?.approval?.status || "pending") === "rejected" ? "Required for rejected test cases." : "Optional reviewer context or revision guidance."}</small><textarea className="test-case-grid-input test-case-grid-textarea" value={editingReviewComment} onChange={(event) => setEditingReviewComment(event.target.value)} placeholder={addingAfterId ? "Why is this coverage needed?" : "Add a review comment"} /></label></div><footer className="confirm-actions"><span className="case-modal-required">Title, steps, and expected results are required.</span><button type="button" className="secondary-button" disabled={saving} onClick={closeCaseModal}>Cancel</button><button type="button" className="primary-button" disabled={saving} onClick={addingAfterId ? addTestCase : () => saveEdit(editingId)}>{saving ? <><LoaderCircle className="spin" size={16} /> {addingAfterId ? "Adding..." : "Saving..."}</> : addingAfterId ? <><Plus size={16} /> Add</> : <><Check size={16} /> Save changes</>}</button></footer></div></div>}
     {generation && <section className="requirements-review-card"><div className="test-review-heading"><div><div className="eyebrow">HUMAN REVIEW</div><h2>{allApproved ? "Review complete" : "Finalize review"}</h2></div></div><div className="review-fields"><label>Reviewer<input value={reviewer} onChange={(event) => setReviewer(event.target.value)} /></label><label>Review comments<textarea value={comments} onChange={(event) => setComments(event.target.value)} placeholder="Optional review notes" /></label><button className="primary-button" onClick={saveReview} disabled={saving || !testCases.length}>{saving ? <><LoaderCircle className="spin" size={16} /> Saving...</> : <><ShieldCheck size={16} /> Save review</>}</button></div></section>}
     {functionalRequirementHistorySection()}
     {projectHistorySection()}
+    {/* Coverage and grounding is intentionally hidden for now.
     {generation && <details className="requirements-panel test-case-coverage-summary coverage-collapse-panel" aria-label="Test case coverage and evidence"><summary className="coverage-collapse-summary"><h2>Coverage and grounding</h2><span>{coverageSummary.requirements_covered || 0}/{coverageSummary.requirements_total || 0} requirements covered</span></summary><div className="coverage-collapse-content"><div className="test-case-coverage-metrics"><span>FRs: {coverageSummary.requirements_covered || 0}/{coverageSummary.requirements_total || 0}</span><span>Acceptance criteria: {coverageSummary.acceptance_criteria_covered || 0}/{coverageSummary.acceptance_criteria_total || 0}</span><span>Business rules: {coverageSummary.business_rules_covered || 0}/{coverageSummary.business_rules_total || 0}</span><span>{knowledgeUsed ? "Knowledge Base evidence used" : "Knowledge Base evidence unavailable"}</span></div><p>{testCases.length} cases generated for this version. The cumulative history combines exact or equivalent cases across versions.</p>{(coverageGaps.length > 0 || (contract.global_gaps || []).length > 0) && <details className="coverage-gap-details"><summary>View coverage gaps ({coverageGaps.length + (contract.global_gaps || []).length})</summary>{coverageGaps.length > 0 && <ul className="coverage-gap-list">{coverageGaps.map((gap, index) => <li key={`${gap.kind}-${gap.id}-${index}`}><strong>{gap.kind}{gap.id ? ` ${gap.id}` : ""}{gap.requirementId ? ` · ${gap.requirementId}` : ""}:</strong> {gap.label || "No description available"}</li>)}</ul>}{(contract.global_gaps || []).length > 0 && <ul className="coverage-gap-list">{contract.global_gaps.map((gap, index) => <li key={`global-${index}`}>{gap}</li>)}</ul>}</details>}</div></details>}
+    */}
     {externalImportSection()}
   </div>;
 }

@@ -690,6 +690,14 @@ class TestCaseReviewRequest(BaseModel):
     comments: str | None = Field(default=None, max_length=4000)
     items: list[TestCaseReviewItem] = Field(min_length=1)
 
+class ManualTestCaseCreateRequest(BaseModel):
+    source_test_case_id: str = Field(min_length=1, max_length=100)
+    reviewer: str = Field(min_length=1, max_length=200)
+    title: str = Field(min_length=3, max_length=400)
+    steps: list[str] = Field(min_length=1, max_length=50)
+    expected_results: list[str] = Field(min_length=1, max_length=50)
+    comments: str | None = Field(default=None, max_length=4000)
+
 class TestCaseRegenerationRequest(BaseModel):
     reviewer: str | None = Field(default=None, max_length=200)
     reason: str | None = Field(default=None, max_length=4000)
@@ -4513,6 +4521,80 @@ def review_test_case_generation(generation_id: str, request: TestCaseReviewReque
         result["review_comments"] = request.comments
         return result
 
+
+@app.post("/api/v1/test-case-generations/{generation_id}/test-cases", status_code=201)
+def add_manual_test_case(generation_id: str, request: ManualTestCaseCreateRequest):
+    with connection() as conn:
+        lock_suffix = " FOR UPDATE" if DATABASE_URL else ""
+        row = conn.execute(f"SELECT * FROM test_case_generation WHERE generation_id=%s{lock_suffix}", (generation_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Test-case generation run not found")
+        contract = json.loads(row["contract_json"])
+        cases = contract.get("test_cases", [])
+        if len(cases) >= 500:
+            raise HTTPException(409, "This generation already contains the maximum supported number of test cases")
+        source_case = next((case for case in cases if case.get("test_case_id") == request.source_test_case_id), None)
+        if not source_case:
+            raise HTTPException(422, "The selected source test case does not belong to this generation")
+        title = request.title.strip()
+        steps = [value.strip() for value in request.steps if value and value.strip()]
+        expected_results = [value.strip() for value in request.expected_results if value and value.strip()]
+        if not title or not steps or not expected_results:
+            raise HTTPException(422, "Title, steps, and expected results are required")
+        if any(len(value) > 4000 for value in (*steps, *expected_results)):
+            raise HTTPException(422, "Each step and expected result must be 4,000 characters or fewer")
+        if any(str(case.get("title") or "").strip().casefold() == title.casefold() for case in cases):
+            raise HTTPException(409, "A test case with this title already exists in the current generation")
+
+        numeric_ids = [int(match.group(1)) for case in cases if (match := re.fullmatch(r"TC-(\d+)", str(case.get("test_case_id") or ""), re.IGNORECASE))]
+        next_number = max(numeric_ids, default=0) + 1
+        existing_ids = {str(case.get("test_case_id") or "").upper() for case in cases}
+        new_case_id = f"TC-{next_number:03d}"
+        while new_case_id.upper() in existing_ids:
+            next_number += 1
+            new_case_id = f"TC-{next_number:03d}"
+
+        timestamp = now()
+        new_case = copy.deepcopy(source_case)
+        for key in ("generated_data", "test_data_values", "execution_result", "execution_history"):
+            new_case.pop(key, None)
+        new_case.update({
+            "test_case_id": new_case_id,
+            "title": title,
+            "description": f"Manually added test coverage related to {source_case.get('test_case_id')}.",
+            "scenario": title,
+            "steps": steps,
+            "expected_results": expected_results,
+            "review_status": "pending",
+            "approved": False,
+            "approval": {"status": "pending", "reviewer": request.reviewer, "comments": request.comments or "", "reviewed_at": timestamp},
+            "execution_status": "not_run",
+            "origin": "manual",
+            "manual_metadata": {"source_test_case_id": request.source_test_case_id, "created_by": request.reviewer, "created_at": timestamp},
+        })
+        _normalize_test_case_format({"test_cases": [new_case]})
+        cases.append(new_case)
+        contract["approved_test_case_ids"] = [case["test_case_id"] for case in cases if _review_status(case) == "approved"]
+        contract["rejected_test_case_ids"] = [case["test_case_id"] for case in cases if _review_status(case) == "rejected"]
+        contract["pending_test_case_ids"] = [case["test_case_id"] for case in cases if _review_status(case) == "pending"]
+        analysis = conn.execute("SELECT * FROM requirement_analysis WHERE analysis_id=%s", (row["analysis_id"],)).fetchone()
+        if analysis:
+            _apply_coverage_and_quality_review(contract, _approved_requirement_payload(json.loads(analysis["contract_json"])), timestamp)
+        contract["review_metadata"] = {
+            "reviewer": request.reviewer, "comments": request.comments, "reviewed_at": timestamp,
+            "approved_count": len(contract["approved_test_case_ids"]), "rejected_count": len(contract["rejected_test_case_ids"]),
+            "pending_count": len(contract["pending_test_case_ids"]),
+        }
+        reviewed_contract_hash = hashlib.sha256(json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        conn.execute("UPDATE test_case_generation SET status=%s,contract_json=%s,updated_at=%s WHERE generation_id=%s", ("needs_review", json.dumps(contract), timestamp, generation_id))
+        conn.execute(
+            "INSERT INTO test_case_review_audit (audit_id,generation_id,analysis_id,package_id,project_id,reviewer,comments,reviewed_contract_hash,approved_test_case_ids_json,rejected_test_case_ids_json,pending_test_case_ids_json,reviewed_contract_json,reviewed_items_json,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            (uid("tcaudit"), generation_id, row["analysis_id"], row["package_id"], row["project_id"], request.reviewer, request.comments or "Test case added manually", reviewed_contract_hash, json.dumps(contract["approved_test_case_ids"]), json.dumps(contract["rejected_test_case_ids"]), json.dumps(contract["pending_test_case_ids"]), json.dumps(contract), json.dumps([{"action": "created", "test_case_id": new_case_id, "source_test_case_id": request.source_test_case_id, "review_status": "pending", "title": title}]), timestamp),
+        )
+        result = _test_case_generation_response(conn.execute("SELECT * FROM test_case_generation WHERE generation_id=%s", (generation_id,)).fetchone())
+        result["created_test_case_id"] = new_case_id
+        return result
+
 @app.get("/api/v1/test-case-generations/{generation_id}/coverage-review")
 def get_test_case_coverage_review(generation_id: str):
     with connection() as conn:
@@ -5845,11 +5927,12 @@ def generate_test_data(generation_id: str, request: TestDataGenerationRequest):
             raise HTTPException(409, "The package Knowledge Base did not return database-schema evidence. Add/index the database schema before generating test data.")
         pattern_guidance = _test_data_pattern_guidance()
         schema_context = [{"source_reference": item["source_reference"], "text": item["text"]} for item in schema_evidence]
+        assignment_placeholders = ",".join("%s" for _ in assignment_case_ids)
         existing_rows = conn.execute(
             "SELECT r.test_case_id,r.status,r.bronze_raw_file_id,"
             "EXISTS (SELECT 1 FROM test_data_bronze_ref ref WHERE ref.record_id=r.record_id) AS sent_to_bronze "
-            "FROM test_data_record r WHERE r.generation_id=%s",
-            (generation_id,),
+            f"FROM test_data_record r WHERE r.generation_id=%s AND r.test_case_id IN ({assignment_placeholders})",
+            (generation_id, *assignment_case_ids),
         ).fetchall()
         if existing_rows:
             if not request.replace_existing_drafts:
@@ -6381,13 +6464,52 @@ def _expected_test_data_ids(payload):
             prescriptions.append(prescription["prescription_id"])
     return sorted(set(members)), sorted(set(prescriptions))
 
+def _campaign_case_expectation(rows, approved_case):
+    description = " ".join(str(approved_case.get(key) or "") for key in ("title", "description", "scenario", "expected_results", "assertions")).lower()
+    prescription_payload = {}
+    member_payload = {}
+    for row in rows:
+        payload = json.loads(row["payload_json"])
+        nested_prescription = payload.get("prescription")
+        nested_member = payload.get("membership") or payload.get("member")
+        if isinstance(nested_prescription, dict):
+            prescription_payload = nested_prescription
+        elif str(row["entity_name"]).lower() == "prescription" or payload.get("prescription_id"):
+            prescription_payload = payload
+        if isinstance(nested_member, dict):
+            member_payload = nested_member
+        elif str(row["entity_name"]).lower() == "membership" or (payload.get("member_id") and not payload.get("prescription_id")):
+            member_payload = payload
+    prescription_status = str(prescription_payload.get("status") or "").upper()
+    member_status = str(member_payload.get("status") or "").upper()
+    ineligible = prescription_payload.get("eligible_ind") is False
+    no_refills = bool(prescription_payload) and int(prescription_payload.get("refills_remaining") or 0) <= 0
+    inactive = prescription_status == "INACTIVE" or member_status == "INACTIVE"
+    analytics_exclusion = ineligible or no_refills or inactive
+    if inactive:
+        exclusion_reason = "inactive member or prescription"
+    elif ineligible:
+        exclusion_reason = "prescription is not eligible"
+    elif no_refills:
+        exclusion_reason = "no refills remain"
+    else:
+        exclusion_reason = None
+    return {
+        "expects_dnc": any(term in description for term in ("suppression", "do not contact", "dnc")),
+        "expects_missing_contact": any(term in description for term in ("without valid phone", "no valid phone", "missing phone", "no phone number", "invalid phone")),
+        "analytics_exclusion": analytics_exclusion,
+        "expected_action": "EXCLUDED" if analytics_exclusion else "QUALIFIED",
+        "exclusion_reason": exclusion_reason,
+    }
+
+
 def _validate_gold_transport(conn, rows, generation_id, test_case_id, assertions):
     case = conn.execute("SELECT contract_json FROM test_case_generation WHERE generation_id=%s", (generation_id,)).fetchone()
     contract = json.loads(case["contract_json"]) if case else {}
     approved_case = next((item for item in contract.get("test_cases", []) if item.get("test_case_id") == test_case_id), {})
-    description = " ".join(str(approved_case.get(key) or "") for key in ("title", "description", "scenario", "expected_results", "assertions")).lower()
-    expects_dnc = any(term in description for term in ("suppression", "do not contact", "dnc"))
-    expects_missing_contact = any(term in description for term in ("without valid phone", "no valid phone", "missing phone", "no phone number", "invalid phone"))
+    expectation = _campaign_case_expectation(rows, approved_case)
+    expects_dnc = expectation["expects_dnc"]
+    expects_missing_contact = expectation["expects_missing_contact"]
     rx_ids = sorted({rx for row in rows for rx in _expected_test_data_ids(json.loads(row["payload_json"]))[1]})
     gold_actual, transport_actual = [], []
     if not rx_ids:
@@ -6406,24 +6528,33 @@ def _validate_gold_transport(conn, rows, generation_id, test_case_id, assertions
             "WHERE p.prescription_id=%s ORDER BY a.evaluation_date DESC",
             (rx_id,),
         ).fetchall()
+        silver_record = conn.execute(
+            "SELECT p.prescription_sk,p.silver_created_time,p.silver_updated_time,p.eligible_ind,p.status AS prescription_status,m.status AS member_status "
+            "FROM silverbox.prescription p LEFT JOIN silverbox.member m ON m.member_sk=p.member_sk "
+            "WHERE p.prescription_id=%s ORDER BY p.silver_updated_time DESC NULLS LAST,p.prescription_sk DESC LIMIT 1",
+            (rx_id,),
+        ).fetchone()
+        silver_ready_at = (silver_record.get("silver_updated_time") or silver_record.get("silver_created_time")) if silver_record else None
+        campaign_run = conn.execute(
+            "SELECT run_id,campaign_code,status,records_read,records_processed,records_eligible,records_excluded,records_failed,completed_at,error_message "
+            "FROM goldbox.prescription_refill_etl_audit "
+            "WHERE status='COMPLETED' AND records_failed=0 AND completed_at IS NOT NULL AND completed_at >= %s "
+            "ORDER BY completed_at DESC LIMIT 1",
+            (silver_ready_at,),
+        ).fetchone() if silver_ready_at else None
         if not audit_rows:
-            _add_pending_assertion(assertions, f"Analytics evaluation for {rx_id}", "campaign decision audit", "not recorded yet", "Waiting for the Analytics campaign process on the target data platform.")
+            if campaign_run and expectation["analytics_exclusion"]:
+                _add_assertion(assertions, f"Campaign processing completed for {rx_id}", True, "completed campaign after processed data became available", campaign_run["status"])
+                _add_assertion(assertions, f"Ineligible prescription {rx_id} excluded from campaign output", not gold_rows, "No business outcome record", "No business outcome record" if not gold_rows else "Unexpected business outcome record", expectation["exclusion_reason"])
+                gold_actual.append({"prescription_id": rx_id, "campaign_run": dict(campaign_run), "refill_rows": [dict(item) for item in gold_rows], "exclusion_evidence": expectation["exclusion_reason"]})
+            elif campaign_run:
+                _add_assertion(assertions, f"Campaign qualification for {rx_id}", False, "qualified business outcome record", "not created after campaign completed", "The campaign completed after the processed prescription became available, but the expected qualified output was not produced.")
+                gold_actual.append({"prescription_id": rx_id, "campaign_run": dict(campaign_run), "refill_rows": []})
+            else:
+                _add_pending_assertion(assertions, f"Analytics evaluation for {rx_id}", "completed campaign run after processed data became available", "not recorded yet", "Waiting for the Analytics campaign process on the target data platform.")
         else:
-            latest_audit = audit_rows[-1]
-            prescription_payload = {}
-            for row in rows:
-                row_payload = json.loads(row["payload_json"])
-                nested_prescription = row_payload.get("prescription")
-                if isinstance(nested_prescription, dict):
-                    prescription_payload = nested_prescription
-                    break
-                if str(row["entity_name"]).lower() == "prescription" or row_payload.get("prescription_id"):
-                    prescription_payload = row_payload
-                    break
-            ineligible = isinstance(prescription_payload, dict) and prescription_payload.get("eligible_ind") is False
-            no_refills = isinstance(prescription_payload, dict) and int(prescription_payload.get("refills_remaining") or 0) <= 0
-            expects_exclusion = expects_missing_contact or ineligible or no_refills
-            expected_action = "EXCLUDED" if expects_exclusion else "QUALIFIED"
+            latest_audit = audit_rows[0]
+            expected_action = expectation["expected_action"]
             _add_assertion(assertions, f"Analytics campaign decision for {rx_id}", latest_audit["action"] == expected_action, expected_action, latest_audit["action"], latest_audit.get("exclusion_reason"))
             gold_actual.append({"prescription_id": rx_id, "audit": dict(latest_audit), "refill_rows": [dict(item) for item in gold_rows]})
         if gold_rows:
@@ -6440,8 +6571,12 @@ def _validate_gold_transport(conn, rows, generation_id, test_case_id, assertions
                 expected_status = "DNC_EXCLUDED" if expects_dnc else "MISSING_CONTACT" if expects_missing_contact else "ROUTED"
                 observed_statuses = sorted({item["result_status"] for item in routed})
                 _add_assertion(assertions, f"Transport outcome for {rx_id}", expected_status in observed_statuses, expected_status, observed_statuses, "; ".join(item.get("failure_reason") or "" for item in routed if item.get("failure_reason")) or None)
-        elif audit_rows and audit_rows[-1]["action"] == "EXCLUDED":
+        elif audit_rows and audit_rows[0]["action"] == "EXCLUDED":
             _add_assertion(assertions, f"Transport not routed for Analytics-excluded {rx_id}", True, "No Transport journey", "Analytics excluded this prescription.")
+        elif campaign_run and expectation["analytics_exclusion"]:
+            _add_assertion(assertions, f"Transport not routed for campaign-excluded {rx_id}", True, "No delivery journey", "No delivery journey was created.")
+        elif campaign_run:
+            _add_assertion(assertions, f"Transport was not started for unqualified {rx_id}", True, "No delivery journey after missing business outcome", "No delivery journey was created.")
         else:
             _add_pending_assertion(assertions, f"Analytics refill record for {rx_id}", "eligible Analytics refill or exclusion result", "not available yet")
     return gold_actual, transport_actual
@@ -6932,7 +7067,7 @@ def list_test_case_review_audit(generation_id: str):
 
 @app.get("/api/v1/token-usage")
 def get_token_usage(project_id: str | None = None, package_id: str | None = None, stage: str | None = None):
-    """Return persisted provider token counts and estimated cost by workflow step."""
+    """Return persisted provider usage by step and generation-centred delivery cycle."""
     clauses, params = [], []
     if project_id:
         clauses.append("u.project_id=%s")
@@ -6945,12 +7080,31 @@ def get_token_usage(project_id: str | None = None, package_id: str | None = None
         params.append(stage)
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
     with connection() as conn:
+        usage_rows = conn.execute(
+            "SELECT u.* FROM llm_token_usage u" + where + " ORDER BY u.created_at", tuple(params),
+        ).fetchall()
         rows = conn.execute(
             "SELECT u.stage,u.model,SUM(u.input_tokens) AS input_tokens,SUM(u.output_tokens) AS output_tokens, "
             "SUM(u.total_tokens) AS total_tokens,SUM(u.cached_input_tokens) AS cached_input_tokens, "
             "COUNT(*) AS calls,MAX(u.created_at) AS last_used_at, "
             "SUM(CASE WHEN u.status='failed' THEN 1 ELSE 0 END) AS failed_calls "
             "FROM llm_token_usage u" + where + " GROUP BY u.stage,u.model ORDER BY u.stage,u.model", tuple(params),
+        ).fetchall()
+        cycle_clauses, cycle_params = [], []
+        if project_id:
+            cycle_clauses.append("g.project_id=%s")
+            cycle_params.append(project_id)
+        if package_id:
+            cycle_clauses.append("g.package_id=%s")
+            cycle_params.append(package_id)
+        cycle_where = " WHERE " + " AND ".join(cycle_clauses) if cycle_clauses else ""
+        cycle_rows = conn.execute(
+            "SELECT g.generation_id,g.analysis_id,g.package_id,g.project_id,g.status,g.created_at,g.updated_at,"
+            "a.analysis_version,m.package_version,m.package_name,"
+            "EXISTS (SELECT 1 FROM test_data_record d WHERE d.generation_id=g.generation_id) AS has_test_data "
+            "FROM test_case_generation g JOIN requirement_analysis a ON a.analysis_id=g.analysis_id "
+            "JOIN source_package_manifest m ON m.package_id=g.package_id" + cycle_where + " ORDER BY g.created_at",
+            tuple(cycle_params),
         ).fetchall()
     grouped = {}
     for row in rows:
@@ -6981,7 +7135,75 @@ def get_token_usage(project_id: str | None = None, package_id: str | None = None
             stage_row["models"].append(item["model"])
     steps = [{**item, "estimated_cost_usd": float(item["estimated_cost_usd"])} for item in grouped.values()]
     keys = ("input_tokens", "output_tokens", "total_tokens", "cached_input_tokens", "calls", "failed_calls", "unpriced_calls")
-    return {"project_id": project_id, "package_id": package_id, "steps": steps,
+    cycle_candidates = []
+    for row in cycle_rows:
+        item = dict(row)
+        item.update({
+            "cycle_id": item["generation_id"], "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+            "cached_input_tokens": 0, "calls": 0, "failed_calls": 0, "unpriced_calls": 0,
+            "estimated_cost_usd": Decimal("0"), "started_at": None, "completed_at": None, "stages": {},
+        })
+        cycle_candidates.append(item)
+
+    def usage_timestamp(value):
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+        except (TypeError, ValueError):
+            return 0
+
+    for raw_row in usage_rows:
+        event = dict(raw_row)
+        matches = [cycle for cycle in cycle_candidates if event.get("generation_id") and cycle["generation_id"] == event["generation_id"]]
+        if not matches and event.get("analysis_id"):
+            matches = [cycle for cycle in cycle_candidates if cycle["analysis_id"] == event["analysis_id"]]
+        if not matches and event.get("package_id"):
+            matches = [cycle for cycle in cycle_candidates if cycle["package_id"] == event["package_id"]]
+        if not matches:
+            continue
+        event_time = usage_timestamp(event.get("created_at"))
+        cycle = min(matches, key=lambda candidate: abs(usage_timestamp(candidate.get("created_at")) - event_time))
+        input_tokens = int(event.get("input_tokens") or 0)
+        output_tokens = int(event.get("output_tokens") or 0)
+        total_tokens = int(event.get("total_tokens") or 0)
+        cached_tokens = int(event.get("cached_input_tokens") or 0)
+        cost = estimate_cost_usd(event.get("model"), input_tokens, output_tokens, cached_tokens)
+        cycle["input_tokens"] += input_tokens
+        cycle["output_tokens"] += output_tokens
+        cycle["total_tokens"] += total_tokens
+        cycle["cached_input_tokens"] += cached_tokens
+        cycle["calls"] += 1
+        cycle["failed_calls"] += int(event.get("status") == "failed")
+        cycle["unpriced_calls"] += int(cost is None)
+        if cost is not None:
+            cycle["estimated_cost_usd"] += cost
+        created_at = event.get("created_at")
+        if created_at and (not cycle["started_at"] or created_at < cycle["started_at"]):
+            cycle["started_at"] = created_at
+        if created_at and (not cycle["completed_at"] or created_at > cycle["completed_at"]):
+            cycle["completed_at"] = created_at
+        stage_item = cycle["stages"].setdefault(event["stage"], {"stage": event["stage"], "total_tokens": 0, "calls": 0, "estimated_cost_usd": Decimal("0")})
+        stage_item["total_tokens"] += total_tokens
+        stage_item["calls"] += 1
+        if cost is not None:
+            stage_item["estimated_cost_usd"] += cost
+
+    cycles = []
+    for cycle in cycle_candidates:
+        if not cycle["calls"]:
+            continue
+        cycle["lifecycle_status"] = "complete" if cycle.pop("has_test_data") else "test_design_complete"
+        cycle["estimated_cost_usd"] = float(cycle["estimated_cost_usd"])
+        cycle["cost_pricing_complete"] = cycle["unpriced_calls"] == 0
+        cycle["stages"] = [{**item, "estimated_cost_usd": float(item["estimated_cost_usd"])} for item in cycle["stages"].values()]
+        cycles.append(cycle)
+    cycles.sort(key=lambda item: item.get("completed_at") or item.get("updated_at") or "", reverse=True)
+    completed_cycles = [item for item in cycles if item["lifecycle_status"] == "complete"]
+    cycle_summary = {
+        "cycle_count": len(cycles), "completed_cycles": len(completed_cycles),
+        "average_tokens_per_cycle": round(sum(item["total_tokens"] for item in completed_cycles) / len(completed_cycles)) if completed_cycles else 0,
+        "average_cost_per_cycle_usd": sum(item["estimated_cost_usd"] for item in completed_cycles) / len(completed_cycles) if completed_cycles else 0,
+    }
+    return {"project_id": project_id, "package_id": package_id, "steps": steps, "cycles": cycles, "cycle_summary": cycle_summary,
             "totals": {**{key: sum(item[key] for item in steps) for key in keys},
                        "estimated_cost_usd": sum(item["estimated_cost_usd"] for item in steps),
                        "cost_pricing_complete": all(item["unpriced_calls"] == 0 for item in steps)}}

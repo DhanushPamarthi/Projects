@@ -26,6 +26,36 @@ def _client(monkeypatch):
             )
     return TestClient(app.main.app)
 
+
+def test_campaign_expectation_distinguishes_analytics_and_transport_exclusions(monkeypatch):
+    _client(monkeypatch)
+    from app.main import _campaign_case_expectation
+
+    negative_rows = [
+        {"entity_name": "membership", "payload_json": json.dumps({"member_id": "M-1", "status": "INACTIVE"})},
+        {"entity_name": "prescription", "payload_json": json.dumps({"prescription_id": "RX-1", "eligible_ind": False, "refills_remaining": 2, "status": "INACTIVE"})},
+    ]
+    negative = _campaign_case_expectation(negative_rows, {"title": "Exclude inactive member from SMS reminder"})
+    assert negative["analytics_exclusion"] is True
+    assert negative["expected_action"] == "EXCLUDED"
+    assert negative["exclusion_reason"] == "inactive member or prescription"
+
+    missing_contact_rows = [
+        {"entity_name": "membership", "payload_json": json.dumps({"member_id": "M-2", "status": "ACTIVE"})},
+        {"entity_name": "prescription", "payload_json": json.dumps({"prescription_id": "RX-2", "eligible_ind": True, "refills_remaining": 2, "status": "ACTIVE"})},
+    ]
+    missing_contact = _campaign_case_expectation(missing_contact_rows, {"title": "Do not send SMS without valid phone"})
+    assert missing_contact["analytics_exclusion"] is False
+    assert missing_contact["expected_action"] == "QUALIFIED"
+    assert missing_contact["expects_missing_contact"] is True
+
+    no_refills = _campaign_case_expectation(
+        [{"entity_name": "prescription", "payload_json": json.dumps({"prescription_id": "RX-3", "eligible_ind": True, "refills_remaining": 0, "status": "ACTIVE"})}],
+        {"title": "Exclude prescription with no refills"},
+    )
+    assert no_refills["analytics_exclusion"] is True
+    assert no_refills["exclusion_reason"] == "no refills remain"
+
 def test_upload_revision_duplicate_manifest(monkeypatch):
     client = _client(monkeypatch)
     body = b"# Login\nThe user must sign in with email and password."
@@ -140,6 +170,167 @@ def test_each_test_case_execution_attempt_is_preserved_in_history(monkeypatch):
         json={"reviewer": "qa-reviewer", "selected_test_case_ids": ["TC-OUTSIDE-BASELINE"]},
     )
     assert invalid_selection.status_code == 422
+
+
+def test_manual_test_case_is_persisted_and_uses_existing_review_workflow(monkeypatch):
+    client = _client(monkeypatch)
+    import app.db
+
+    timestamp = "2026-10-12T10:00:00+00:00"
+    requirement_contract = {
+        "requirements": [{
+            "requirement_id": "FR-001",
+            "title": "Eligible member reminder",
+            "statement": "Eligible members receive a refill reminder.",
+            "type": "functional",
+            "priority": "high",
+            "actors": ["member"],
+            "entities": ["prescription"],
+            "flow_steps": ["Evaluate eligibility", "Send reminder"],
+            "acceptance_criteria": [{"acceptance_id": "AC-001", "text": "A reminder is sent to an eligible member."}],
+            "business_rules": [{"rule_id": "RULE-001", "text": "Only eligible prescriptions qualify."}],
+            "expected_outcomes": [],
+            "source_references": [{"fragment_id": "frag-1", "source_reference": "BRD section 1"}],
+        }],
+    }
+    source_case = {
+        "test_case_id": "TC-001",
+        "requirement_id": "FR-001",
+        "title": "Send reminder to eligible member",
+        "description": "Validate the eligible path.",
+        "scenario": "Eligible member reminder",
+        "category": "positive",
+        "type": "functional",
+        "priority": "high",
+        "steps": ["Step 1: Evaluate an eligible prescription"],
+        "expected_results": ["Member is selected for a reminder"],
+        "data_needs": [{"name": "member_id", "type": "string", "value": "", "required": True, "source": "schema"}],
+        "actions": [{"step": 1, "surface": "database", "actor": "tester", "action": "Evaluate eligibility", "data_inputs": ["member_id"]}],
+        "acceptance_criteria_ids": ["AC-001"],
+        "business_rule_ids": ["RULE-001"],
+        "source_references": [{"fragment_id": "frag-1", "source_reference": "BRD section 1"}],
+        "review_status": "approved",
+        "approval": {"status": "approved", "reviewer": "qa-reviewer"},
+    }
+    generation_contract = {
+        "test_cases": [source_case],
+        "approved_test_case_ids": ["TC-001"],
+        "rejected_test_case_ids": [],
+        "pending_test_case_ids": [],
+        "coverage": {"required_categories": ["positive"], "generated_categories": ["positive"]},
+    }
+    with app.db.connection() as conn:
+        conn.execute(
+            "INSERT INTO source_package_manifest (package_id,project_id,package_version,package_name,scope,lifecycle_status,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+            ("pkg-manual", "p1", 1, "Manual Case Package", "QA", "ready", timestamp),
+        )
+        conn.execute(
+            "INSERT INTO requirement_analysis (analysis_id,package_id,project_id,analysis_version,status,analysis_kind,contract_json,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            ("ana-manual", "pkg-manual", "p1", 1, "approved", "functional", json.dumps(requirement_contract), timestamp, timestamp),
+        )
+        conn.execute(
+            "INSERT INTO test_case_generation (generation_id,analysis_id,package_id,project_id,status,contract_json,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+            ("tcg-manual", "ana-manual", "pkg-manual", "p1", "ready", json.dumps(generation_contract), timestamp, timestamp),
+        )
+
+    created = client.post(
+        "/api/v1/test-case-generations/tcg-manual/test-cases",
+        json={
+            "source_test_case_id": "TC-001",
+            "reviewer": "qa-reviewer",
+            "title": "Do not remind an ineligible member",
+            "steps": ["Load an ineligible member", "Evaluate the reminder campaign"],
+            "expected_results": ["The member is excluded from reminder delivery"],
+            "comments": "Added to cover the negative eligibility path.",
+        },
+    )
+    assert created.status_code == 201, created.text
+    payload = created.json()
+    assert payload["created_test_case_id"] == "TC-002"
+    added = next(item for item in payload["contract"]["test_cases"] if item["test_case_id"] == "TC-002")
+    assert added["review_status"] == "pending"
+    assert added["origin"] == "manual"
+    assert added["requirement_id"] == "FR-001"
+    assert added["data_needs"] == source_case["data_needs"]
+    assert added["steps"] == ["Step 1: Load an ineligible member", "Step 2: Evaluate the reminder campaign"]
+    assert payload["contract"]["pending_test_case_ids"] == ["TC-002"]
+
+    duplicate = client.post(
+        "/api/v1/test-case-generations/tcg-manual/test-cases",
+        json={
+            "source_test_case_id": "TC-001",
+            "reviewer": "qa-reviewer",
+            "title": "Do not remind an ineligible member",
+            "steps": ["Repeat the same case"],
+            "expected_results": ["Duplicate is rejected"],
+        },
+    )
+    assert duplicate.status_code == 409
+
+    reviewed = client.post(
+        "/api/v1/test-case-generations/tcg-manual/review",
+        json={
+            "reviewer": "qa-reviewer",
+            "comments": "Negative coverage approved.",
+            "items": [
+                {"test_case_id": "TC-001", "review_status": "approved", "title": source_case["title"], "steps": source_case["steps"], "expected_results": source_case["expected_results"]},
+                {"test_case_id": "TC-002", "review_status": "approved", "title": added["title"], "steps": added["steps"], "expected_results": added["expected_results"]},
+            ],
+        },
+    )
+    assert reviewed.status_code == 200, reviewed.text
+    assert reviewed.json()["contract"]["approved_test_case_ids"] == ["TC-001", "TC-002"]
+    audit = client.get("/api/v1/test-case-generations/tcg-manual/review-audit")
+    assert audit.status_code == 200, audit.text
+    assert any(item.get("action") == "created" and item.get("test_case_id") == "TC-002" for row in audit.json() for item in row.get("reviewed_items", []))
+
+
+def test_token_usage_returns_generation_cycle_history(monkeypatch):
+    client = _client(monkeypatch)
+    import app.db
+
+    timestamp = "2026-10-12T10:00:00+00:00"
+    with app.db.connection() as conn:
+        conn.execute(
+            "INSERT INTO source_package_manifest (package_id,project_id,package_version,package_name,scope,lifecycle_status,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+            ("pkg-usage", "p1", 1, "Usage Package", "QA", "ready", timestamp),
+        )
+        conn.execute(
+            "INSERT INTO requirement_analysis (analysis_id,package_id,project_id,analysis_version,status,analysis_kind,contract_json,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            ("ana-usage", "pkg-usage", "p1", 1, "approved", "functional", "{}", timestamp, timestamp),
+        )
+        for generation_id, created_at in (("tcg-usage-1", timestamp), ("tcg-usage-2", "2026-10-12T11:00:00+00:00")):
+            conn.execute(
+                "INSERT INTO test_case_generation (generation_id,analysis_id,package_id,project_id,status,contract_json,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                (generation_id, "ana-usage", "pkg-usage", "p1", "ready", '{"test_cases":[]}', created_at, created_at),
+            )
+        conn.execute(
+            "INSERT INTO test_data_record (record_id,generation_id,test_case_id,template_id,template_name,template_version,entity_name,payload_json,pre_steps_json,schema_context_json,status,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            ("td-usage", "tcg-usage-1", "TC-001", "template-1", "Member", 1, "member", "{}", "[]", "[]", "approved", timestamp, timestamp),
+        )
+        usage_rows = [
+            ("tok-usage-1", "test_cases", "op-1", "tcg-usage-1", 1000, 300, 1300, timestamp),
+            ("tok-usage-2", "test_data", "op-2", "tcg-usage-1", 500, 200, 700, "2026-10-12T10:10:00+00:00"),
+            ("tok-usage-3", "test_cases", "op-3", "tcg-usage-2", 800, 200, 1000, "2026-10-12T11:00:00+00:00"),
+        ]
+        for usage_id, stage, operation_id, generation_id, input_tokens, output_tokens, total_tokens, created_at in usage_rows:
+            conn.execute(
+                "INSERT INTO llm_token_usage (usage_id,stage,operation_id,project_id,package_id,analysis_id,generation_id,model,input_tokens,output_tokens,total_tokens,cached_input_tokens,status,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (usage_id, stage, operation_id, "p1", "pkg-usage", "ana-usage", generation_id, "gpt-4o-mini", input_tokens, output_tokens, total_tokens, 0, "succeeded", created_at),
+            )
+
+    response = client.get("/api/v1/token-usage?project_id=p1")
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["totals"]["total_tokens"] == 3000
+    assert payload["cycle_summary"]["cycle_count"] == 2
+    assert payload["cycle_summary"]["completed_cycles"] == 1
+    completed = next(item for item in payload["cycles"] if item["cycle_id"] == "tcg-usage-1")
+    assert completed["lifecycle_status"] == "complete"
+    assert completed["total_tokens"] == 2000
+    assert completed["calls"] == 2
+    assert {item["stage"] for item in completed["stages"]} == {"test_cases", "test_data"}
+    assert completed["estimated_cost_usd"] > 0
 
 
 def test_brd_version_upload_keeps_package_lineage_and_preserves_previous_snapshot(monkeypatch):

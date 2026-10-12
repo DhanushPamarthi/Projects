@@ -334,6 +334,12 @@ export async function reviewTestCaseGeneration(generationId, review) {
   });
 }
 
+export async function addTestCaseToGeneration(generationId, payload) {
+  return request(`/api/v1/test-case-generations/${encodeURIComponent(generationId)}/test-cases`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+  });
+}
+
 export async function getTestCaseCoverageReview(generationId) {
   return request(`/api/v1/test-case-generations/${encodeURIComponent(generationId)}/coverage-review`);
 }
