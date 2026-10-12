@@ -1,4 +1,5 @@
 import io
+import json
 import sys
 import types
 import uuid
@@ -86,6 +87,59 @@ def test_explicit_brd_version_upload_keeps_lineage_and_workspace_lists_all_brds(
     versioned = next(brd for brd in summary["brds"] if brd["source_id"] == first.json()["source_id"])
     assert versioned["revision_count"] == 2
     assert versioned["active_revision"]["filename"] == "requirements-renamed-v2.md"
+
+
+def test_each_test_case_execution_attempt_is_preserved_in_history(monkeypatch):
+    client = _client(monkeypatch)
+    import app.db
+    import app.main
+    timestamp = "2026-10-12T10:00:00+00:00"
+    with app.db.connection() as conn:
+        conn.execute(
+            "INSERT INTO source_package_manifest (package_id,project_id,package_version,package_name,scope,lifecycle_status,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+            ("pkg-history", "p1", 1, "History Package", "QA", "ready", timestamp),
+        )
+        conn.execute(
+            "INSERT INTO requirement_analysis (analysis_id,package_id,project_id,analysis_version,status,analysis_kind,contract_json,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            ("ana-history", "pkg-history", "p1", 1, "approved", "functional", "{}", timestamp, timestamp),
+        )
+        contract = {"test_cases": [{"test_case_id": "TC-HISTORY-1", "title": "Preserve execution history"}]}
+        conn.execute(
+            "INSERT INTO test_case_generation (generation_id,analysis_id,package_id,project_id,status,contract_json,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+            ("tcg-history", "ana-history", "pkg-history", "p1", "ready", json.dumps(contract), timestamp, timestamp),
+        )
+        conn.execute(
+            "INSERT INTO test_run (run_id,package_id,project_id,status,configuration_snapshot,generation_id,selected_test_case_ids_json,frozen_contract_json,lifecycle_state,immutable_observations_json,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            ("run-history", "pkg-history", "p1", "selected", "{}", "tcg-history", json.dumps(["TC-HISTORY-1"]), "{}", "selected", "[]", timestamp),
+        )
+        assert app.main._execute_case_against_bronze(conn, "run-history", "tcg-history", "TC-HISTORY-1", timestamp) == "failed"
+        assert app.main._execute_case_against_bronze(conn, "run-history", "tcg-history", "TC-HISTORY-1", timestamp) == "failed"
+
+    response = client.get("/api/v1/test-case-generations/tcg-history/execution-runs")
+    assert response.status_code == 200, response.text
+    run = response.json()[0]
+    assert len(run["execution_results"]) == 1
+    assert [attempt["attempt_number"] for attempt in run["execution_history"]] == [2, 1]
+    assert all(attempt["test_case_id"] == "TC-HISTORY-1" for attempt in run["execution_history"])
+
+    selected_execution = client.post(
+        "/api/v1/execution-runs/run-history/execute",
+        json={"reviewer": "qa-reviewer", "selected_test_case_ids": ["TC-HISTORY-1"]},
+    )
+    assert selected_execution.status_code == 200, selected_execution.text
+    assert [attempt["attempt_number"] for attempt in selected_execution.json()["execution_history"]] == [3, 2, 1]
+    assert "Preserve execution history failed because" in selected_execution.json()["execution_results"][0]["error"]
+    assert "Raw layer" not in selected_execution.json()["execution_results"][0]["error"]
+    report = client.get("/api/v1/packages/pkg-history/execution-report")
+    assert report.status_code == 200, report.text
+    assert len(report.json()["generations"]) == 1
+    assert len(report.json()["runs"]) == 1
+    assert len(report.json()["runs"][0]["execution_history"]) == 3
+    invalid_selection = client.post(
+        "/api/v1/execution-runs/run-history/execute",
+        json={"reviewer": "qa-reviewer", "selected_test_case_ids": ["TC-OUTSIDE-BASELINE"]},
+    )
+    assert invalid_selection.status_code == 422
 
 
 def test_brd_version_upload_keeps_package_lineage_and_preserves_previous_snapshot(monkeypatch):
@@ -567,6 +621,20 @@ def test_test_case_generation_review_and_execution_lifecycle(monkeypatch):
         json={"reviewer": "qa-reviewer", "comments": "Freeze second baseline.", "selected_test_case_ids": [approved_case_id]},
     )
     assert second_run.status_code == 201, second_run.text
+
+    history_run = client.post(
+        f"/api/v1/test-case-generations/{generation_id}/execution-runs",
+        json={"reviewer": "qa-reviewer", "comments": "Verify immutable execution history.", "selected_test_case_ids": [approved_case_id]},
+    )
+    assert history_run.status_code == 201, history_run.text
+    first_attempt = client.post(f"/api/v1/execution-runs/{history_run.json()['run_id']}/execute", json={"reviewer": "qa-reviewer"})
+    second_attempt = client.post(f"/api/v1/execution-runs/{history_run.json()['run_id']}/execute", json={"reviewer": "qa-reviewer"})
+    assert first_attempt.status_code == second_attempt.status_code == 200
+    history = second_attempt.json()["execution_history"]
+    assert len(history) == 2
+    assert [attempt["attempt_number"] for attempt in history] == [2, 1]
+    assert all(attempt["test_case_id"] == approved_case_id for attempt in history)
+    assert len(second_attempt.json()["execution_results"]) == 1
 
     cancelled = client.patch(
         f"/api/v1/execution-runs/{first_run.json()['run_id']}/lifecycle",

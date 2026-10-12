@@ -710,6 +710,7 @@ class ExecutionRunLifecycleRequest(BaseModel):
 class ExecutionRunExecuteRequest(BaseModel):
     reviewer: str | None = Field(default=None, max_length=200)
     comments: str | None = Field(default=None, max_length=4000)
+    selected_test_case_ids: list[str] | None = Field(default=None, min_length=1)
 
 class TestDataTemplateDefinition(BaseModel):
     template_id: str = Field(min_length=1, max_length=100)
@@ -2489,6 +2490,13 @@ def _execution_results_for_run(conn, run_id: str):
     rows = conn.execute("SELECT * FROM test_execution_result WHERE run_id=%s ORDER BY test_case_id", (run_id,)).fetchall()
     return [_test_execution_result_response(row) for row in rows]
 
+def _execution_attempts_for_run(conn, run_id: str):
+    rows = conn.execute(
+        "SELECT * FROM test_execution_attempt WHERE run_id=%s ORDER BY completed_at DESC,test_case_id,attempt_number DESC",
+        (run_id,),
+    ).fetchall()
+    return [_test_execution_result_response(row) for row in rows]
+
 def _execution_summary(results):
     total = len(results)
     passed = sum(1 for item in results if item.get("status") == "passed")
@@ -2514,6 +2522,7 @@ def _test_run_response(row, conn=None):
         result[key[:-5]] = json.loads(value or ("{}" if key == "frozen_contract_json" else "[]"))
     results = _execution_results_for_run(conn, result["run_id"]) if conn else []
     result["execution_results"] = results
+    result["execution_history"] = _execution_attempts_for_run(conn, result["run_id"]) if conn else []
     result["execution_summary"] = _execution_summary(results)
     return result
 
@@ -4682,6 +4691,53 @@ def list_execution_runs_for_generation(generation_id: str):
         return [_test_run_response(row, conn) for row in rows]
 
 
+@app.get("/api/v1/packages/{package_id}/execution-report")
+def get_package_execution_report(package_id: str):
+    """Return all test generations, latest results, and attempt history in one request."""
+    with connection() as conn:
+        package = conn.execute("SELECT package_id,project_id FROM source_package_manifest WHERE package_id=%s", (package_id,)).fetchone()
+        if not package:
+            raise HTTPException(404, "Resource Package not found")
+        generation_rows = conn.execute(
+            "SELECT * FROM test_case_generation WHERE package_id=%s ORDER BY created_at DESC",
+            (package_id,),
+        ).fetchall()
+        run_rows = conn.execute(
+            "SELECT * FROM test_run WHERE package_id=%s ORDER BY created_at DESC",
+            (package_id,),
+        ).fetchall()
+        run_ids = [row["run_id"] for row in run_rows]
+        results_by_run = {run_id: [] for run_id in run_ids}
+        attempts_by_run = {run_id: [] for run_id in run_ids}
+        if run_ids:
+            placeholders = ",".join(["%s"] * len(run_ids))
+            result_rows = conn.execute(
+                f"SELECT * FROM test_execution_result WHERE run_id IN ({placeholders}) ORDER BY run_id,test_case_id",
+                tuple(run_ids),
+            ).fetchall()
+            attempt_rows = conn.execute(
+                f"SELECT * FROM test_execution_attempt WHERE run_id IN ({placeholders}) ORDER BY run_id,completed_at DESC,test_case_id,attempt_number DESC",
+                tuple(run_ids),
+            ).fetchall()
+            for row in result_rows:
+                results_by_run[row["run_id"]].append(_test_execution_result_response(row))
+            for row in attempt_rows:
+                attempts_by_run[row["run_id"]].append(_test_execution_result_response(row))
+        runs = []
+        for row in run_rows:
+            run = _test_run_response(row)
+            run["execution_results"] = results_by_run[run["run_id"]]
+            run["execution_history"] = attempts_by_run[run["run_id"]]
+            run["execution_summary"] = _execution_summary(run["execution_results"])
+            runs.append(run)
+        return {
+            "package_id": package_id,
+            "project_id": package["project_id"],
+            "generations": [_test_case_generation_response(row) for row in generation_rows],
+            "runs": runs,
+        }
+
+
 @app.post("/api/v1/execution-runs/{run_id}/execute")
 def execute_run(run_id: str, request: ExecutionRunExecuteRequest | None = None):
     with connection() as conn:
@@ -4693,9 +4749,16 @@ def execute_run(run_id: str, request: ExecutionRunExecuteRequest | None = None):
             raise HTTPException(409, "Execution run is cancelled")
 
         started_at = now()
-        selected_case_ids = json.loads(row["selected_test_case_ids_json"] or "[]")
-        if not selected_case_ids:
+        baseline_case_ids = json.loads(row["selected_test_case_ids_json"] or "[]")
+        if not baseline_case_ids:
             raise HTTPException(422, "Execution baseline has no selected test cases")
+        requested_case_ids = request.selected_test_case_ids if request else None
+        selected_case_ids = requested_case_ids or baseline_case_ids
+        if len(set(selected_case_ids)) != len(selected_case_ids):
+            raise HTTPException(422, "Each selected test case must appear only once")
+        unknown_case_ids = sorted(set(selected_case_ids) - set(baseline_case_ids))
+        if unknown_case_ids:
+            raise HTTPException(422, {"message": "Selected test cases are not part of this execution baseline", "unknown_test_case_ids": unknown_case_ids})
         frozen_contract = json.loads(row["frozen_contract_json"] or "{}")
         frozen_record_ids = frozen_contract.get("selected_test_data_record_ids")
         frozen_records_by_case = {}
@@ -4708,10 +4771,11 @@ def execute_run(run_id: str, request: ExecutionRunExecuteRequest | None = None):
         comments = request.comments if request else None
         observations.append({
             "type": "execution_started",
-            "message": "Execution check started for Raw, Curated, Analytics, and Transport outputs on the target data platform for each selected test case.",
+            "message": f"Execution check started for {len(selected_case_ids)} selected test case(s) across Raw, Curated, Analytics, and Transport outputs.",
             "created_at": started_at,
             "reviewer": reviewer or row["reviewer"],
             "comments": comments,
+            "selected_test_case_ids": selected_case_ids,
         })
         conn.execute(
             "UPDATE test_run SET status=%s,lifecycle_state=%s,started_at=%s,error=%s,immutable_observations_json=%s WHERE run_id=%s",
@@ -6205,6 +6269,51 @@ def _assert_equal_if_present(assertions, name: str, expected, actual):
 def _add_pending_assertion(assertions, name: str, expected=None, actual=None, message: str = "Waiting for the target data platform to complete this layer."):
     assertions.append({"name": name, "status": "pending", "expected": expected, "actual": actual, "message": message})
 
+def _tester_friendly_term(value) -> str:
+    text = str(value or "required information").replace("_", " ")
+    replacements = {
+        "bronze": "submitted source data", "raw layer": "submitted source data",
+        "silver": "processed data", "curated layer": "processed data",
+        "gold": "business outcome", "analytics": "business outcome",
+        "transport": "delivery output", "cdp": "target system",
+        "row": "record", "rows": "records",
+    }
+    for technical, friendly in replacements.items():
+        text = re.sub(rf"\b{re.escape(technical)}\b", friendly, text, flags=re.IGNORECASE)
+    return " ".join(text.split()).strip().capitalize()
+
+def _tester_friendly_value(value) -> str:
+    if value is None or value == "":
+        return "no value"
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    if isinstance(value, (dict, list)):
+        text = json.dumps(value, default=str, ensure_ascii=False)
+    else:
+        text = str(value)
+    return text if len(text) <= 140 else text[:137] + "..."
+
+def _tester_friendly_failure_reason(conn, generation_id: str, test_case_id: str, failed_assertions: list[dict]) -> str:
+    generation = conn.execute("SELECT contract_json FROM test_case_generation WHERE generation_id=%s", (generation_id,)).fetchone()
+    contract = json.loads(generation["contract_json"] or "{}") if generation else {}
+    test_case = next((item for item in contract.get("test_cases", []) if item.get("test_case_id") == test_case_id), {})
+    title = str(test_case.get("title") or test_case.get("scenario") or test_case_id or "This test case").strip()
+    primary = failed_assertions[0] if failed_assertions else {}
+    check = _tester_friendly_term(primary.get("name"))
+    expected = primary.get("expected")
+    actual = primary.get("actual")
+    missing_values = {"", "none", "null", "missing", "not found", "not found yet", "no value", "[]", "{}"}
+    actual_text = _tester_friendly_value(actual)
+    actual_is_missing = actual is None or actual == [] or actual == {} or str(actual).strip().lower() in missing_values
+    if actual_is_missing:
+        reason = f"{title} failed because {check.lower()} was missing. Expected {_tester_friendly_value(expected)}."
+    else:
+        reason = f"{title} failed because {check.lower()} did not match. Expected {_tester_friendly_value(expected)}, but found {actual_text}."
+    additional = max(0, len(failed_assertions) - 1)
+    if additional:
+        reason += f" {additional} additional validation check{'s' if additional != 1 else ''} also failed."
+    return reason
+
 def _expected_test_data_ids(payload):
     members, prescriptions = [], []
     if payload.get("type") == "pharmacy.orders.v1.sample-notification":
@@ -6569,13 +6678,22 @@ def _execute_case_against_bronze(conn, run_id: str, generation_id: str, test_cas
     failed = [item for item in assertions if item["status"] == "failed"]
     pending = [item for item in assertions if item["status"] == "pending"]
     status = "failed" if failed else "pending" if pending else "passed"
-    error = "; ".join(item["name"] for item in failed[:5]) if failed else "Waiting for target data platform: " + "; ".join(item["name"] for item in pending[:5]) if pending else None
+    error = _tester_friendly_failure_reason(conn, generation_id, test_case_id, failed) if failed else "Waiting for the target system to finish processing the required data." if pending else None
     result_id = "xres_" + hashlib.sha256(f"{run_id}:{test_case_id}".encode("utf-8")).hexdigest()[:24]
     conn.execute(
         "INSERT INTO test_execution_result (result_id,run_id,generation_id,test_case_id,status,expected_json,actual_json,assertions_json,bronze_refs_json,started_at,completed_at,error) "
         "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
         "ON CONFLICT (run_id, test_case_id) DO UPDATE SET status=EXCLUDED.status,expected_json=EXCLUDED.expected_json,actual_json=EXCLUDED.actual_json,assertions_json=EXCLUDED.assertions_json,bronze_refs_json=EXCLUDED.bronze_refs_json,started_at=EXCLUDED.started_at,completed_at=EXCLUDED.completed_at,error=EXCLUDED.error",
         (result_id, run_id, generation_id, test_case_id, status, json.dumps({"records": expected_records}, sort_keys=True, default=str), json.dumps({"bronze_rows": actual_records, "silver": silver_actual, "gold": gold_actual, "transport": transport_actual}, sort_keys=True, default=str), json.dumps(assertions, sort_keys=True, default=str), json.dumps(all_refs, sort_keys=True, default=str), started_at, completed_at, error),
+    )
+    attempt_number = conn.execute(
+        "SELECT COALESCE(MAX(attempt_number),0)+1 AS next_attempt FROM test_execution_attempt WHERE run_id=%s AND test_case_id=%s",
+        (run_id, test_case_id),
+    ).fetchone()["next_attempt"]
+    conn.execute(
+        "INSERT INTO test_execution_attempt (attempt_id,run_id,generation_id,test_case_id,attempt_number,status,expected_json,actual_json,assertions_json,bronze_refs_json,started_at,completed_at,error) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        (uid("xatt"), run_id, generation_id, test_case_id, attempt_number, status, json.dumps({"records": expected_records}, sort_keys=True, default=str), json.dumps({"bronze_rows": actual_records, "silver": silver_actual, "gold": gold_actual, "transport": transport_actual}, sort_keys=True, default=str), json.dumps(assertions, sort_keys=True, default=str), json.dumps(all_refs, sort_keys=True, default=str), started_at, completed_at, error),
     )
     return status
 

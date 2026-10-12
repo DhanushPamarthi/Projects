@@ -358,6 +358,10 @@ export async function listExecutionRuns(generationId) {
   return request(`/api/v1/test-case-generations/${encodeURIComponent(generationId)}/execution-runs`);
 }
 
+export async function getPackageExecutionReport(packageId) {
+  return request(`/api/v1/packages/${encodeURIComponent(packageId)}/execution-report`, { cache: "no-store" });
+}
+
 export async function updateExecutionRunLifecycle(runId, payload) {
   return request(`/api/v1/execution-runs/${encodeURIComponent(runId)}/lifecycle`, {
     method: "PATCH",

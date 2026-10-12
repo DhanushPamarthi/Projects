@@ -267,6 +267,24 @@ CREATE TABLE IF NOT EXISTS testiq.test_execution_result (
   error TEXT,
   UNIQUE(run_id, test_case_id)
 );
+CREATE TABLE IF NOT EXISTS testiq.test_execution_attempt (
+  attempt_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES testiq.test_run(run_id),
+  generation_id TEXT NOT NULL REFERENCES testiq.test_case_generation(generation_id),
+  test_case_id TEXT NOT NULL,
+  attempt_number INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  expected_json TEXT NOT NULL,
+  actual_json TEXT NOT NULL,
+  assertions_json TEXT NOT NULL,
+  bronze_refs_json TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  completed_at TEXT NOT NULL,
+  error TEXT,
+  UNIQUE(run_id, test_case_id, attempt_number)
+);
+CREATE INDEX IF NOT EXISTS testiq_test_execution_attempt_run_idx ON testiq.test_execution_attempt(run_id,completed_at);
+CREATE INDEX IF NOT EXISTS testiq_test_execution_attempt_case_idx ON testiq.test_execution_attempt(generation_id,test_case_id,completed_at);
 CREATE INDEX IF NOT EXISTS testiq_test_execution_result_run_idx ON testiq.test_execution_result(run_id);
 CREATE INDEX IF NOT EXISTS testiq_test_execution_result_case_idx ON testiq.test_execution_result(generation_id,test_case_id);
 CREATE TABLE IF NOT EXISTS testiq.knowledge_index (
@@ -433,6 +451,9 @@ MIGRATIONS = [
     "CREATE TABLE IF NOT EXISTS test_execution_result (result_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES test_run(run_id), generation_id TEXT NOT NULL REFERENCES test_case_generation(generation_id), test_case_id TEXT NOT NULL, status TEXT NOT NULL, expected_json TEXT NOT NULL, actual_json TEXT NOT NULL, assertions_json TEXT NOT NULL, bronze_refs_json TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT NOT NULL, error TEXT, UNIQUE(run_id, test_case_id))",
     "CREATE INDEX IF NOT EXISTS testiq_test_execution_result_run_idx ON test_execution_result(run_id)",
     "CREATE INDEX IF NOT EXISTS testiq_test_execution_result_case_idx ON test_execution_result(generation_id,test_case_id)",
+    "CREATE TABLE IF NOT EXISTS test_execution_attempt (attempt_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES test_run(run_id), generation_id TEXT NOT NULL REFERENCES test_case_generation(generation_id), test_case_id TEXT NOT NULL, attempt_number INTEGER NOT NULL, status TEXT NOT NULL, expected_json TEXT NOT NULL, actual_json TEXT NOT NULL, assertions_json TEXT NOT NULL, bronze_refs_json TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT NOT NULL, error TEXT, UNIQUE(run_id, test_case_id, attempt_number))",
+    "CREATE INDEX IF NOT EXISTS testiq_test_execution_attempt_run_idx ON test_execution_attempt(run_id,completed_at)",
+    "CREATE INDEX IF NOT EXISTS testiq_test_execution_attempt_case_idx ON test_execution_attempt(generation_id,test_case_id,completed_at)",
     "UPDATE test_data_record SET status='ready_for_execution' WHERE status='ready_for_cdp'",
 ]
 
